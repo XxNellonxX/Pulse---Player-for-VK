@@ -1,0 +1,54 @@
+name: Attach verified macOS preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful macOS build run ID
+        required: true
+        type: string
+      tag:
+        description: Existing draft prerelease tag
+        default: v0.4.0-macos-preview
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  attach-preview:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PULSE_BUILD_RUN: ${{ inputs.run_id }}
+      PULSE_PREVIEW_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check completed build and draft preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PULSE_BUILD_RUN" =~ ^[0-9]+$ ]]
+          [[ "$PULSE_PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-macos-preview$ ]]
+          gh api "repos/$GH_REPO/actions/runs/$PULSE_BUILD_RUN" > build.json
+          jq -e '.conclusion == "success" and .path == ".github/workflows/release-macos.yml"' build.json
+          gh api "repos/$GH_REPO/releases/tags/$PULSE_PREVIEW_TAG" > preview.json
+          jq -e '.draft == true and .prerelease == true' preview.json
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.run_id }}
+          pattern: pulse-macos-*
+          path: preview
+      - name: Attach both architectures and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f preview/pulse-macos-arm64/*_aarch64.dmg
+          test -f preview/pulse-macos-x64/*_x64.dmg
+          sha256sum preview/*/*.dmg > SHA256SUMS-macos.txt
+          gh release upload "$PULSE_PREVIEW_TAG" preview/*/*.dmg SHA256SUMS-macos.txt
+          cat SHA256SUMS-macos.txt
