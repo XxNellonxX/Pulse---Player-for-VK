@@ -1,0 +1,5 @@
+.queue-panel-virtual { display: flex; flex-direction: column; }
+.queue-panel-virtual .queue-header, .queue-panel-virtual .clear-queue { flex-shrink: 0; }
+.queue-panel-virtual .queue-list-virtual { flex: 1; min-height: 0; max-height: none; padding: 0; margin: 10px 0; overflow-anchor: none; }
+.queue-virtual-space { position: relative; }
+.queue-virtual-space .queue-row { position: absolute; left: 0; right: 0; box-sizing: border-box; }

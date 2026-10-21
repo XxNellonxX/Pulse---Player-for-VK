@@ -1,0 +1,11 @@
+{
+  "identifier": "ru.vkplayer.independentqa",
+  "productName": "VK Player QA",
+  "app": {
+    "windows": [{
+      "label": "main", "title": "VK Player QA", "width": 1440, "height": 900,
+      "minWidth": 960, "minHeight": 620, "backgroundColor": "#0c0d0f",
+      "additionalBrowserArgs": "--autoplay-policy=no-user-gesture-required"
+    }]
+  }
+}

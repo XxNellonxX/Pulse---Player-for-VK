@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="case" x1="168" y1="64" x2="856" y2="984" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#283F4B"/>
+      <stop offset=".47" stop-color="#12262D"/>
+      <stop offset="1" stop-color="#09161C"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0" cy="0" r="1" gradientTransform="translate(525 405) rotate(90) scale(420)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B7F675" stop-opacity=".14"/>
+      <stop offset="1" stop-color="#B7F675" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="260" y1="170" x2="808" y2="872" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#D9FFE7" stop-opacity=".26"/>
+      <stop offset=".48" stop-color="#99D3BC" stop-opacity=".04"/>
+      <stop offset="1" stop-color="#99D3BC" stop-opacity=".13"/>
+    </linearGradient>
+    <linearGradient id="sound" x1="306" y1="300" x2="721" y2="719" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E1FFA5"/>
+      <stop offset=".54" stop-color="#B6F36A"/>
+      <stop offset="1" stop-color="#74DEBC"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="236" fill="url(#case)"/>
+  <rect x="32" y="32" width="960" height="960" rx="236" fill="url(#halo)"/>
+  <rect x="36" y="36" width="952" height="952" rx="232" stroke="url(#rim)" stroke-width="8"/>
+  <circle cx="512" cy="512" r="338" fill="#07191E" fill-opacity=".24" stroke="url(#rim)" stroke-width="3"/>
+  <circle cx="512" cy="512" r="296" stroke="#C0FFCD" stroke-opacity=".055" stroke-width="2"/>
+  <circle cx="512" cy="512" r="254" stroke="#C0FFCD" stroke-opacity=".045" stroke-width="2"/>
+  <!-- A waveform opens into the play glyph: original, legible at tray size. -->
+  <g fill="url(#sound)">
+    <rect x="286" y="425" width="52" height="174" rx="26"/>
+    <rect x="370" y="363" width="56" height="298" rx="28"/>
+    <path d="M480 341C480 318 505 303 525 315L749 477C773 494 773 530 749 547L525 709C505 721 480 706 480 683V341Z"/>
+  </g>
+  <path d="M500 342L720 501" stroke="#F0FFD0" stroke-opacity=".3" stroke-width="6" stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,4 @@
+yt-dlp 2026.08.19: https://github.com/yt-dlp/yt-dlp (Unlicense; packaged third-party notices included in its official distribution)
+Deno 2.9.7: https://github.com/denoland/deno (MIT)
+FFmpeg Windows essentials by gyan.dev: https://www.gyan.dev/ffmpeg/builds/ (GPLv3 build; source: https://ffmpeg.org/download.html)
+These programs are started only for a user-requested URL import.

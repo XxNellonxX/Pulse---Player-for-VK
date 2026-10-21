@@ -1,0 +1,24 @@
+node_modules/
+dist/
+release/
+release-*/
+test-results/
+playwright-report/
+*.log
+.env
+.env.*
+!.env.example
+src-tauri/target/
+src-tauri/gen/
+asar-audit-*/
+qa-user-data/
+qa/artifacts/
+qa/research/
+qa/theme-visual/
+# Local measurements can contain account metadata, URLs and machine paths.
+qa/**/*.json
+!qa/tauri.config.json
+qa/installed-final-pid.txt
+src-tauri/resources/import-tools/*.exe
+src-tauri/resources/import-tools/*.source-sha256
+src-tauri/resources/vk_hls.js

@@ -1,0 +1,6 @@
+{
+  "clientId": "",
+  "redirectUri": "http://127.0.0.1:49281/callback",
+  "scopes": "vkid.personal_info",
+  "apiVersion": "5.199"
+}
