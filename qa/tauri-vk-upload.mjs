@@ -1,7 +1,7 @@
 import { chromium } from 'playwright';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, writeFile, readFile, rm, copyFile } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, copyFile, readdir, realpath, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
@@ -28,7 +28,7 @@ await copyFile(file, duplicate); await writeFile(corrupt, 'Not an MP3 file');
 const original = await readFile(file);
 assert.ok(original.length > 256 * 1024, 'fixture must cross native chunk boundaries');
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
-const html = `<!doctype html><meta charset="utf-8"><title>QA isolated upload runtime</title><script>
+let html = `<!doctype html><meta charset="utf-8"><title>QA isolated upload runtime</title><script>
 window.vk={id:42,user:{first_name:'QA',last_name:'Upload'}};
 window.__qaMode='ok';window.__qaCalls=[];window.__qaTransfers=[];window.__qaLibrary=[];window.__qaSaveCount=0;
 const tuple=(id,title,artist)=>[id,42,'https://unused.invalid/audio',title,artist,3];
@@ -52,22 +52,47 @@ window.XMLHttpRequest=class{constructor(){this.upload={};this.status=200;}open(m
 window.getAudioPlayer=()=>({getCurrentAudio:()=>null,isPlaying:()=>false,isPaused:()=>true});
 </script><p>Controlled upload fixture. No real VK access.</p>`;
 
-let child,browser,page,remote;
+let child,browser,page,remote,browsers=[];
 const output=[],results=[];let failures=0;
 async function until(fn,message,timeout=12000){const end=Date.now()+timeout;while(Date.now()<end){if(await fn())return;await new Promise(resolve=>setTimeout(resolve,100));}throw Error(message);}
 async function check(name,fn){try{await fn();results.push({name,pass:true});console.log('PASS '+name);}catch(e){failures++;results.push({name,pass:false,error:e.stack});console.log('FAIL '+name+': '+e.stack);}}
-try{
- child=spawn(exe,[],{windowsHide:true,env:{...process.env,VK_PLAYER_QA_PROFILE:profile,VK_PLAYER_QA_FILES:JSON.stringify([file,corrupt,duplicate]),WEBVIEW2_USER_DATA_FOLDER:path.join(root,'browser'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port=9225 --autoplay-policy=no-user-gesture-required --host-resolver-rules="MAP vk.com 127.0.0.1,MAP vk.ru 127.0.0.1"'},stdio:['ignore','pipe','pipe']});
+async function stop(){
+ if(child?.exitCode===null){const exit=new Promise(r=>child.once('exit',r));child.kill();await Promise.race([exit,new Promise(r=>setTimeout(r,3000))]);}
+ await Promise.all(browsers.map(value=>value.close().catch(()=>{})));browsers=[];browser=page=remote=undefined;
+ await new Promise(resolve=>setTimeout(resolve,400));
+}
+async function launch(){
+ const env={...process.env,VK_PLAYER_QA_PROFILE:profile,VK_PLAYER_QA_FILES:JSON.stringify([file,corrupt,duplicate]),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port=0 --autoplay-policy=no-user-gesture-required --host-resolver-rules="MAP vk.com 127.0.0.1,MAP vk.ru 127.0.0.1"'};
+ // The app gives its main and VK documents different browser arguments and
+ // profile directories. A global folder forces both into one incompatible
+ // WebView2 environment and fails before any fixture can be created.
+ delete env.WEBVIEW2_USER_DATA_FOLDER;
+ const mainPortFile=path.join(process.env.LOCALAPPDATA,'ru.vkplayer.independentqa','EBWebView','DevToolsActivePort');
+ const oldMainEndpoint=await readFile(mainPortFile,'utf8').catch(()=>null);
+ child=spawn(exe,[],{windowsHide:true,env,stdio:['ignore','pipe','pipe']});
  child.stdout.on('data',x=>output.push(String(x)));child.stderr.on('data',x=>output.push(String(x)));
- for(let i=0;i<100;i++){try{browser=await chromium.connectOverCDP('http://127.0.0.1:9225',{timeout:600});break;}catch{}if(child.exitCode!==null)throw Error('QA binary exited '+child.exitCode+' '+output.join(''));await new Promise(r=>setTimeout(r,150));}
+ for(let i=0;i<100;i++){try{const endpoint=await readFile(mainPortFile,'utf8');if(endpoint===oldMainEndpoint)throw Error('await new debugger');const port=Number(endpoint.split('\n')[0]);assert.ok(port>0);browser=await chromium.connectOverCDP(`http://127.0.0.1:${port}`,{timeout:600});break;}catch{}if(child.exitCode!==null)throw Error('QA binary exited '+child.exitCode+' '+output.join(''));await new Promise(r=>setTimeout(r,150));}
  assert.ok(browser);
+ browsers.push(browser);
  await until(()=>{page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri.localhost'));return !!page;},'main page missing');
  await page.locator('.app-shell').waitFor();
- const session=await browser.newBrowserCDPSession();await session.send('Target.setDiscoverTargets',{discover:true});
- const routes=async()=>{for(const c of browser.contexts())await c.route(/^https:\/\/vk\.(com|ru)\//,r=>r.fulfill({status:200,contentType:'text/html',body:html}));};
- await routes();session.on('Target.targetCreated',()=>void routes());
+ const routes=async()=>{for(const b of browsers)for(const c of b.contexts())await c.route(/^https:\/\/vk\.(com|ru)\//,r=>r.fulfill({status:200,contentType:'text/html',body:html}));};
+ await routes();
  await page.evaluate(()=>window.desktop.connectVk());
- await until(()=>{remote=browser.contexts().flatMap(c=>c.pages()).find(p=>p!==page&&(/^https:\/\/vk\.(com|ru)\//.test(p.url())||p.url()==='chrome-error://chromewebdata/'));return !!remote;},'remote page missing');
+ // Read each isolated environment's own dynamic IPv4 port. Reusing one fixed
+ // port sends the second environment to IPv6, which this runtime can deny.
+ await until(async()=>{
+  try{
+   const names=(await readdir(profile)).filter(name=>name==='vk-webview'||name.startsWith('vk-webview-'));
+   for(const name of names){
+    const port=Number((await readFile(path.join(profile,name,'EBWebView','DevToolsActivePort'),'utf8')).split('\n')[0]);
+    if(!port)continue;
+    const second=await chromium.connectOverCDP(`http://127.0.0.1:${port}`,{timeout:500});browsers.push(second);return true;
+   }
+  }catch{}
+  return false;
+ },'isolated VK debugger missing');
+ await until(()=>{remote=browsers.flatMap(b=>b.contexts().flatMap(c=>c.pages())).find(p=>p!==page&&(/^https:\/\/vk\.(com|ru)\//.test(p.url())||p.url()==='chrome-error://chromewebdata/'));return !!remote;},'remote page missing');
  await routes();
  if(!await remote.evaluate(()=>!!window.__qaLibrary).catch(()=>false)){
   const dev=await remote.context().newCDPSession(remote);await dev.send('Network.enable');await dev.send('Network.setBypassServiceWorker',{bypass:true});
@@ -75,6 +100,41 @@ try{
   await dev.send('Fetch.enable',{patterns:[{urlPattern:'https://vk.com/*'},{urlPattern:'https://vk.ru/*'}]});await remote.goto('https://vk.com/audio');
  }
  await until(async()=>(await page.evaluate(()=>window.desktop.getVkStatus())).state==='connected','fixture library did not sync');
+}
+async function retainedBinding(id,expected){
+ const envelope=JSON.parse(await readFile(path.join(profile,'library.json'),'utf8'));
+ const managed=new Map(envelope.files).get(id);assert.ok(managed,'verified VK identity has no retained native file binding');
+ assert.equal(await realpath(path.dirname(managed)),await realpath(path.join(profile,'uploaded-audio')));
+ assert.match(path.basename(managed),/^[a-f0-9]{64}-[a-f0-9]{32}\.mp3$/);
+ assert.equal(hash(await readFile(managed)),hash(expected),'retained bytes differ from the exact uploaded source');
+ const resolved=await page.evaluate(id=>window.desktop.resolveVkTrack(id),id);
+ assert.equal(resolved.id,id);assert.equal(resolved.source,'local');assert.match(resolved.url,/^(https?:\/\/asset\.localhost\/|asset:)/);
+ assert.equal(resolved.remote.ownerId,42);assert.equal(resolved.remote.inLibrary,true);
+ const persistent=(await page.evaluate(()=>window.desktop.getState())).tracks.find(track=>track.id===id);
+ assert.equal(persistent.source,'vk');assert.equal(persistent.url,`vk-web://42/${resolved.remote.audioId}`);
+ // The production CSP deliberately grants retained assets only to media-src,
+ // so fetch() cannot test them. Exercise the browser's real decoder instead.
+ const playback=await page.evaluate(async url=>{
+  const audio=new Audio();audio.muted=true;const started=performance.now();
+  let timer;
+  try{
+   const ready=new Promise((resolve,reject)=>{
+    audio.addEventListener('canplay',resolve,{once:true});
+    audio.addEventListener('error',()=>reject(Error('retained audio decode failed: '+audio.error?.code)),{once:true});
+    timer=setTimeout(()=>reject(Error('retained audio never became playable')),5000);
+   });
+   audio.src=url;audio.load();await ready;clearTimeout(timer);await audio.play();
+   await new Promise(resolve=>setTimeout(resolve,350));
+   return{duration:audio.duration,position:audio.currentTime,paused:audio.paused,startMs:Math.round(performance.now()-started-350)};
+  }finally{clearTimeout(timer);audio.pause();audio.removeAttribute('src');audio.load();}
+ },resolved.url);
+ assert.ok(playback.duration>19&&playback.duration<21,'retained source is not the exact 20s generated original');
+ assert.ok(playback.position>.1&&!playback.paused,'retained native asset decoded but did not play');
+ assert.ok(playback.startMs<3000,`retained local startup took ${playback.startMs}ms`);
+ return managed;
+}
+try{
+ await launch();
  await check('real-native-batch-original-bytes-metadata-corrupt-file-and-renamed-duplicate',async()=>{
   const result=await page.evaluate(()=>window.desktop.uploadFilesToVk());
   assert.deepEqual(result.items.map(x=>x.status),['uploaded','failed','skipped']);
@@ -87,10 +147,17 @@ try{
   await until(async()=>(await page.evaluate(()=>window.desktop.getState())).tracks[0]?.id==='vk-42-502','new track absent from native authoritative snapshot');
   const state=await page.evaluate(()=>window.desktop.getState());assert.deepEqual(state.tracks.map(x=>x.id),['vk-42-502','vk-42-1']);assert.equal(state.tracks[0].title,'Tagged Title');assert.equal(state.tracks[0].artist,'Tagged Artist');assert.equal(state.tracks[0].source,'vk');
  });
+ await check('verified-upload-retains-exact-bytes-and-resolves-local-under-the-canonical-vk-identity',async()=>{
+  await retainedBinding('vk-42-502',original);
+  const other=await page.evaluate(()=>window.desktop.resolveVkTrack('vk-42-1'));assert.equal(other.source,'vk');assert.equal(other.id,'vk-42-1');
+  assert.equal((await readdir(path.join(profile,'uploaded-audio'))).length,1,'corrupt/skipped files left unverified staged copies behind');
+ });
  await check('lost-save-confirmation-is-uncertain-never-fake-success',async()=>{
+  const ownedBefore=(await readdir(path.join(profile,'uploaded-audio'))).sort();
   await remote.evaluate(()=>window.__qaMode='save-fails');
   const before=await remote.evaluate(()=>window.__qaSaveCount);const result=await page.evaluate(()=>window.desktop.uploadFilesToVk());
   assert.equal(result.items[0].status,'uncertain');assert.equal(await remote.evaluate(()=>window.__qaSaveCount),before+1);assert.equal(result.items.some(x=>x.status==='uploaded'),false);
+  assert.deepEqual((await readdir(path.join(profile,'uploaded-audio'))).sort(),ownedBefore,'uncertain uploads must not retain a new source binding');
  });
  await check('existing-local-artist-only-tag-uses-filename-title-and-keeps-tagged-artist',async()=>{
   // Reuse only this temporary fixture path so earlier batch scenarios and the
@@ -129,10 +196,21 @@ try{
   assert.ok(state.tracks.some(track=>track.id===local.id&&track.source==='local'),'upload discarded the existing local file');
   const uploaded=state.tracks.find(track=>track.id===trackId);assert.equal(uploaded.title,'Filename Artist - Filename Title');assert.equal(uploaded.artist,'Genuine Tagged Artist');
  });
- console.log(JSON.stringify({passed:5-failures,failed:failures}));
+ await check('retained-upload-survives-original-relocation-and-a-native-process-restart',async()=>{
+  const rows=await remote.evaluate(()=>window.__qaLibrary);
+  await rename(file,path.join(root,'Original moved outside picker.mp3'));
+  await rename(duplicate,path.join(root,'Duplicate moved outside picker.mp3'));
+  await stop();
+  html=html.replace("window.__qaLibrary=[tuple(1,'Existing','QA')];",`window.__qaLibrary=${JSON.stringify(rows)};`);
+  await launch();
+  await until(async()=>(await page.evaluate(()=>window.desktop.getState())).tracks.some(track=>track.id==='vk-42-502'),'restart lost the canonical VK record');
+  await retainedBinding('vk-42-502',original);
+  const saves=await remote.evaluate(()=>window.__qaSaveCount);assert.equal(saves,0,'restoring a local upload binding must not repeat a cloud upload');
+ });
+ console.log(JSON.stringify({passed:results.length-failures,failed:failures}));
 }finally{
- if(child?.exitCode===null){const exit=new Promise(r=>child.once('exit',r));child.kill();await Promise.race([exit,new Promise(r=>setTimeout(r,3000))]);}
+ await stop();
  await writeFile(new URL('./tauri-vk-upload-results.json',import.meta.url),JSON.stringify({checkedAt:new Date().toISOString(),results,output},null,2)+'\n');
- await browser?.close().catch(()=>{});await new Promise(r=>setTimeout(r,500));await rm(root,{recursive:true,force:true}).catch(()=>{});
+ await rm(root,{recursive:true,force:true}).catch(()=>{});
 }
 if(failures)process.exitCode=1;
