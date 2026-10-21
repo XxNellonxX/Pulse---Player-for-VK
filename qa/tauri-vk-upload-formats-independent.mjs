@@ -35,14 +35,22 @@ c.onFail();},0)}};
 window.XMLHttpRequest=class{constructor(){this.upload={};this.status=200;}open(){}send(form){form.get('file').arrayBuffer().then(bytes=>{window.__qaTransfers.push({bytes:Array.from(new Uint8Array(bytes)),name:form.get('file').name});this.responseText='{"response":"fixture_signature"}';this.onload();});}abort(){this.onabort?.();}};
 window.getAudioPlayer=()=>({getCurrentAudio:()=>null,isPlaying:()=>false,isPaused:()=>true,_ensureHasURL:()=>new Promise(()=>{})});
 </script><p>Isolated synthetic runtime only</p>`;
-let child,browser,page,remote;const results=[],output=[],evidence={};
+let child,browser,page,remote;const results=[],output=[],evidence={},noticeOnly=process.argv.includes('--notice-only');
 async function until(fn,message,timeout=20000){const end=Date.now()+timeout;while(Date.now()<end){if(await fn())return;await new Promise(r=>setTimeout(r,100));}throw Error(message);}
 async function check(name,fn){try{await fn();results.push({name,pass:true});console.log('PASS '+name);}catch(error){results.push({name,pass:false,error:error.stack});console.error('FAIL '+name+': '+error.stack);}}
+async function visibleImportNotice(){
+ const notice=page.locator('.notification-card.notification-error').filter({hasText:'Не удалось добавить файлов: 2'});await notice.waitFor({timeout:4000});const text=await notice.innerText();assert.match(text,/обрезан|поврежд|декодир/i);evidence.importNotice=text;return notice;
+}
 try{
  child=spawn(exe,[],{windowsHide:true,env:{...process.env,VK_PLAYER_QA_PROFILE:profile,VK_PLAYER_QA_FILES:JSON.stringify([flac,aac,cut,bad]),WEBVIEW2_USER_DATA_FOLDER:path.join(root,'browser'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port=9248 --autoplay-policy=no-user-gesture-required --host-resolver-rules="MAP vk.com 127.0.0.1,MAP vk.ru 127.0.0.1"'},stdio:['ignore','pipe','pipe']});
  child.stdout.on('data',b=>output.push(String(b)));child.stderr.on('data',b=>output.push(String(b)));
  await until(async()=>{try{browser=await chromium.connectOverCDP('http://127.0.0.1:9248',{timeout:500});return true}catch{return false}},'CDP unavailable');
  await until(()=>{page=browser.contexts().flatMap(c=>c.pages()).find(p=>/tauri.localhost/.test(p.url()));return !!page},'Main view unavailable');await page.locator('.app-shell').waitFor();
+ if(noticeOnly){
+  await check('rejected-files-show-user-visible-count-reason-and-dismiss-control',async()=>{
+   const imported=await page.evaluate(()=>window.desktop.importFiles());evidence.localTracks=imported;assert.deepEqual(imported.map(track=>track.title).sort(),['FLAC Tagged Title','Variable AAC']);const notice=await visibleImportNotice();await notice.getByRole('button',{name:'Закрыть уведомление',exact:true}).click();await notice.waitFor({state:'detached',timeout:2000});assert.equal((await page.evaluate(()=>window.desktop.getState())).tracks.length,2);
+  });
+ }else{
  const session=await browser.newBrowserCDPSession();await session.send('Target.setDiscoverTargets',{discover:true});
  const routeAll=async()=>{for(const context of browser.contexts()){
   await context.route(/^https:\/\/vk\.(com|ru)\//,r=>r.fulfill({status:200,contentType:'text/html',body:html}));
@@ -66,7 +74,7 @@ try{
   await until(async()=>{const status=await remote.evaluate(()=>window.__PULSE_VK_WEB__.playback());return status.playing&&status.position>.3},'Uploaded MP3 failed to advance native playback');const playback=await remote.evaluate(()=>window.__PULSE_VK_WEB__.playback());assert.equal(playback.error,null);assert.equal(playback.requestedId,'vk-42-701');assert.ok(playback.duration>4.9);await page.evaluate(()=>window.desktop.vkWebControl({operation:'pause'}));
  });
  await check('local-flac-and-raw-aac-imports-actually-play-in-webview',async()=>{
-  const imported=await page.evaluate(()=>window.desktop.importFiles());evidence.localTracks=imported;assert.ok(imported.some(t=>t.source==='local'&&t.title==='FLAC Tagged Title'));assert.ok(imported.some(t=>t.source==='local'&&t.title==='Variable AAC'));for(const track of imported){assert.ok(track.duration>0&&Number.isFinite(track.duration));assert.equal(track.available,true);}
+  const imported=await page.evaluate(()=>window.desktop.importFiles());evidence.localTracks=imported;await visibleImportNotice();assert.ok(imported.some(t=>t.source==='local'&&t.title==='FLAC Tagged Title'));assert.ok(imported.some(t=>t.source==='local'&&t.title==='Variable AAC'));for(const track of imported){assert.ok(track.duration>0&&Number.isFinite(track.duration));assert.equal(track.available,true);}
   await page.evaluate(async()=>{const state=await window.desktop.getState();state.settings.volume=0;state.settings.autoSkip=false;state.currentTrackId=null;state.position=0;await window.desktop.saveState(state)});await page.reload();await page.locator('.app-shell').waitFor();await page.getByRole('button',{name:/^Локальные файлы(?:\s+\d+)?$/}).click();evidence.localPlayback=[];
   for(const name of ['FLAC Tagged Title','Variable AAC']){
    await page.getByRole('button',{name:'Воспроизвести '+name,exact:true}).click();
@@ -83,7 +91,8 @@ try{
   assert.deepEqual(again.map(track=>track.id).sort(),firstIds);const state=await page.evaluate(()=>window.desktop.getState());assert.equal(state.tracks.filter(track=>track.source==='local').length,2);for(const [file,digest]of sourceHashes)assert.equal(hash(await readFile(file)),digest);
   await page.reload();await page.locator('.app-shell').waitFor();const restored=await page.evaluate(()=>window.desktop.getState());assert.deepEqual(restored.tracks.filter(track=>track.source==='local').map(track=>track.id).sort(),firstIds);assert.ok(restored.tracks.filter(track=>track.source==='local').every(track=>track.available));
  });
+ }
 }finally{
- if(child?.exitCode===null){const exit=new Promise(r=>child.once('exit',r));child.kill();await Promise.race([exit,new Promise(r=>setTimeout(r,3000))]);}await browser?.close().catch(()=>{});await writeFile(new URL('./tauri-vk-upload-formats-independent-results.json',import.meta.url),JSON.stringify({checkedAt:new Date().toISOString(),results,evidence,output},null,2)+'\n');await new Promise(r=>setTimeout(r,500));await rm(root,{recursive:true,force:true}).catch(()=>{});
+ if(child?.exitCode===null){const exit=new Promise(r=>child.once('exit',r));child.kill();await Promise.race([exit,new Promise(r=>setTimeout(r,3000))]);}await browser?.close().catch(()=>{});await writeFile(new URL(noticeOnly?'./tauri-vk-upload-notice-independent-results.json':'./tauri-vk-upload-formats-independent-results.json',import.meta.url),JSON.stringify({checkedAt:new Date().toISOString(),results,evidence,output},null,2)+'\n');await new Promise(r=>setTimeout(r,500));await rm(root,{recursive:true,force:true}).catch(()=>{});
 }
 process.exitCode=results.some(r=>!r.pass)?1:0;
