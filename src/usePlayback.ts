@@ -32,6 +32,11 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const playIntent = useRef(false)
   const failureTimes = useRef<number[]>([])
   const loadedId = useRef<string | null>(null)
+  // A VK library item can use a verified copy retained by our own upload.
+  // Keep its library identity intact and route controls by the loaded source.
+  const transport = useRef<{ id: string | null; kind: 'pending' | 'web' | 'local' }>({ id: null, kind: 'pending' })
+  const ownedSourceId = useRef<string | null>(null)
+  const ownedFailedId = useRef<string | null>(null)
   const sourceVersion = useRef(0)
   const pendingStart = useRef(false)
   const sourceAbort = useRef<AbortController | null>(null)
@@ -52,7 +57,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const webProgress = useRef(0)
   const webSeeking = useRef(false)
   const current = useMemo(() => state.tracks.find(track => track.id === state.currentTrackId), [state.tracks, state.currentTrackId])
-  const isWebTrack = () => stateRef.current.tracks.find(track => track.id === stateRef.current.currentTrackId)?.url.startsWith('vk-web://') === true
+  const isWebTrack = () => transport.current.id === stateRef.current.currentTrackId && transport.current.kind === 'web'
+  const isLocalTrack = () => transport.current.id === stateRef.current.currentTrackId && transport.current.kind === 'local'
   const controlWeb = useCallback(async (command: VkWebCommand) => {
     if (!window.desktop?.vkWebControl) throw new Error('Подключение плеера VK недоступно в этой версии.')
     const result = await window.desktop.vkWebControl(command)
@@ -190,7 +196,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   useEffect(() => window.desktop?.onVkPlayback?.(status => {
     const s = stateRef.current
     const track = s.tracks.find(item => item.id === s.currentTrackId)
-    if (!track?.url.startsWith('vk-web://')) return
+    if (!track || !isWebTrack()) return
     setEqualizerError(status.equalizerError || '')
     if (status.error && (status.requestedId === track.id || status.id === track.id)) {
       if (Number.isFinite(status.position) && (status.position > 0 || webLatestPosition.current === 0)) {
@@ -249,7 +255,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     let active = true
     const handlers: Array<[string, EventListener]> = []
     const on = (type: string, handler: () => void) => {
-      const listener = () => { if (active) handler() }
+      const listener = () => { if (active && isLocalTrack()) handler() }
       handlers.push([type, listener])
       element.addEventListener(type, listener)
     }
@@ -260,7 +266,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       const ranges = readMediaBuffered(element)
       setBuffered(previous => sameBufferedRanges(previous, ranges) ? previous : ranges)
       setBufferedAhead(secondsBufferedAhead(ranges, element.currentTime))
-      const remote = stateRef.current.tracks.find(track => track.id === stateRef.current.currentTrackId)?.source === 'vk'
+      const remote = ownedSourceId.current !== stateRef.current.currentTrackId && stateRef.current.tracks.find(track => track.id === stateRef.current.currentTrackId)?.source === 'vk'
       setNetwork(element.error ? 'error' : remote && navigator.onLine === false ? 'offline' : element.readyState >= 3 ? 'ready' : element.networkState === 2 ? 'loading' : 'idle')
     }
     const update = () => {
@@ -281,6 +287,15 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const failed = () => {
       if (stallTimer.current) clearTimeout(stallTimer.current)
       stallTimer.current = null
+      // A removed or unreadable retained copy must still allow the exact VK
+      // item to play. Retry through VK once, without skipping the library item.
+      if (ownedSourceId.current && ownedSourceId.current === stateRef.current.currentTrackId) {
+        ownedFailedId.current = ownedSourceId.current; ownedSourceId.current = null
+        transport.current = { id: stateRef.current.currentTrackId, kind: 'pending' }
+        sourceAbort.current?.abort(); loadedId.current = null
+        setReloadNonce(value => value + 1)
+        return
+      }
       pendingStart.current = false
       sourceAbort.current?.abort()
       setPlaying(false); setBuffering(false)
@@ -311,7 +326,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const waiting = () => {
       if (!playIntent.current) return
       setBuffering(true)
-      if (!isWebTrack()) setNetwork(navigator.onLine === false ? 'offline' : 'stalled')
+      if (!isWebTrack()) setNetwork(ownedSourceId.current !== stateRef.current.currentTrackId && navigator.onLine === false ? 'offline' : 'stalled')
       if (!stallTimer.current) stallTimer.current = setTimeout(() => { stallTimer.current = null; if (playIntent.current && !element.ended) failed() }, 15000)
     }
     on('playing', () => { recovered(); setPlaying(true); setError('') })
@@ -342,6 +357,9 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const element = audio.current
     if (!element) return
     const version = ++sourceVersion.current
+    transport.current = { id: current?.id || null, kind: 'pending' }
+    ownedSourceId.current = null
+    if (ownedFailedId.current !== current?.id) ownedFailedId.current = null
     if (snippetRef.current && snippetRef.current.id !== current?.id) clearSnippet()
     setAdvertising(false)
     setBuffered([]); setBufferedAhead(0); setNetwork('idle')
@@ -362,7 +380,14 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     if (pendingStart.current) { playIntent.current = true; setBuffering(true); setNetwork('loading') }
     const load = async () => {
       try {
-        if (current.url.startsWith('vk-web://')) {
+        let resolved = current
+        if (current.source === 'vk' && window.desktop?.resolveVkTrack && ownedFailedId.current !== current.id) {
+          try { resolved = await window.desktop.resolveVkTrack(current.id) }
+          catch (error) { if (!current.url.startsWith('vk-web://')) throw error }
+        }
+        if (sourceVersion.current !== version || controller.signal.aborted) return
+        if (resolved.url.startsWith('vk-web://')) {
+          transport.current = { id: current.id, kind: 'web' }
           const startPosition = stateRef.current.position || 0
           webEnded.current = ''; webPosition.current = startPosition; webLatestPosition.current = startPosition; webProgress.current = startPosition; webSeeking.current = false; webPaused.current = !playIntent.current; webAtEnd.current = false
           if (playIntent.current) {
@@ -373,7 +398,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
             await configureWebEqualizer()
             if (sourceVersion.current !== version || controller.signal.aborted || !playIntent.current) return
             await controlWeb({ operation: 'play', id: current.id, position: startPosition })
-            if (sourceVersion.current !== version || controller.signal.aborted) { if (!stateRef.current.tracks.find(track => track.id === stateRef.current.currentTrackId)?.url.startsWith('vk-web://')) void controlWeb({ operation: 'stop' }).catch(() => {}); return }
+            if (sourceVersion.current !== version || controller.signal.aborted) { if (isLocalTrack()) void controlWeb({ operation: 'stop' }).catch(() => {}); return }
             acceptSnippetStart(current.id, startPosition)
             webLoaded.current = current.id
             webPending.current = null
@@ -382,9 +407,9 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           return
         }
         if (webLoaded.current || webPending.current) { void controlWeb({ operation: 'stop' }).catch(() => {}); webLoaded.current = null; webPending.current = null; webPlaying.current = false }
-        const resolved = current.source === 'vk' && window.desktop ? await window.desktop.resolveVkTrack(current.id) : current
-        if (sourceVersion.current !== version || controller.signal.aborted) return
         if (!resolved.available || !resolved.url) throw new Error('unavailable')
+        transport.current = { id: current.id, kind: 'local' }
+        ownedSourceId.current = current.source === 'vk' && resolved.source === 'local' ? current.id : null
         const resolvedUrl = new URL(resolved.url, location.href)
         // Local Tauri asset responses explicitly permit CORS; browser-local
         // imports are blobs or same-origin URLs. Legacy remote API sources
@@ -511,6 +536,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       setState(previous => previous.currentTrackId === id ? { ...previous, position: savedPosition } : previous)
     }
     loadedId.current = null
+    ownedFailedId.current = null
     playIntent.current = true
     setError('')
     setReloadNonce(value => value + 1)
@@ -531,8 +557,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const previous = useCallback(() => { if ((isWebTrack() ? webPosition.current : audio.current?.currentTime || 0) > 3) seek(0); else next(-1) }, [seek, next])
   useEffect(() => {
     if (!('mediaSession' in navigator)) return
-    navigator.mediaSession.setActionHandler('play', () => { if (isWebTrack() ? !webPlaying.current : audio.current?.paused) toggle() })
-    navigator.mediaSession.setActionHandler('pause', () => { if (isWebTrack() ? webPlaying.current : !audio.current?.paused) toggle() })
+    navigator.mediaSession.setActionHandler('play', () => { if (!playIntent.current && (isWebTrack() ? !webPlaying.current : audio.current?.paused)) toggle() })
+    navigator.mediaSession.setActionHandler('pause', () => { if (playIntent.current || (isWebTrack() ? webPlaying.current : !audio.current?.paused)) toggle() })
     navigator.mediaSession.setActionHandler('nexttrack', () => next())
     navigator.mediaSession.setActionHandler('previoustrack', previous)
     navigator.mediaSession.setActionHandler('seekto', detail => { if (detail.seekTime !== undefined) seek(detail.seekTime) })

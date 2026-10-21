@@ -22,6 +22,7 @@ mod audio_session;
 mod equalizer;
 mod local_audio;
 mod media_prepare;
+mod owned_uploads;
 mod source_page;
 mod updates;
 mod soundcloud;
@@ -417,6 +418,46 @@ fn save_locked(app: &AppHandle, shared: &AppState) -> Result<(), String> {
     shared.recovered.store(false, Ordering::SeqCst);
     Ok(())
 }
+
+// Called only after our upload adapter confirms the exact saved record. The
+// existing native file registry persists the receipt binding across restarts;
+// no renderer field can insert or change a native file path.
+pub(crate) fn remember_uploaded_source(
+    app: &AppHandle,
+    expected: &vk_web::UploadGuard,
+    receipt: &serde_json::Value,
+    source: &Path,
+) -> Result<(), String> {
+    let (id, path) = owned_uploads::verified_binding(&data_dir(app), source, expected.account_id, receipt)
+        .ok_or("Не удалось подтвердить локальную копию загруженного трека.")?;
+    remember_owned_source(app, expected, id, path, false)
+}
+
+fn remember_owned_source(
+    app: &AppHandle,
+    expected: &vk_web::UploadGuard,
+    id: String,
+    path: PathBuf,
+    require_registered_track: bool,
+) -> Result<(), String> {
+    let shared = app.state::<AppState>();
+    let _storage = shared.storage_lock.lock().unwrap();
+    if !vk_web::check_upload_guard(app, expected) {
+        return Err("Аккаунт VK изменился. Локальная копия не привязана.".into());
+    }
+    if require_registered_track && !shared.state.lock().unwrap().tracks.iter()
+        .any(|track| track.id == id && owned_uploads::own_track(expected.account_id, track)) {
+        return Err("Этот трек больше не находится в вашей музыке VK. Исходник не привязан.".into());
+    }
+    app.asset_protocol_scope().allow_file(&path).map_err(|_| "Не удалось разрешить воспроизведение исходника.")?;
+    let previous = shared.media.lock().unwrap().insert(id.clone(), path);
+    if let Err(error) = save_locked(app, &shared) {
+        let mut media = shared.media.lock().unwrap();
+        if let Some(previous) = previous { media.insert(id, previous); } else { media.remove(&id); }
+        return Err(error);
+    }
+    Ok(())
+}
 fn is_audio(p: &Path) -> bool {
     matches!(
         p.extension()
@@ -642,6 +683,54 @@ async fn upload_local_track_to_vk(app: AppHandle, id: String) -> Result<serde_js
         }
     };
     vk_upload::upload_files(app, vec![source], guard).await
+}
+
+#[tauri::command]
+async fn attach_vk_source(app: AppHandle, id: String) -> Result<serde_json::Value, String> {
+    let _permit = ImportPermit::acquire(&app)?;
+    let expected = vk_web::upload_guard(&app)?;
+    // The renderer chooses an existing record, never a native path or a
+    // synthetic receipt. Native ownership is checked before opening a dialog.
+    let track = app.state::<AppState>().state.lock().unwrap().tracks.iter()
+        .find(|track| track.id == id && owned_uploads::own_track(expected.account_id, track)).cloned()
+        .ok_or("Исходник можно подключить только к треку из вашей музыки VK.")?;
+    let selected = if cfg!(debug_assertions) && std::env::var_os("VK_PLAYER_QA_FILES").is_some() {
+        let paths: Vec<PathBuf> = serde_json::from_str(&std::env::var("VK_PLAYER_QA_FILES").unwrap_or_default())
+            .map_err(|_| "Некорректный список тестовых файлов.")?;
+        if paths.len() > 1 { return Err("Выберите один исходный аудиофайл.".into()); }
+        paths.into_iter().next()
+    } else {
+        rfd::AsyncFileDialog::new().set_title("Подключить исходный файл к выбранному треку VK")
+            .add_filter("Аудио", &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aiff", "aif", "webm"])
+            .pick_file().await.map(|file| file.path().to_path_buf())
+    };
+    let Some(selected) = selected else { return Ok(serde_json::json!({"attached":false})); };
+    if !vk_web::check_upload_guard(&app, &expected) {
+        return Err("Аккаунт VK изменился. Исходник не привязан.".into());
+    }
+    let tools = import_tools(&app)?;
+    let profile = data_dir(&app);
+    let imports = profile.join("imports");
+    fs::create_dir_all(&imports).map_err(|_| "Не удалось создать папку подготовки аудио.")?;
+    import_progress(&app, "prepare", "Проверяем исходный аудиофайл для выбранного трека VK", 1, 1);
+    let prepared = media_prepare::for_vk(&selected, &tools, &imports).await?;
+    let source = prepared.path.clone();
+    let stage_profile = profile.clone();
+    let staged = tauri::async_runtime::spawn_blocking(move || owned_uploads::stage(&stage_profile, &source))
+        .await.map_err(|_| "Не удалось сохранить исходник трека.")??;
+    let save_app = app.clone();
+    let save_path = staged.path.clone();
+    // Selection explicitly associates this file with this exact record. There
+    // is no metadata match and no upload/save request to VK in this command.
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = owned_uploads::resolve(&profile, &save_path, expected.account_id, &track)
+            .ok_or("Не удалось проверить сохранённый исходник трека.")?;
+        remember_owned_source(&save_app, &expected, id, path, true)
+    }).await.map_err(|_| "Не удалось сохранить привязку исходника.")??;
+    staged.retain();
+    drop(prepared);
+    import_progress(&app, "complete", "Исходный файл подключён. Библиотека VK сохранена.", 1, 1);
+    Ok(serde_json::json!({"attached":true}))
 }
 #[tauri::command]
 async fn import_from_url(
@@ -1306,7 +1395,7 @@ pub(crate) fn merge_web_search_results(state: &mut PersistedState, tracks: &mut 
     Ok(())
 }
 #[tauri::command]
-async fn resolve_vk_track(shared: State<'_, AppState>, id: String) -> Result<Track, String> {
+async fn resolve_vk_track(app: AppHandle, shared: State<'_, AppState>, id: String) -> Result<Track, String> {
     let track = shared
         .state
         .lock()
@@ -1320,6 +1409,31 @@ async fn resolve_vk_track(shared: State<'_, AppState>, id: String) -> Result<Tra
         return Ok(track);
     }
     if vk_web::valid_web_track(&track) {
+        // Only an app-uploaded, verified own record can resolve to a local
+        // source. A cache miss is immediate and preserves normal VK playback.
+        let owned_path = shared.media.lock().unwrap().get(&id).cloned();
+        if let (Some(path), Ok(expected)) = (owned_path, vk_web::upload_guard(&app)) {
+            let profile = data_dir(&app);
+            let candidate = track.clone();
+            let account = expected.account_id;
+            let local = tauri::async_runtime::spawn_blocking(move || owned_uploads::resolve(&profile, &path, account, &candidate))
+                .await.map_err(|_| "Не удалось проверить сохранённый исходник трека.")?;
+            if !vk_web::check_upload_guard(&app, &expected) {
+                return Err("Аккаунт VK изменился. Запуск трека отменён.".into());
+            }
+            if !shared.state.lock().unwrap().tracks.iter().any(|current| current.id == id && current.available && vk_web::valid_web_track(current)
+                && current.remote.as_ref().is_some_and(|remote| remote.owner_id == account && remote.in_library)) {
+                return Err("Трек удалён во время проверки исходника.".into());
+            }
+            if let Some(path) = local {
+                let mut resolved = track;
+                resolved.url = path.to_string_lossy().into_owned();
+                // This is a transient playback response only. The registry,
+                // VK badge, membership and canonical vk-web URL stay intact.
+                resolved.source = "local".into();
+                return Ok(resolved);
+            }
+        }
         return Ok(track);
     }
     let Some(remote) = track.remote.clone() else {
@@ -1548,6 +1662,7 @@ pub fn run() {
             import_files,
             upload_files_to_vk,
             upload_local_track_to_vk,
+            attach_vk_source,
             import_from_url,
             remove_track,
             open_external,

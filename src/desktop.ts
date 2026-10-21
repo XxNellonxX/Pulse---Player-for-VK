@@ -15,6 +15,7 @@ if (isTauri()) {
     saveState: state => invoke('save_state', { state: { ...state, tracks: [], playlists: state.playlists.filter(playlist => !playlist.remote) } }),
     importFiles: async () => (await invoke<Track[]>('import_files')).map(track),
     uploadFilesToVk: () => invoke('upload_files_to_vk'),
+    attachVkSource: id => invoke('attach_vk_source', { id }),
     uploadLocalTrackToVk: id => invoke('upload_local_track_to_vk', { id }),
     importFromUrl: async (url, destination, proxy) => {
       const result = await invoke<import('./shared/contracts').UploadBatchResult>('import_from_url', { url, destination, proxy: proxy || null })
@@ -42,7 +43,7 @@ if (isTauri()) {
     vkPlaylistChange: input => invoke('vk_playlist_change', { playlistId: null, title: null, description: null, trackIds: null, track: null, ...input }),
     searchVk: query => invoke('search_vk', { query }),
   artistMusic: input => invoke('vk_artist_music', { input }),
-    resolveVkTrack: id => invoke('resolve_vk_track', { id }),
+    resolveVkTrack: async id => track(await invoke<Track>('resolve_vk_track', { id })),
     vkWebControl: command => invoke('vk_web_control', { id: null, position: null, volume: null, equalizer: null, ...command }),
     onVkUpdate(callback) {
       let disposed = false

@@ -11,6 +11,7 @@
   const CANCELLED = 'PULSE_DIRECT_CANCELLED';
   const RESOLVE_TIMEOUT = 20000;
   const LOAD_TIMEOUT = 25000;
+  const START_TIMEOUT = 60000;
   const failure = message => new Error(message);
   const cancelled = () => Object.assign(new Error('Команда воспроизведения отменена.'), { code: CANCELLED });
   const int = value => Number.isSafeInteger(Number(value)) ? Number(value) : 0;
@@ -125,6 +126,7 @@
     let lastProgressAt = Date.now();
     let healthyRecoverySeconds = 0;
     let hasPlayed = false;
+    let initialPlayBudget = null;
     let equalizerSettings = { enabled: false, bands: Array(10).fill(0), preamp: 0 };
     let equalizerGraph = null;
     let equalizerError = null;
@@ -168,7 +170,7 @@
       hasPlayed = false;
       observedPosition = 0;
     }
-    function invalidate() { epoch++; action++; desired = false; recovering = false; recoveryTask = null; cancelWaiting(); disposeMedia(); buffering = false; }
+    function invalidate() { epoch++; action++; desired = false; recovering = false; recoveryTask = null; initialPlayBudget = null; cancelWaiting(); disposeMedia(); buffering = false; }
     function bounded(promise, timeout, generation, message) {
       return new Promise((resolve, reject) => {
         let settled = false;
@@ -278,10 +280,15 @@
       }, generation);
       let releaseLoad = () => {};
       const loaded = new Promise((resolve, reject) => {
-        const offReady = listen(target, 'loadedmetadata', () => resolve(), generation);
-        const offCanPlay = listen(target, 'canplay', () => resolve(), generation);
+        // Duration and headers do not establish that the decoder has audio.
+        // Some dead CDN responses publish metadata and then never provide a
+        // frame. Keep trying the other granted sources in that case.
+        const playable = () => { if (target.readyState >= 3) resolve(); };
+        const offReady = listen(target, 'loadedmetadata', playable, generation);
+        const offData = listen(target, 'loadeddata', playable, generation);
+        const offCanPlay = listen(target, 'canplay', playable, generation);
         const offError = listen(target, 'error', () => reject(failure('Источник VK не загрузился.')), generation);
-        releaseLoad = () => { offReady(); offCanPlay(); offError(); };
+        releaseLoad = () => { offReady(); offData(); offCanPlay(); offError(); };
       });
       // A synchronous engine error can reject before the deadline check below.
       // Keep that promise observed even if the candidate has already expired.
@@ -298,8 +305,29 @@
           // to inline transmuxing if the WebView CSP blocks worker creation.
           hls = new Hls({ enableWorker: true, emeEnabled: false, backBufferLength: 30, maxBufferLength: 120, maxMaxBufferLength: 180, maxBufferSize: 8 * 1024 * 1024, manifestLoadingMaxRetry: 1, levelLoadingMaxRetry: 1, fragLoadingMaxRetry: 3 });
           const engine = hls;
+          let networkRepairs = 0;
+          let repairPosition = -1;
           engine.on(Hls.Events.ERROR, (_event, data) => {
             if (!isCurrent(generation) || hls !== engine || !data?.fatal) return;
+            // A failed future fragment is not a failure of already buffered
+            // audio. Retain those bytes while HLS retries the network in the
+            // same engine; the media-clock watchdog still renews a genuinely
+            // frozen source once playback actually stops progressing.
+            const current = Number(target.currentTime) || 0;
+            let ahead = 0;
+            try {
+              for (let index = 0; index < target.buffered.length; index++) {
+                if (target.buffered.start(index) <= current + .05 && target.buffered.end(index) > current) ahead = target.buffered.end(index) - current;
+              }
+            } catch { /* Detached TimeRanges cannot prove playable audio. */ }
+            if (data.type === (Hls.ErrorTypes?.NETWORK_ERROR || 'networkError') && ready && desired && !recovering && target.readyState >= 3 && ahead > 3) {
+              if (current > repairPosition + 10) networkRepairs = 0;
+              if (networkRepairs < 2 && typeof engine.startLoad === 'function') {
+                networkRepairs++; repairPosition = current;
+                try { engine.startLoad(-1); } catch { /* Keep draining valid buffered audio. */ }
+              }
+              return;
+            }
             // A fatal segment/decoder error can be transient. Renew only the
             // account-authorized source, keeping the audible position and intent.
             if (ready && desired && !recovering) recoverSource();
@@ -317,27 +345,37 @@
       check(generation);
       remaining();
     }
-    async function resolveSource(raw, player, generation, fallback = false, renewal = false) {
+    async function resolveSource(raw, player, generation, fallback = false, renewal = false, hardDeadline = Infinity) {
       const input = normalize(raw);
       let audio = input;
       let lastError;
+      let fallbackSource = typeof raw?.__pulseFallbackSource === 'function' ? () => raw.__pulseFallbackSource() : null;
+      const attempted = new Set();
       // Keep the full source phase within the native receipt's existing
       // 20s resolve + 25s load budget, including an expired cached candidate.
-      const deadline = Date.now() + RESOLVE_TIMEOUT + LOAD_TIMEOUT;
+      const deadline = Math.min(hardDeadline, Date.now() + RESOLVE_TIMEOUT + LOAD_TIMEOUT);
       async function loadSources(sources, loadDeadline) {
+        sources = sources.filter(source => !attempted.has(source.url));
         if (fallback && sources.length > 1) sources.push(sources.shift());
         for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
           check(generation);
           if (Date.now() >= loadDeadline) break;
           const remaining = Math.max(1, loadDeadline - Date.now());
           const remainingSources = sources.length - sourceIndex;
-          const sourceTimeout = Math.max(2500, Math.floor(remaining / remainingSources));
+          // A healthy alternative must not sit behind a silent CDN for half
+          // the full load budget. Preserve provider quality/order, but move
+          // on promptly while there are other explicit candidates to try.
+          const sourceTimeout = remainingSources > 1
+            ? Math.min(4000, Math.max(2500, Math.floor(remaining / remainingSources)))
+            : remaining;
+          attempted.add(sources[sourceIndex].url);
           try { await define(sources[sourceIndex], generation, Math.min(remaining, sourceTimeout)); return true; }
           catch (failureValue) { if (failureValue?.code === CANCELLED) throw failureValue; lastError = failureValue; }
         }
         return false;
       }
       const sourceResolver = typeof raw?.__pulseResolveSource === 'function';
+      const refreshResolver = typeof raw?.__pulseRefreshSource === 'function';
       const websiteResolver = typeof player?._ensureHasURL === 'function';
       // Uploaded audio can already contain its complete playable file, even
       // alongside reload hashes or only in extra.audio_streams. The website's
@@ -346,31 +384,71 @@
       // Renewals and artist access-key closures must still obtain fresh data.
       if (!renewal && !sourceResolver) {
         const supplied = sourceList(input, player);
-        const cachedBudget = websiteResolver ? 8000 : LOAD_TIMEOUT;
+        const cachedBudget = refreshResolver || websiteResolver ? 8000 : LOAD_TIMEOUT;
         if (supplied.length && await loadSources(supplied, Math.min(deadline, Date.now() + cachedBudget))) return;
       }
       // Artist/release APIs provide full streams and an access key rather
       // than website reload hashes. Their private closure refreshes those
       // exact sources inside the same signed-in VK document on every load
       // and renewal; URLs and credentials never cross the native bridge.
+      let resolved = false;
       if (sourceResolver) {
-        const result = await bounded(raw.__pulseResolveSource(), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.');
+        let result;
+        try { result = await bounded(raw.__pulseResolveSource(), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.'); }
+        catch (failureValue) {
+          check(generation);
+          if (!fallbackSource || failureValue?.code === CANCELLED) throw failureValue;
+          lastError = failureValue;
+        }
         check(generation);
-        audio = normalize(result);
-        if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
-      } else if (websiteResolver) {
+        if (result != null) {
+          // Validation is deliberately outside the recoverable request catch.
+          // A changed identity/restriction is final, not permission to fall back.
+          audio = normalize(result);
+          if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
+          if (typeof result?.__pulseFallbackSource === 'function') fallbackSource = () => result.__pulseFallbackSource();
+        } else if (!fallbackSource) throw failure('VK не предоставил доступный аудиоисточник для этого трека.');
+        resolved = true;
+      } else if (refreshResolver) {
+        // Warm URLs normally start without an API round trip. If the CDN no
+        // longer answers, the adapter can privately refresh this exact item
+        // through the signed-in AudioApi instead of only its legacy hashes.
+        let result;
+        try { result = await bounded(raw.__pulseRefreshSource(), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.'); }
+        catch (failureValue) { check(generation); if (failureValue?.code === CANCELLED) throw failureValue; }
+        check(generation);
+        if (result != null) {
+          audio = normalize(result);
+          if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
+          if (typeof result?.__pulseFallbackSource === 'function') fallbackSource = () => result.__pulseFallbackSource();
+          resolved = true;
+        }
+      }
+      if (!resolved && websiteResolver) {
         const result = await bounded(player._ensureHasURL({ ...input, url: undefined }), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.');
         check(generation);
         audio = normalize(result);
         if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
-      } else if (lastError) {
+      } else if (!resolved && lastError) {
         throw lastError;
       }
-      const sources = sourceList(audio, player);
-      if (!sources.length) throw failure('VK не предоставил доступный аудиоисточник для этого трека.');
+      const sources = sourceResolver && lastError && audio === input ? [] : sourceList(audio, player);
+      if (!sources.length && !fallbackSource) throw failure('VK не предоставил доступный аудиоисточник для этого трека.');
       // A repeatedly broken primary source may have a valid alternate stream.
       // Every explicit fallback receives a bounded share of the remaining time.
-      if (await loadSources(sources, Math.min(deadline, Date.now() + LOAD_TIMEOUT))) return;
+      if (await loadSources(sources, Math.min(deadline, Date.now() + (fallbackSource ? 4000 : LOAD_TIMEOUT)))) return;
+      if (fallbackSource && Date.now() < deadline) {
+        // The exact API and the website's tuple resolver can grant different
+        // working deliveries for the same item. Only the adapter can supply
+        // this second private route; artist access-key closures do not opt in.
+        const result = await bounded(fallbackSource(), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.');
+        check(generation);
+        if (result != null) {
+          const alternate = normalize(result);
+          if (alternate.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
+          if (await loadSources(sourceList(alternate, player), Math.min(deadline, Date.now() + LOAD_TIMEOUT))) return;
+        }
+      }
       throw lastError || failure('Источник VK не загрузился.');
     }
     function terminalFailure() {
@@ -384,6 +462,7 @@
       if (Number.isFinite(media?.duration) && media.duration > 0) knownDuration = media.duration;
       if (recoveryCount >= 2) { terminalFailure(); return; }
       const generation = epoch, revision = ++action;
+      const recoveryDeadline = Date.now() + RESOLVE_TIMEOUT + LOAD_TIMEOUT;
       healthyRecoverySeconds = 0;
       recovering = true; buffering = true; error = null; ended = false;
       disposeMedia();
@@ -391,7 +470,8 @@
         while (recoveryCount < 2) {
           recoveryCount++;
           try {
-            await resolveSource(sourceInput, sourcePlayer, generation, recoveryCount > 1, true);
+            if (Date.now() >= recoveryDeadline) break;
+            await resolveSource(sourceInput, sourcePlayer, generation, recoveryCount > 1, true, recoveryDeadline);
             check(generation);
             if (revision !== action || !desired) throw cancelled();
             const target = media;
@@ -403,7 +483,9 @@
             const playing = Promise.resolve(target.play()).then(() => {
               if (!isCurrent(generation) || revision !== action || !desired || media !== target) { if (!isCurrent(generation) || media !== target || !desired) target.pause(); throw cancelled(); }
             });
-            await bounded(playing, LOAD_TIMEOUT, generation, 'VK не подтвердил восстановление трека.');
+            const remaining = recoveryDeadline - Date.now();
+            if (remaining <= 0) throw failure('VK не подтвердил восстановление трека.');
+            await bounded(playing, Math.min(LOAD_TIMEOUT, remaining), generation, 'VK не подтвердил восстановление трека.');
             check(generation);
             if (revision !== action || !desired || media !== target) { if (media !== target || !desired) target.pause(); throw cancelled(); }
             resumePosition = mediaPosition(); lastProgressAt = Date.now();
@@ -426,9 +508,14 @@
         sourceInput = raw; sourcePlayer = player; recoveryCount = 0;
         resumePosition = 0; knownDuration = 0; lastProgressAt = Date.now(); healthyRecoverySeconds = 0;
         const generation = epoch; error = null; ended = false; buffering = true;
+        const started = Date.now();
         try {
           if (account <= 0) throw failure('Войдите в VK для воспроизведения.');
           await resolveSource(raw, player, generation);
+          // Source resolution/loading and its first play share one budget.
+          // Keep the remaining duration, not an absolute timestamp: a user
+          // can legitimately leave a preloaded track paused before playing.
+          initialPlayBudget = Math.max(1, Math.min(LOAD_TIMEOUT, START_TIMEOUT - (Date.now() - started)));
         } catch (failureValue) {
           if (failureValue?.code === CANCELLED || !isCurrent(generation)) throw cancelled();
           desired = false; buffering = false; disposeMedia();
@@ -441,14 +528,18 @@
         check(generation);
         if (!media || !ready) throw failure('Сначала загрузите доступный трек VK.');
         const revision = ++action; const target = media;
+        const deadline = Date.now() + (initialPlayBudget ?? LOAD_TIMEOUT);
+        initialPlayBudget = null;
         desired = true; ended = false; error = null; buffering = target.readyState < 3;
         try {
-          if (equalizerSettings.enabled || equalizerGraph) await applyEqualizer();
+          if (equalizerSettings.enabled || equalizerGraph) await applyEqualizer(Math.min(deadline, Date.now() + 1500));
           if (!isCurrent(generation) || action !== revision || !desired || media !== target) throw cancelled();
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw failure('Воспроизведение VK не началось. Повторите запуск.');
           const playing = Promise.resolve(target.play()).then(() => {
             if (!isCurrent(generation) || action !== revision || !desired || media !== target) { if (!isCurrent(generation) || media !== target || !desired) target.pause(); throw cancelled(); }
           });
-          await bounded(playing, LOAD_TIMEOUT, generation, 'Воспроизведение VK не началось. Повторите запуск.');
+          await bounded(playing, Math.min(LOAD_TIMEOUT, remaining), generation, 'Воспроизведение VK не началось. Повторите запуск.');
           if (!isCurrent(generation) || action !== revision || !desired || media !== target) { if (!isCurrent(generation) || media !== target || !desired) target.pause(); throw cancelled(); }
           buffering = false; lastProgressAt = Date.now();
         } catch (failureValue) {

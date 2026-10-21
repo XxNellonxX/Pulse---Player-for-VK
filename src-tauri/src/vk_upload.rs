@@ -184,11 +184,14 @@ async fn upload_one(
     app: &AppHandle,
     expected: &UploadGuard,
     source: &UploadSource,
+    original_name: &str,
     current: usize,
     total: usize,
 ) -> Result<Value, String> {
     guard(app, expected)?;
-    let name = public_name(&source.path);
+    // The owned staging filename is private bookkeeping. VK should see the
+    // user's original filename (with MP3 extension after format preparation).
+    let name = Path::new(original_name).with_extension("mp3").to_string_lossy().into_owned();
     if !source
         .path
         .extension()
@@ -356,6 +359,14 @@ pub(crate) async fn upload_files(
                 continue;
             }
         }
+        let staging_profile = crate::data_dir(&app);
+        let staging_source = source.path.clone();
+        let staged = match tauri::async_runtime::spawn_blocking(move || crate::owned_uploads::stage(&staging_profile, &staging_source)).await {
+            Ok(Ok(staged)) => staged,
+            Ok(Err(message)) => { items.push(json!({"name":name,"status":"failed","message":message})); continue; }
+            Err(_) => { items.push(json!({"name":name,"status":"failed","message":"Не удалось сохранить исходник загрузки."})); continue; }
+        };
+        source.path = staged.path.clone();
         let path = source.path.clone();
         let digest = tauri::async_runtime::spawn_blocking(move || fingerprint(&path))
             .await
@@ -371,12 +382,28 @@ pub(crate) async fn upload_files(
             }
             _ => {}
         }
-        let result = upload_one(&app, &expected, &source, index + 1, total).await;
-        drop(prepared);
+        let result = upload_one(&app, &expected, &source, &name, index + 1, total).await;
         let mut item = match result {
             Ok(value) => value,
             Err(message) => json!({"status":"failed","message":message}),
         };
+        if item.get("status").and_then(Value::as_str) == Some("uploaded") {
+            let save_app = app.clone();
+            let save_guard = expected.clone();
+            let save_receipt = item.clone();
+            let save_path = staged.path.clone();
+            match tauri::async_runtime::spawn_blocking(move || crate::remember_uploaded_source(&save_app, &save_guard, &save_receipt, &save_path)).await {
+                Ok(Ok(())) => staged.retain(),
+                _ => {
+                    // The cloud write already succeeded: never suggest retrying
+                    // that mutation because a local disk save failed.
+                    item["message"] = json!("Загружен в VK и подтверждён в библиотеке. Локальную копию сохранить не удалось; будет использован источник VK.");
+                }
+            }
+        }
+        // The verified owned copy is committed before the generated upload
+        // conversion or a URL import's original download can be removed.
+        drop(prepared);
         item["name"] = json!(name);
         // Return a bounded report, never arbitrary official page data.
         items.push(json!({"name":item["name"],"status":item["status"],"message":item["message"],"trackId":item.get("trackId").filter(|id| id.as_str().is_some_and(|id| id.len()<100))}));

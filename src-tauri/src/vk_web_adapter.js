@@ -22,6 +22,7 @@
   const MAX_ITEMS = 100000;
   const MAX_PAGES = 2000;
   const REQUEST_TIMEOUT = 20000;
+  const PLAYBACK_LOOKUP_TIMEOUT = 8000;
   const UNVERSIONED_PLAYLIST_CACHE_MS = 10 * 60 * 1000;
   const tuples = new Map();
   const knownTracks = new Map();
@@ -47,6 +48,7 @@
   let equalizerError = null;
   let playbackIntentSequence = 0;
   let direct = null;
+  let audioRuntime = null;
   function directPlayer() {
     if (!direct) {
       if (typeof w.__PULSE_CREATE_DIRECT_AUDIO__ !== 'function') throw new Error('Прямой аудиоплеер не загрузился. Перезапустите Pulse.');
@@ -173,11 +175,11 @@
     } catch { /* The source link is optional; VK will enforce access checks. */ }
     return '';
   }
-  function request(url, params, run, owner) {
+  function request(url, params, run, owner, timeout = REQUEST_TIMEOUT) {
     valid(run, owner);
     return new Promise((resolve, reject) => {
       let done = false;
-      const timer = setTimeout(() => finish(new Error('request_timeout')), REQUEST_TIMEOUT);
+      const timer = setTimeout(() => finish(new Error('request_timeout')), timeout);
       function finish(error, args) {
         if (done) return;
         done = true;
@@ -199,18 +201,19 @@
     if ((typeof value !== 'number' && !(typeof value === 'string' && /^\d+$/.test(value))) || n < 0 || n > MAX_ITEMS || Number(value) !== n) throw new Error('invalid_collection_count');
     return n;
   }
-  async function readSongs(owner, playlistId, accessHash, run, sessionOwner, onPage, declaredRestricted = false) {
+  async function readSongs(owner, playlistId, accessHash, run, sessionOwner, onPage, declaredRestricted = false, lookup = null) {
     let offset = 0;
     let expected = null;
     const all = [];
     const seenPages = new Set();
     const libraryIds = playlistId === -1 ? new Set() : null;
-    for (let page = 0; page < MAX_PAGES; page++) {
+    for (let page = 0; page < (lookup?.maxPages || MAX_PAGES); page++) {
+      if (lookup && Date.now() >= lookup.deadline) throw new Error('cached_track_unavailable');
       const [data] = await request('al_audio.php', {
         act: 'load_section', type: 'playlist', owner_id: owner, playlist_id: playlistId,
         access_hash: accessHash || '', offset, is_loading_all: 1, is_preload: 0,
         context: 'my', claim: 0,
-      }, run, sessionOwner);
+      }, run, sessionOwner, lookup ? Math.max(1, Math.min(REQUEST_TIMEOUT, lookup.deadline - Date.now())) : REQUEST_TIMEOUT);
       if (playlistId === -1) state.cacheStats.libraryPages++;
       else state.cacheStats.playlistPages++;
       if (data === false && declaredRestricted) throw new Error('playlist_restricted');
@@ -238,6 +241,9 @@
       all.push(...data.list);
       if (all.length > total || all.length > MAX_ITEMS) throw new Error('contradictory_audio_count');
       onPage?.(all.length, total);
+      // Playback needs one exact tuple, not a complete authoritative snapshot.
+      // Catalog synchronization still reads and validates every page.
+      if (lookup && pageIds.includes(lookup.id)) return data.list;
       if (all.length === total) return all;
       if (!data.list.length) throw new Error('incomplete_audio_page');
       // VK's own loadAllPlaylistAudios uses numeric offsets with
@@ -247,16 +253,17 @@
       if (next <= offset) throw new Error('nonadvancing_audio_page');
       offset = next;
     }
-    throw new Error('page_limit');
+    throw new Error(lookup ? 'cached_track_unavailable' : 'page_limit');
   }
-  async function readPlaylists(run, owner) {
+  async function readPlaylists(run, owner, deadline = Infinity) {
     const cards = [];
     const seen = new Set();
     let expected = null;
     for (let page = 0; page < MAX_PAGES; page++) {
+      if (Date.now() >= deadline) throw new Error('cached_track_unavailable');
       const [items, rawCount] = await request('al_audio.php?act=owner_playlists', {
         owner_id: owner, group_id: 0, offset: cards.length, is_attach: 0,
-      }, run, owner);
+      }, run, owner, Math.max(1, Math.min(REQUEST_TIMEOUT, deadline - Date.now())));
       if (!Array.isArray(items)) throw new Error('invalid_playlist_page');
       const total = count(rawCount);
       if (expected !== null && expected !== total) throw new Error('collection_changed');
@@ -508,17 +515,163 @@
       return { ...result, ...audio, id: desiredTrack || null, requestedId: desiredTrack || null, advertising: false, error: playbackError || audio.error, equalizerError: audio.equalizerError || equalizerError };
     } catch { return { ...result, error: 'Не удалось прочитать состояние аудиоплеера.' }; }
   }
-  async function resolveCachedTuple(id, run, owner) {
-    if (tuples.has(id)) return tuples.get(id);
+  function audioApi() {
+    // Reuse the same session-owned AudioApi as the artist catalog. Its
+    // getById call does not require scanning thousands of library entries.
+    if (!audioRuntime) w.webpackChunkvkweb?.push([[`pulse-audio-${Date.now()}-${Math.random()}`], {}, require => { audioRuntime = require; }]);
+    if (typeof audioRuntime !== 'function' || !audioRuntime.m?.[217528] || !audioRuntime.m?.[518943]) return null;
+    const container = audioRuntime(217528)?.ensureDIRootWebContainer?.();
+    const api = container?.resolve?.(audioRuntime(518943)?.AudioApi);
+    return typeof api?.getById === 'function' ? api : null;
+  }
+  async function exactTuple(api, track, run, owner, timeout, initialAccess = '', legacyRaw = null) {
+    const expected = { owner: integer(track.remote.ownerId), id: integer(track.remote.audioId) };
+    const fetchRow = async (access = '', checkRun = false) => {
+      if (checkRun) valid(run, owner);
+      else if (currentAccount() !== owner || account !== owner) throw new Error('session_changed');
+      let timer;
+      try {
+        const rows = await Promise.race([
+          Promise.resolve().then(() => api.getById({ audios: `${expected.owner}_${expected.id}${access ? `_${access}` : ''}` })),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('cached_track_lookup_timeout')), timeout); }),
+        ]);
+        if (checkRun) valid(run, owner);
+        else if (currentAccount() !== owner || account !== owner) throw new Error('session_changed');
+        return Array.isArray(rows) ? rows.find(row => row && !Array.isArray(row) && integer(row.owner_id) === expected.owner && integer(row.id) === expected.id) || null : null;
+      } finally { clearTimeout(timer); }
+    };
+    const row = await fetchRow(initialAccess, true);
+    if (!row) return null;
+    const toTuple = value => {
+      const tuple = [];
+      const put = (name, fallback, item) => { tuple[Number.isInteger(w.AudioUtils?.[name]) ? w.AudioUtils[name] : fallback] = item; };
+      put('AUDIO_ITEM_INDEX_ID', 0, value.id); put('AUDIO_ITEM_INDEX_OWNER_ID', 1, value.owner_id);
+      put('AUDIO_ITEM_INDEX_URL', 2, value.url); put('AUDIO_ITEM_INDEX_TITLE', 3, value.title);
+      put('AUDIO_ITEM_INDEX_PERFORMER', 4, value.artist); put('AUDIO_ITEM_INDEX_DURATION', 5, value.duration);
+      tuple[6] = value.album?.id; tuple[9] = value.has_lyrics; tuple[10] = 0;
+      put('AUDIO_ITEM_INDEX_EXTRA', 12, { audio_streams: Array.isArray(value.audio_streams) ? value.audio_streams : [] });
+      put('AUDIO_ITEM_INDEX_HASHES', 13, '');
+      put('AUDIO_ITEM_INDEX_COVER_URL', 14, value.thumb?.photo_600 || value.thumb?.photo_300 || value.album?.thumb?.photo_600 || value.album?.thumb?.photo_300 || '');
+      tuple[16] = value.subtitle;
+      put('AUDIO_ITEM_INDEX_MAIN_ARTISTS', 17, value.main_artists || []);
+      put('AUDIO_ITEM_INDEX_FEAT_ARTISTS', 18, value.featured_artists || []);
+      put('AUDIO_ITEM_INDEX_ALBUM', 19, value.album); tuple[20] = value.track_code;
+      put('AUDIO_ITEM_INDEX_RESTRICTION', 21, value.restriction_status || 0); tuple[24] = value.access_key;
+      if (value.available === false || value.isRestricted === true) tuple.available = false;
+      return tuple;
+    };
+    const tuple = toTuple(row);
+    if (!Number(row.restriction_status || 0) && row.available !== false && row.isRestricted !== true && !hasTupleSource(tuple)) return null;
+    let initial = true, access = typeof row.access_key === 'string' ? row.access_key : initialAccess;
+    Object.defineProperty(tuple, '__pulseResolveSource', { value: async () => {
+      if (currentAccount() !== owner || account !== owner) throw new Error('session_changed');
+      // The first transport load consumes this freshly fetched row. Renewals
+      // fetch the same identity again, keeping access keys inside VK.
+      if (initial) { initial = false; return tuple; }
+      const fresh = await fetchRow(access);
+      if (!fresh) throw new Error('VK не подтвердил источник выбранного трека.');
+      if (typeof fresh.access_key === 'string') access = fresh.access_key;
+      return toTuple(fresh);
+    } });
+    Object.defineProperty(tuple, '__pulseFallbackSource', { value: async () => {
+      if (currentAccount() !== owner || account !== owner) throw new Error('session_changed');
+      const fallbackRun = generation;
+      // The exact API can grant a CDN URL whose delivery is unavailable while
+      // the website still has another working stream for the same identity.
+      // Preserve its original private hashes instead of resolving the API's
+      // hashless replacement through the legacy website route.
+      const original = legacyRaw || await lookupLegacyTuple(track.id || `vk-${expected.owner}-${expected.id}`, track, fallbackRun, owner, Date.now() + PLAYBACK_LOOKUP_TIMEOUT, true);
+      valid(fallbackRun, owner);
+      const identity = trackIdentity(original);
+      if (identity.owner !== expected.owner || identity.id !== expected.id) throw new Error('invalid_audio_identity');
+      const restriction = Number(tupleValue(original, 'AUDIO_ITEM_INDEX_RESTRICTION', 21, ['restrictionStatus', 'restriction_status']) || 0);
+      if (restriction || original?.available === false || original?.isRestricted === true) throw new Error('VK ограничил воспроизведение этого трека для аккаунта.');
+      const player = getPlayer();
+      if (typeof player?._ensureHasURL !== 'function') return original;
+      const hashes = String(tupleValue(original, 'AUDIO_ITEM_INDEX_HASHES', 13, ['hashes']) || '').split('/');
+      const result = await player._ensureHasURL({
+        fullId: identity.fullId, ownerId: identity.owner, id: identity.id,
+        actionHash: typeof original?.actionHash === 'string' ? original.actionHash : hashes[2] || '',
+        urlHash: typeof original?.urlHash === 'string' ? original.urlHash : hashes[5] || '',
+        url: undefined, extra: tupleValue(original, 'AUDIO_ITEM_INDEX_EXTRA', 12, ['extra']),
+      });
+      valid(fallbackRun, owner);
+      const confirmed = trackIdentity(result);
+      if (confirmed.owner !== expected.owner || confirmed.id !== expected.id) throw new Error('invalid_audio_identity');
+      return result;
+    } });
+    return tuple;
+  }
+  function hasTupleSource(raw) {
+    const direct = tupleValue(raw, 'AUDIO_ITEM_INDEX_URL', 2, ['url']);
+    const usable = value => typeof value === 'string' && !value.includes('audio_api_unavailable') && Boolean(https(value));
+    if (usable(direct)) return true;
+    let extra = tupleValue(raw, 'AUDIO_ITEM_INDEX_EXTRA', 12, ['extra']);
+    if (typeof extra === 'string') {
+      try { extra = extra.length < 1024 * 1024 ? JSON.parse(extra) : null; } catch { extra = null; }
+    }
+    return Array.isArray(extra?.audio_streams) && extra.audio_streams.some(stream => stream && !stream.drm && !stream.key_system && !stream.license_url && ['hls_ts', 'hls_range', 'mp3', 'aac', 'flac'].includes(stream.type) && usable(stream.url));
+  }
+  function withSourceRefresh(raw, owner) {
+    if (typeof raw?.__pulseResolveSource === 'function' || typeof raw?.__pulseRefreshSource === 'function') return raw;
+    let api;
+    try { api = audioApi(); } catch { return raw; }
+    if (!api) return raw;
+    const identity = trackIdentity(raw);
+    const access = tupleValue(raw, 'AUDIO_ITEM_INDEX_ACCESS_KEY', 24, ['accessKey', 'access_key']);
+    const refreshed = Array.isArray(raw) ? Object.assign(raw.slice(), raw) : { ...raw };
+    Object.defineProperty(refreshed, '__pulseRefreshSource', { value: async () => {
+      if (currentAccount() !== owner || account !== owner) throw new Error('session_changed');
+      const run = generation;
+      try {
+        // Only a failing/expired already-granted source invokes this lookup.
+        // The normal fast path keeps its original URL and source order.
+        return await exactTuple(api, { remote: { ownerId: identity.owner, audioId: identity.id } }, run, owner, 3000, typeof access === 'string' ? access : '', raw);
+      } catch {
+        valid(run, owner);
+        return null; // The transport can still use the legacy exact tuple.
+      }
+    } });
+    return refreshed;
+  }
+  async function resolveCachedTuple(id, run, owner, interactive = false) {
+    const previous = tuples.get(id);
+    if (previous && (!interactive || typeof previous.__pulseResolveSource === 'function')) return previous;
+    if (previous && hasTupleSource(previous)) {
+      const playable = withSourceRefresh(previous, owner);
+      tuples.set(id, playable);
+      return playable;
+    }
     const track = knownTracks.get(id);
-    if (!track) throw new Error('Трек отсутствует в текущей библиотеке VK. Обновите синхронизацию.');
+    if (!track) {
+      if (previous) return previous;
+      throw new Error('Трек отсутствует в текущей библиотеке VK. Обновите синхронизацию.');
+    }
+    const deadline = interactive ? Date.now() + PLAYBACK_LOOKUP_TIMEOUT : Infinity;
+    if (interactive) {
+      try {
+        const api = audioApi();
+        if (api) {
+          const access = tupleValue(previous, 'AUDIO_ITEM_INDEX_ACCESS_KEY', 24, ['accessKey', 'access_key']);
+          const exact = await exactTuple(api, track, run, owner, Math.min(3000, Math.max(1, deadline - Date.now())), typeof access === 'string' ? access : '', previous);
+          valid(run, owner);
+          if (exact) { tuples.set(id, exact); return exact; }
+        }
+      } catch { valid(run, owner); /* Changed/unsupported APIs retain the authoritative collection fallback. */ }
+    }
+    // The independent background read may have restored this tuple while
+    // the optional exact API request was pending. Reuse that verified row.
+    if (tuples.has(id)) return tuples.get(id);
+    return lookupLegacyTuple(id, track, run, owner, deadline, interactive);
+  }
+  async function lookupLegacyTuple(id, track, run, owner, deadline, interactive) {
     if (track.remote?.searchResult === true && !track.remote.inLibrary) {
       const [result] = await request('al_audio.php', {
         act: 'load_section', type: 'search', search_q: `${track.artist} ${track.title}`.slice(0, 300),
         owner_id: owner, playlist_id: 0, offset: 0, context: 'search', access_hash: '',
         search_performer: 0, search_lyrics: 0, search_sort: 0, search_history: 0,
         claim: 0, track_type: 'default',
-      }, run, owner);
+      }, run, owner, Math.max(1, Math.min(REQUEST_TIMEOUT, deadline - Date.now())));
       const list = Array.isArray(result?.list) ? result.list : [];
       const raw = list.slice(0, 500).find(raw => trackIdentity(raw).key === id);
       valid(run, owner);
@@ -531,7 +684,7 @@
       : undefined;
     let card = playlist ? playlistCards.get(playlist.id) : undefined;
     if (playlist && !card) {
-      for (const item of await readPlaylists(run, owner)) {
+      for (const item of await readPlaylists(run, owner, deadline)) {
         const identity = playlistIdentity(item);
         playlistCards.set(identity.key, { identity, access: playlistAccess(item, identity) });
       }
@@ -544,13 +697,14 @@
       act: 'load_section', type: 'playlist', owner_id: listOwner, playlist_id: listId,
       access_hash: card?.access || '', offset: Math.max(0, offset), is_loading_all: 1,
       is_preload: 0, context: 'my', claim: 0,
-    }, run, owner);
+    }, run, owner, Math.max(1, Math.min(REQUEST_TIMEOUT, deadline - Date.now())));
     if (!page || !Array.isArray(page.list)) throw new Error('cached_track_unavailable');
-    let raw = page.list.find(raw => trackIdentity(raw).key === id);
+    const current = tuples.get(id);
+    let raw = page.list.find(raw => trackIdentity(raw).key === id) || (typeof current?.__pulseResolveSource !== 'function' ? current : null);
     // The playlist may have moved since its cached offset. Search only this
     // authoritative collection rather than loading all playlists again.
     if (!raw) {
-      const songs = await readSongs(listOwner, listId, card?.access || '', run, owner);
+      const songs = await readSongs(listOwner, listId, card?.access || '', run, owner, undefined, false, { id, deadline, maxPages: interactive ? 3 : MAX_PAGES });
       raw = songs.find(raw => trackIdentity(raw).key === id);
     }
     valid(run, owner);
@@ -710,7 +864,7 @@
         const transport = directPlayer();
         const requestedAccount = account;
         const commandRun = generation;
-        action = (tuples.has(input.id) ? Promise.resolve(tuples.get(input.id)) : resolveCachedTuple(input.id, commandRun, requestedAccount)).then(raw => {
+        action = resolveCachedTuple(input.id, commandRun, requestedAccount, true).then(raw => {
           if (playbackIntent !== playbackIntentSequence || requestedAccount !== account || currentAccount() !== account || desiredPlayback !== 'playing') return;
           return transport.load(raw, player);
         }).then(() => {
@@ -722,9 +876,14 @@
       else if (input.operation === 'resume') {
         if (ownedTrack) desiredPlayback = 'playing';
         const transport = directPlayer();
-        if (!transport.read().duration && desiredTrack && tuples.has(desiredTrack)) {
+        if (!transport.read().duration && desiredTrack && (tuples.has(desiredTrack) || knownTracks.has(desiredTrack))) {
           const requestedAccount = account;
-          action = transport.load(tuples.get(desiredTrack), player).then(() => {
+          const commandRun = generation;
+          const requestedTrack = desiredTrack;
+          action = resolveCachedTuple(requestedTrack, commandRun, requestedAccount, true).then(raw => {
+            if (playbackIntent !== playbackIntentSequence || requestedAccount !== account || currentAccount() !== account || desiredPlayback !== 'playing') return;
+            return transport.load(raw, player);
+          }).then(() => {
             if (playbackIntent === playbackIntentSequence && requestedAccount === account && currentAccount() === account && desiredPlayback === 'playing') return transport.play();
           });
         } else action = transport.play();
@@ -814,6 +973,9 @@
       valid(run, owner);
       return results;
     },
+    // Receipt polling must not consume read()'s one-shot catalog snapshot.
+    // Still refresh the live identity so a changed account cancels old work.
+    get accountId() { refreshIdentity(); return account; },
     get lastCommand() { return state.lastCommand; },
     get status() { return state.status; },
     get runId() { return state.runId; },

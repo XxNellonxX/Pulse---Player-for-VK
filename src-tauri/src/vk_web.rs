@@ -478,10 +478,18 @@ async fn open_with_policy(
     let builder = builder
     // A click in Pulse cannot carry its transient browser activation into
     // the separate VK document. Pulse's explicit playback intent owns starts.
-    .additional_browser_args("--autoplay-policy=no-user-gesture-required")
+    // The audio document is intentionally hidden, even when Pulse is open.
+    // Its HLS timers and source renewals must not become background work or
+    // wait for the minute-long timer batches of a silent hidden renderer.
+    // Extend the existing explicit autoplay arguments only for this separate
+    // VK profile; leave the main renderer and browser security policies alone.
+    .additional_browser_args("--autoplay-policy=no-user-gesture-required --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows")
     .data_directory(profile_dir(&app));
     #[cfg(target_os = "macos")]
-    let builder = builder.data_store_identifier(profile_store_identifier(&profile_dir(&app)));
+    let builder = builder
+        .data_store_identifier(profile_store_identifier(&profile_dir(&app)))
+        // macOS 14+ supports an explicit native policy for hidden WKWebViews.
+        .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
     let result = builder.on_navigation(crate::allowed_vk)
     .on_page_load(move |window, payload| {
         let app = window.app_handle();
@@ -1254,7 +1262,7 @@ pub async fn vk_web_control(
     // Keep the individual receipt: another volume/seek command can replace
     // lastCommand while a previous play() promise is still resolving.
     let receipt_key = serde_json::to_string(&format!("__PULSE_RECEIPT_{request_id}")).unwrap();
-    let check = format!("if(window.top!==window.self||!['https://vk.com','https://vk.ru'].includes(location.origin))return {{accepted:false,error:'Страница VK изменилась.'}};const a=window.__PULSE_VK_WEB__;if(!a)return {{accepted:false,error:'Плеер VK недоступен.'}};const s=a.read(false);if(s.user?.id!=={account})return {{accepted:false,error:'Аккаунт VK изменился.'}};");
+    let check = format!("if(window.top!==window.self||!['https://vk.com','https://vk.ru'].includes(location.origin))return {{accepted:false,error:'Страница VK изменилась.'}};const a=window.__PULSE_VK_WEB__;if(!a)return {{accepted:false,error:'Плеер VK недоступен.'}};if(a.accountId!=={account})return {{accepted:false,error:'Аккаунт VK изменился.'}};");
     let script = format!("(()=>{{{check}return window[{receipt_key}]=a.command({request});}})()");
     let outcome = async {
         let mut result = evaluate(&window, script).await?;

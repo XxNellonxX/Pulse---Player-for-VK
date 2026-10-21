@@ -56,6 +56,7 @@ export interface DesktopAPI {
   importFiles(): Promise<Track[]>;
   uploadFilesToVk?(): Promise<UploadBatchResult>;
   uploadLocalTrackToVk?(id: string): Promise<UploadBatchResult>;
+  attachVkSource?(id: string): Promise<{ attached: boolean }>;
   importFromUrl?(url: string, destination: 'vk' | 'local', proxy?: string): Promise<UploadBatchResult>;
   onImportProgress?(callback: (progress: ImportProgress) => void): () => void;
   onAppNotice?(callback: (message: string) => void): () => void;
