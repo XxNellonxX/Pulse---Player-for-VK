@@ -11,9 +11,10 @@ VK, подписки на новинки, ленту релизов, снипп�
 и проверку обновлений рядом с логотипом Pulse. Исправлено ожидание аудио для
 загруженных в VK MP3. Проверки и ограничения описаны в [отчёте 0.4.0](docs/release-0.4.0-verification.md).
 
-Подготовлена сборка `.app` и `.dmg` для macOS 14+ на Apple Silicon и Intel.
-Она требует проверки на Mac перед публикацией; процесс сборки и ограничения
-импорта описаны в [документе macOS](docs/macos-release.md).
+Для macOS 14+ на Apple Silicon и Intel успешно собраны `.app` и `.dmg`.
+[macOS preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.4.0-macos-preview)
+не подписан Apple и ещё требует проверки на физическом Mac; процесс сборки и
+ограничения импорта описаны в [документе macOS](docs/macos-release.md).
 
 ## Запуск
 

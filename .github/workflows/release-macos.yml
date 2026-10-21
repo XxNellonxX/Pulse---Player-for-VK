@@ -3,7 +3,7 @@ name: macOS build verification
 on:
   workflow_dispatch:
   push:
-    tags: ['v*']
+    tags: ['v*', '!v*-macos-preview']
 
 permissions:
   contents: read

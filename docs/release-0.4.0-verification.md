@@ -108,6 +108,10 @@ Apple Music, Deezer и Tidal завершаются понятной ошибк�
 macOS требует отдельной проверки на физическом Mac; Windows не подтверждает
 поведение WKWebView и аудиокодеков macOS. Проверочные DMG не подписаны и не
 прошли Apple notarization. Подробнее: [macos-release.md](macos-release.md).
+Обе архитектуры финальной версии успешно собраны на macOS в
+[CI запуска тега v0.4.0](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39628697180).
+Они опубликованы отдельным prerelease `v0.4.0-macos-preview`, не включённым в
+стабильный канал Windows. Успешная сборка не заменяет нативную приёмку на Mac.
 
 ## Воспроизведение проверок
 
