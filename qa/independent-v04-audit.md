@@ -4,8 +4,9 @@ The reviewer edited QA code only and did not change the user's installed player,
 VK account, files, library, playlists or follows. Native tests refused to run
 unless `assert-isolated-native.mjs` confirmed a debug QA binary named **VK Player
 QA**. Temporary profiles and an intercepted synthetic VK page were used. The
-final native verification used the debug build from 21 October 2026, 19:35 local
-time. No unresolved actionable issue remained in these tested scenarios.
+full native verification used the debug build from 21 October 2026, 19:35 local
+time. A subsequent targeted notification check passed on the 19:40:57 debug
+build. No unresolved actionable issue remained in these tested scenarios.
 
 ## Independently discovered defects verified as fixed
 
@@ -47,8 +48,15 @@ time. No unresolved actionable issue remained in these tested scenarios.
   two track identities without duplicates. Original hashes and saved identities
   survive a renderer reload.
 
+`node qa/tauri-vk-upload-formats-independent.mjs --notice-only`: **1 / 1 PASS**
+after the renderer notice listener was connected. The actual native event shows
+an error notification containing `Не удалось добавить файлов: 2` and the full
+truncation reason. Only the two valid files are saved, and the close button
+removes the notification. The full suite includes this visibility assertion too.
+
 Receipts are written to `qa/tauri-vk-upload-results.json` and
-`qa/tauri-vk-upload-formats-independent-results.json`. Source fixtures are real
+`qa/tauri-vk-upload-formats-independent-results.json`, with the targeted receipt
+in `qa/tauri-vk-upload-notice-independent-results.json`. Source fixtures are real
 FFmpeg-generated audio, never fabricated MP3 headers.
 
 ## Equalizer and transport evidence
