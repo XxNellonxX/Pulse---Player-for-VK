@@ -2,6 +2,10 @@
 
 Windows 10/11 desktop-плеер на Tauri 2 + React с сохранённой библиотекой VK, очередью, плейлистами, фоновым воспроизведением и 15 темами. Tauri использует системный WebView2.
 
+[Скачать Pulse 0.4.1 для Windows](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.4.1/VK.Player_0.4.1_x64-setup.exe).
+Для обновления завершите Pulse и запустите установщик поверх предыдущей версии;
+профиль, библиотека, настройки и действующая сессия VK сохраняются.
+
 Версия 0.3.0 добавила карточки артистов с релизами и действительными показателями
 VK, подписки на новинки, ленту релизов, сниппеты с границами VK и редактор
 плейлистов с проверкой облачного сохранения. На ползунке видны загруженные участки
@@ -17,7 +21,7 @@ VK, подписки на новинки, ленту релизов, снипп�
 Проверки описаны в [отчёте 0.4.1](docs/release-0.4.1-verification.md).
 
 Для macOS 14+ на Apple Silicon и Intel успешно собраны `.app` и `.dmg`.
-[macOS preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.4.0-macos-preview)
+[macOS 0.4.1 preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.4.1-macos-preview)
 не подписан Apple и ещё требует проверки на физическом Mac; процесс сборки и
 ограничения импорта описаны в [документе macOS](docs/macos-release.md).
 

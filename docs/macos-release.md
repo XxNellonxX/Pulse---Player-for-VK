@@ -1,6 +1,10 @@
 # macOS сборка Pulse
 
-Сборки macOS 14 и новее для Apple Silicon (arm64) и Intel (x64) успешно собраны в [GitHub Actions](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39628697180) из production-кода версии 0.4.0. DMG опубликованы как [macOS preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.4.0-macos-preview). Проверка входа и аудио на физическом Mac ещё не выполнена, поэтому это предварительная версия. На Mac используется WKWebView. Профиль VK хранится в постоянном идентификаторе `WKWebsiteDataStore`, чтобы обновление приложения сохраняло вход; при явном выходе идентификатор меняется и старая сессия больше не подхватывается.
+Версия 0.4.1 для macOS 14 и новее успешно собрана для Apple Silicon (arm64) и Intel (x64) в [GitHub Actions](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39638095778). DMG и контрольные суммы опубликованы как [macOS preview 0.4.1](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.4.1-macos-preview). Сборка и тег preview закреплены на `bc5cda814c6fad420a3e7a990b5d4ed9f59b70bf`; production-код (`src/`, `src-tauri/`, `scripts/`, `package.json` и `package-lock.json`) идентичен `c2a671b8be05faa66f51de95721480c603a453bd`, из которого выпущена версия Windows 0.4.1. Обе архитектуры прошли TypeScript, Vitest, Node regression suite и сборку Tauri; [перенос проверенных артефактов](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39640727685) завершён успешно.
+
+Проверка входа и аудио на физическом Mac ещё не выполнена, поэтому это предварительная версия без подписи и notarization Apple. На Mac используется WKWebView. Профиль VK хранится в постоянном идентификаторе `WKWebsiteDataStore`, чтобы обновление приложения сохраняло вход; при явном выходе идентификатор меняется и старая сессия больше не подхватывается.
+
+Предыдущая [macOS preview 0.4.0](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.4.0-macos-preview) собрана в [запуске 39628697180](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39628697180) и сохранена в истории релизов.
 
 Сборка выполняется на macOS, а не на Windows:
 
@@ -11,11 +15,16 @@ npm test
 npm run dist:mac
 ```
 
-Команда загружает только закреплённые по SHA-256 компоненты импорта и создаёт `.app` и `.dmg`. macOS Gatekeeper может запросить разрешение для неподписанной сборки. Инструменты аудио запускаются только во время импорта и подготовки файлов. Для стабильного релиза требуются подпись и notarization сертификатом Apple. Workflow собирает неподписанные проверочные DMG, без секретов Apple, и сохраняет их в артефактах GitHub Actions. Версия 0.4.0 доступна отдельно как prerelease; автоматической публикации проверочных сборок в стабильный канал нет.
+Команда загружает только закреплённые по SHA-256 компоненты импорта и создаёт `.app` и `.dmg`. macOS Gatekeeper может запросить разрешение для неподписанной сборки. Инструменты аудио запускаются только во время импорта и подготовки файлов. Для стабильного релиза требуются подпись и notarization сертификатом Apple. Workflow собирает неподписанные проверочные DMG, без секретов Apple, и сохраняет их в артефактах GitHub Actions. Версия 0.4.1 доступна отдельно как prerelease; автоматической публикации проверочных сборок в стабильный канал нет. После публикации preview API `releases/latest` по-прежнему возвращает стабильный релиз Windows `v0.4.1`.
 
-Обновление ставится поверх предыдущего `.dmg`: идентификатор `ru.vkplayer.desktop` и папка данных остаются прежними. Перед релизом проверяются запуск старого профиля, сохранение `library.json`, восстановление cookie-профиля VK и удаление временной папки импорта. Неподписанный локальный DMG нельзя считать готовым релизом.
+Для обновления завершите Pulse, откройте новый DMG и замените приложение в папке «Программы». Идентификатор `ru.vkplayer.desktop` и расположение данных остаются прежними. Перед стабильным релизом на физическом Mac необходимо проверить запуск старого профиля, сохранение `library.json`, восстановление cookie-профиля VK и удаление временной папки импорта. Эти сценарии на Mac пока не подтверждены.
 
-Контрольные суммы DMG preview 0.4.0:
+Контрольные суммы DMG preview 0.4.1 (размеры и SHA-256 сверены с GitHub Release API и опубликованным `SHA256SUMS-macos.txt`):
+
+- [Apple Silicon](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.4.1-macos-preview/VK.Player_0.4.1_aarch64.dmg): 117 833 137 байт, SHA-256 `578b3e155a19a4192aa2a2a217419e792e424240218eda743f50b2aae4b00623`.
+- [Intel](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.4.1-macos-preview/VK.Player_0.4.1_x64.dmg): 133 932 425 байт, SHA-256 `c31f7c0ac6dd691cd9cdf9011c26ba7084b4aa1c410472f64f600cad89680efa`.
+
+Контрольные суммы предыдущих DMG preview 0.4.0:
 
 - Apple Silicon: 117 833 147 байт, SHA-256 `4b61228d338e2b36a21e8cc657a7d092dc232460e31c023c3c90849de029de18`.
 - Intel: 133 931 558 байт, SHA-256 `074426c87897f186e7b747652ddb8833e3ce50e6da1381e298e552ee65728abe`.
