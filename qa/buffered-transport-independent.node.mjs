@@ -23,7 +23,7 @@ function fixture() {
   const audio = w.__PULSE_CREATE_DIRECT_AUDIO__();
   return { audio, elements, calls, w, player, advance(seconds) { now += seconds * 1000; elements.at(-1).currentTime += seconds; } };
 }
-async function start(f) { await f.audio.load({ ownerId: 42, id: 1, url: 'https://fixture.test/source.mp3' }, f.player); await f.audio.play(); }
+async function start(f) { await f.audio.load({ ownerId: 42, id: 1 }, f.player); await f.audio.play(); }
 
 test('real buffered islands and gap-aware seconds remain public metadata without signed URLs', async () => {
   const f = fixture(); try {

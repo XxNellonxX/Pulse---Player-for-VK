@@ -33,6 +33,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: node --test qa/*.node.mjs
       - run: npm run prepare:imports
       - run: npm run tauri -- build --target ${{ matrix.target }} --bundles app,dmg --config src-tauri/tauri.macos.conf.json
       - uses: actions/upload-artifact@v4

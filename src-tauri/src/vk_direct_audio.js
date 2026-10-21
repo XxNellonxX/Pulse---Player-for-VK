@@ -67,11 +67,17 @@
     const impl = player?._impl;
     const createKey = impl && Object.getOwnPropertyNames(impl).find(key => /(?:^|_)_createAudio$/.test(key) && typeof impl[key] === 'function');
     let decoded = sources;
-    if (createKey) {
+    if (createKey && sources.length) {
       try {
-        const value = impl[createKey]({ id: audio.fullId, sources });
+        // The optional factory belongs to the changing website. Do not let
+        // its in-place filtering/rewrite erase the original granted choices.
+        const value = impl[createKey]({ id: audio.fullId, sources: sources.map(source => ({ ...source })) });
         if (Array.isArray(value?.sources)) decoded = value.sources;
-      } catch { throw failure('Интерфейс источников VK изменился. Обновите плеер.'); }
+      } catch {
+        // This optional decoder can change independently of the audio API.
+        // Keep explicit, session-granted files when they need no decoding.
+        decoded = sources;
+      }
     }
     const seen = new Set();
     // The website factory can collapse its choices to a single preference.
@@ -184,7 +190,7 @@
       attached.push(off);
       return off;
     }
-    async function allowsEqualizer(source, generation) {
+    async function allowsEqualizer(source, generation, deadline) {
       // HLS.js only loads readable CORS responses and hands MSE a same-origin
       // blob. Native HLS requires a readable manifest check instead.
       const Hls = w.__PULSE_HLS__ || w.Hls;
@@ -192,24 +198,25 @@
       if (new URL(source.url).origin === w.location.origin) return true;
       if (corsProbes.has(source.url)) return corsProbes.get(source.url);
       if (typeof w.fetch !== 'function' || typeof w.AbortController !== 'function') return false;
+      const timeout = Math.min(2500, deadline - Date.now());
+      if (timeout <= 0) return false;
       const controller = new w.AbortController();
       const cancel = () => controller.abort(); waiting.add(cancel);
-      const timer = setTimeout(cancel, 2500);
       let allowed = false;
       try {
         // Read a single range, never download/cache the song or export the
         // session-granted URL from this private document.
-        const response = await w.fetch(source.url, { method: 'GET', mode: 'cors', credentials: 'omit', headers: { Range: 'bytes=0-0' }, signal: controller.signal });
+        const response = await bounded(w.fetch(source.url, { method: 'GET', mode: 'cors', credentials: 'omit', headers: { Range: 'bytes=0-0' }, signal: controller.signal }), timeout, generation, 'Проверка эквалайзера не завершилась.');
         allowed = response.ok && response.type !== 'opaque';
-        try { await response.body?.cancel(); } catch { /* response already closed */ }
+        try { void response.body?.cancel()?.catch(() => {}); } catch { /* response already closed */ }
       } catch { /* fail open to ordinary audio */ }
-      finally { clearTimeout(timer); waiting.delete(cancel); }
+      finally { cancel(); waiting.delete(cancel); }
       check(generation);
       if (corsProbes.size >= 32) corsProbes.delete(corsProbes.keys().next().value);
       corsProbes.set(source.url, allowed);
       return allowed;
     }
-    async function applyEqualizer() {
+    async function applyEqualizer(deadline = Date.now() + 1500) {
       const target = media;
       if (!target) { equalizerError = null; return; }
       if (!equalizerSettings.enabled && !equalizerGraph) { equalizerError = null; return; }
@@ -220,14 +227,20 @@
           equalizerGraph = w.__PULSE_CREATE_EQUALIZER__(target);
         }
         const graph = equalizerGraph;
+        const generation = epoch;
+        const remaining = () => {
+          const timeout = deadline - Date.now();
+          if (timeout <= 0) throw failure('Эквалайзер не запустился.');
+          return timeout;
+        };
         if (equalizerSettings.enabled) {
-          let timer;
-          try { await Promise.race([graph.prepare(), new Promise((_resolve, reject) => { timer = setTimeout(() => reject(failure('Эквалайзер не запустился.')), 1500); })]); }
-          finally { clearTimeout(timer); }
+          const timeout = Math.min(1500, remaining());
+          await bounded(graph.prepare(), timeout, generation, 'Эквалайзер не запустился.');
         }
         if (media !== target || graph !== equalizerGraph) return;
+        const timeout = remaining();
         graph.apply(equalizerSettings);
-        await graph.resume();
+        await bounded(graph.resume(), timeout, generation, 'Эквалайзер не запустился.');
         if (media === target) equalizerError = null;
       } catch {
         if (media === target && equalizerGraph && !equalizerGraph.connected) { equalizerGraph.destroy(); equalizerGraph = null; }
@@ -235,11 +248,18 @@
       }
     }
     async function define(source, generation, timeout) {
+      const deadline = Date.now() + timeout;
+      const remaining = () => {
+        const value = deadline - Date.now();
+        if (value <= 0) throw failure('Источник VK не ответил. Проверьте соединение и повторите запуск.');
+        return value;
+      };
       check(generation);
       disposeMedia();
       equalizerError = null;
-      const readable = equalizerSettings.enabled ? await allowsEqualizer(source, generation) : false;
+      const readable = equalizerSettings.enabled ? await allowsEqualizer(source, generation, deadline) : false;
       check(generation);
+      remaining();
       const target = new w.Audio(); media = target;
       equalizerSafe = readable;
       if (readable) target.crossOrigin = 'anonymous';
@@ -263,6 +283,9 @@
         const offError = listen(target, 'error', () => reject(failure('Источник VK не загрузился.')), generation);
         releaseLoad = () => { offReady(); offCanPlay(); offError(); };
       });
+      // A synchronous engine error can reject before the deadline check below.
+      // Keep that promise observed even if the candidate has already expired.
+      void loaded.catch(() => {});
       try {
         const Hls = w.__PULSE_HLS__ || w.Hls;
         // Chromium/WebView2 reports native HLS as "maybe" even for VK streams
@@ -287,48 +310,67 @@
           if (source.format === 'hls' && !target.canPlayType?.('application/vnd.apple.mpegurl')) throw failure('Для этого источника VK нужен модуль HLS. Обновите плеер.');
           target.src = source.url; target.load();
         }
-        await bounded(loaded, timeout, generation, 'Источник VK не ответил. Проверьте соединение и повторите запуск.');
+        await bounded(loaded, remaining(), generation, 'Источник VK не ответил. Проверьте соединение и повторите запуск.');
       } finally { releaseLoad(); }
       check(generation); ready = true; buffering = false; error = null;
-      await applyEqualizer();
+      await applyEqualizer(Math.min(deadline, Date.now() + 1500));
       check(generation);
+      remaining();
     }
     async function resolveSource(raw, player, generation, fallback = false, renewal = false) {
       const input = normalize(raw);
       let audio = input;
+      let lastError;
+      // Keep the full source phase within the native receipt's existing
+      // 20s resolve + 25s load budget, including an expired cached candidate.
+      const deadline = Date.now() + RESOLVE_TIMEOUT + LOAD_TIMEOUT;
+      async function loadSources(sources, loadDeadline) {
+        if (fallback && sources.length > 1) sources.push(sources.shift());
+        for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
+          check(generation);
+          if (Date.now() >= loadDeadline) break;
+          const remaining = Math.max(1, loadDeadline - Date.now());
+          const remainingSources = sources.length - sourceIndex;
+          const sourceTimeout = Math.max(2500, Math.floor(remaining / remainingSources));
+          try { await define(sources[sourceIndex], generation, Math.min(remaining, sourceTimeout)); return true; }
+          catch (failureValue) { if (failureValue?.code === CANCELLED) throw failureValue; lastError = failureValue; }
+        }
+        return false;
+      }
+      const sourceResolver = typeof raw?.__pulseResolveSource === 'function';
+      const websiteResolver = typeof player?._ensureHasURL === 'function';
+      // Uploaded audio can already contain its complete playable file, even
+      // alongside reload hashes or only in extra.audio_streams. The website's
+      // separate URL resolver does not handle every uploaded track. Try the
+      // sources this session supplied instead of throwing them away first.
+      // Renewals and artist access-key closures must still obtain fresh data.
+      if (!renewal && !sourceResolver) {
+        const supplied = sourceList(input, player);
+        const cachedBudget = websiteResolver ? 8000 : LOAD_TIMEOUT;
+        if (supplied.length && await loadSources(supplied, Math.min(deadline, Date.now() + cachedBudget))) return;
+      }
       // Artist/release APIs provide full streams and an access key rather
       // than website reload hashes. Their private closure refreshes those
       // exact sources inside the same signed-in VK document on every load
       // and renewal; URLs and credentials never cross the native bridge.
-      if (typeof raw?.__pulseResolveSource === 'function') {
-        const result = await bounded(raw.__pulseResolveSource(), RESOLVE_TIMEOUT, generation, 'VK не подтвердил источник трека. Повторите запуск.');
+      if (sourceResolver) {
+        const result = await bounded(raw.__pulseResolveSource(), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.');
         check(generation);
         audio = normalize(result);
         if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
-      } else if (!(Array.isArray(raw) && safeSource(input.url) && !input.actionHash && !input.urlHash && !renewal) && typeof player?._ensureHasURL === 'function') {
-        const result = await bounded(player._ensureHasURL({ ...input, url: undefined }), RESOLVE_TIMEOUT, generation, 'VK не подтвердил источник трека. Повторите запуск.');
+      } else if (websiteResolver) {
+        const result = await bounded(player._ensureHasURL({ ...input, url: undefined }), Math.min(RESOLVE_TIMEOUT, Math.max(1, deadline - Date.now())), generation, 'VK не подтвердил источник трека. Повторите запуск.');
         check(generation);
         audio = normalize(result);
         if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
+      } else if (lastError) {
+        throw lastError;
       }
       const sources = sourceList(audio, player);
       if (!sources.length) throw failure('VK не предоставил доступный аудиоисточник для этого трека.');
       // A repeatedly broken primary source may have a valid alternate stream.
-      if (fallback && sources.length > 1) sources.push(sources.shift());
-      let lastError;
-      const deadline = Date.now() + LOAD_TIMEOUT;
-      for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
-        const source = sources[sourceIndex];
-        check(generation);
-        if (Date.now() >= deadline) break;
-        const remainingSources = sources.length - sourceIndex;
-        const remaining = Math.max(1, deadline - Date.now());
-        // Do not let an unresponsive primary consume the entire retry budget;
-        // each explicit VK fallback receives a bounded share of the deadline.
-        const sourceTimeout = Math.max(2500, Math.floor(remaining / remainingSources));
-        try { await define(source, generation, Math.min(remaining, sourceTimeout)); return; }
-        catch (failureValue) { if (failureValue?.code === CANCELLED) throw failureValue; lastError = failureValue; }
-      }
+      // Every explicit fallback receives a bounded share of the remaining time.
+      if (await loadSources(sources, Math.min(deadline, Date.now() + LOAD_TIMEOUT))) return;
       throw lastError || failure('Источник VK не загрузился.');
     }
     function terminalFailure() {

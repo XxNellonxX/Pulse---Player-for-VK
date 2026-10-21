@@ -8,7 +8,9 @@ import { readFile } from 'node:fs/promises';
 const source = await readFile(new URL('../src-tauri/src/vk_direct_audio.js', import.meta.url), 'utf8');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const deferred = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; };
-const tuple = (id = 7) => ({ id, owner_id: 42, url: 'https://cdn.example.test/cached.mp3', duration: 108 });
+// These recovery cases explicitly exercise initial and renewed resolution.
+// Already granted sources have separate vk-uploaded-source-recovery coverage.
+const tuple = (id = 7) => ({ id, owner_id: 42, duration: 108 });
 async function until(predicate, message, timeout = 2000) {
   const deadline = Date.now() + timeout;
   while (!predicate()) { if (Date.now() >= deadline) assert.fail(message); await sleep(5); }

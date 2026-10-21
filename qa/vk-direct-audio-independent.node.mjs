@@ -6,7 +6,9 @@ import { readFile } from 'node:fs/promises';
 const source = await readFile(new URL('../src-tauri/src/vk_direct_audio.js', import.meta.url), 'utf8');
 const tick = () => new Promise(resolve => setTimeout(resolve, 3));
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
-const tuple = (id = 7, url = 'https://cdn.example.test/music.mp3', extra = null) => { const raw = []; raw[0] = id; raw[1] = 42; raw[2] = url; raw[5] = 30; raw[12] = extra; raw[13] = 'add/edit/action/delete/replace/urlhash/restore'; return raw; };
+// Resolver-specific cases start without a granted URL. Direct uploaded files
+// are covered independently by uploaded-source-independent.node.mjs.
+const tuple = (id = 7, url = '', extra = null) => { const raw = []; raw[0] = id; raw[1] = 42; raw[2] = url; raw[5] = 30; raw[12] = extra; raw[13] = 'add/edit/action/delete/replace/urlhash/restore'; return raw; };
 
 function site({ holdLoad = false, playGate = null, url = 'https://vk.com/audio', hlsSupported = true } = {}) {
   const media = [], engines = [], calls = [];

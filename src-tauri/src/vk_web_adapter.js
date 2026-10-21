@@ -526,8 +526,10 @@
       tuples.set(id, raw);
       return raw;
     }
-    const playlist = !track.remote?.inLibrary && cached?.playlists.find(item => item.trackIds.includes(id) && !item.contentUnavailable);
-    let card = playlist && playlistCards.get(playlist.id);
+    const playlist = !track.remote?.inLibrary
+      ? cached?.playlists.find(item => item.trackIds.includes(id) && !item.contentUnavailable)
+      : undefined;
+    let card = playlist ? playlistCards.get(playlist.id) : undefined;
     if (playlist && !card) {
       for (const item of await readPlaylists(run, owner)) {
         const identity = playlistIdentity(item);
@@ -535,8 +537,8 @@
       }
       card = playlistCards.get(playlist.id);
     }
-    const listOwner = card?.identity.owner ?? playlist?.remote.ownerId ?? owner;
-    const listId = card?.identity.id ?? playlist?.remote.playlistId ?? -1;
+    const listOwner = card?.identity?.owner ?? playlist?.remote?.ownerId ?? owner;
+    const listId = card?.identity?.id ?? playlist?.remote?.playlistId ?? -1;
     const offset = playlist ? playlist.trackIds.indexOf(id) : (cached?.tracks.filter(t => t.remote?.inLibrary).findIndex(t => t.id === id) ?? 0);
     const [page] = await request('al_audio.php', {
       act: 'load_section', type: 'playlist', owner_id: listOwner, playlist_id: listId,
