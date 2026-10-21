@@ -24,6 +24,7 @@ pub struct DownloadedUrl {
     pub path: PathBuf,
     pub title: String,
     pub artist: String,
+    pub expected_duration: Option<f64>,
 }
 
 /// The caller owns the completed file and must remove it after use or failure.
@@ -39,6 +40,9 @@ pub async fn download_url(url: &str, directory: &Path) -> Result<DownloadedUrl, 
 async fn download_inner(input: &str, directory: &Path) -> Result<DownloadedUrl, String> {
     let url = validate_url(input)?;
     let host = url.host_str().unwrap_or_default();
+    if ["spotify.com", "spotify.link", "music.apple.com", "deezer.com", "tidal.com"].iter().any(|domain| host == *domain || host.ends_with(&format!(".{domain}"))) {
+        return Err("Этот сервис не предоставляет полный исходный аудиофайл по обычной ссылке на песню. Pulse не скачивает превью и не подменяет трек поиском VK. Добавьте доступный полный аудиофайл или прямую ссылку на него.".into());
+    }
     if matches!(
         host,
         "soundcloud.com" | "www.soundcloud.com" | "on.soundcloud.com"
@@ -46,6 +50,17 @@ async fn download_inner(input: &str, directory: &Path) -> Result<DownloadedUrl, 
         return download_soundcloud(url, directory).await;
     }
     let response = get_public(url).await?;
+    let content_type = response.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    if content_type.contains("html") {
+        let page = response.url().clone();
+        if page.host_str().is_some_and(|host| ["spotify.com", "spotify.link", "music.apple.com", "deezer.com", "tidal.com"].iter().any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))) {
+            return Err("Spotify не предоставляет полный исходный аудиофайл по обычной ссылке на песню. Pulse не скачивает превью и не подменяет трек поиском VK. Добавьте доступный полный аудиофайл или прямую ссылку на него.".into());
+        }
+        let html = String::from_utf8(bounded_bytes(response, MAX_HTML).await?).map_err(|_| "Не удалось прочитать страницу с аудио.")?;
+        let audio = crate::source_page::declared_audio(&html, &page).ok_or("Страница не содержит публичной ссылки на полный аудиофайл. Нужна ссылка на доступное аудио; трек не заменяется результатом поиска VK.")?;
+        let response = get_public(audio.url).await?;
+        return save_audio(response, directory, None, if audio.title.is_empty() { "Аудио по ссылке".into() } else { audio.title }, audio.artist).await;
+    }
     let title = response_filename(&response)
         .or_else(|| url_filename(response.url()))
         .and_then(|name| {
@@ -553,6 +568,7 @@ async fn save_audio(
         path: final_path,
         title,
         artist,
+        expected_duration: None,
     })
 }
 

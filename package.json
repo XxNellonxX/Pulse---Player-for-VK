@@ -1,6 +1,6 @@
 {
   "name": "vk-player-desktop",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Windows-first VK music player with a local library and a reliable queue.",
   "private": true,
   "type": "module",
@@ -10,6 +10,7 @@
     "build": "node scripts/prepare-web-audio.mjs && tsc --noEmit && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "dist": "npm run prepare:imports && node scripts/tauri.mjs build",
+    "dist:mac": "npm run prepare:imports && node scripts/tauri.mjs build --bundles app,dmg --config src-tauri/tauri.macos.conf.json",
     "prepare:imports": "node scripts/prepare-import-tools.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

@@ -16,18 +16,25 @@ env.CARGO_TARGET_DIR ||= path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'vk-
 const args = process.argv.slice(2);
 const cargo = args[0] === '--cargo';
 const command = cargo ? (process.platform === 'win32' ? 'cargo.exe' : 'cargo') : process.execPath;
-const commandArgs = cargo ? [...args.slice(1), '--manifest-path', path.join(root, 'src-tauri', 'Cargo.toml')] : [path.join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), ...args];
+const cargoArgs = args.slice(1);
+const separator = cargoArgs.indexOf('--');
+if (cargo) cargoArgs.splice(separator < 0 ? cargoArgs.length : separator, 0, '--manifest-path', path.join(root, 'src-tauri', 'Cargo.toml'));
+const commandArgs = cargo ? cargoArgs : [path.join(root, 'node_modules', '@tauri-apps', 'cli', 'tauri.js'), ...args];
 const child = spawn(command, commandArgs, { cwd: root, env, stdio: 'inherit', windowsHide: true });
 child.on('error', error => { console.error(error.code === 'ENOENT' ? 'Rust/Cargo is required. Install a Rust MSVC toolchain and Windows Build Tools.' : error.message); process.exitCode = 1; });
 child.on('exit', async (code, signal) => {
   if (signal) { process.kill(process.pid, signal); return; }
   process.exitCode = code ?? 1;
   if (!cargo && args[0] === 'build' && code === 0 && !args.includes('--debug') && !args.includes('--no-bundle')) {
-    const bundleDir = path.join(env.CARGO_TARGET_DIR, 'release', 'bundle', 'nsis');
+    const requestedTargetIndex = args.indexOf('--target');
+    const requestedTarget = requestedTargetIndex >= 0 ? args[requestedTargetIndex + 1] : undefined;
+    const outputRoot = requestedTarget ? path.join(env.CARGO_TARGET_DIR, requestedTarget) : env.CARGO_TARGET_DIR;
+    const bundleType = process.platform === 'darwin' ? 'dmg' : 'nsis';
+    const bundleDir = path.join(outputRoot, 'release', 'bundle', bundleType);
     if (!existsSync(bundleDir)) return;
     const releaseDir = path.join(root, 'release-tauri');
     await mkdir(releaseDir, { recursive: true });
-    for (const name of await readdir(bundleDir)) if (name.endsWith('.exe')) await copyFile(path.join(bundleDir, name), path.join(releaseDir, name));
+    for (const name of await readdir(bundleDir)) if (name.endsWith(process.platform === 'darwin' ? '.dmg' : '.exe')) await copyFile(path.join(bundleDir, name), path.join(releaseDir, name));
     console.log(`Installer copied to ${releaseDir}`);
   }
 });

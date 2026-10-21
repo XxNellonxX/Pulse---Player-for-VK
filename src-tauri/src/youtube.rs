@@ -15,36 +15,40 @@ const MAX_AUDIO: u64 = 200 * 1024 * 1024;
 const MAX_DURATION: f64 = 3. * 60. * 60.;
 const MAX_LOG: usize = 64 * 1024;
 
+pub(crate) fn import_tool_name(name: &str) -> String {
+    if cfg!(windows) { format!("{name}.exe") } else { name.to_string() }
+}
+
 /// Original best available audio for local playback; MP3 320k for a VK upload.
 /// No browser cookies, account credentials, or player identity are supplied.
-pub async fn download_youtube(
+pub async fn download_media(
     url: &str,
     directory: &Path,
     tools: &Path,
     proxy: Option<&str>,
     for_vk: bool,
 ) -> Result<DownloadedUrl, String> {
-    let url = normalize_youtube_url(url)?;
+    let url = if is_youtube_url(url) { normalize_youtube_url(url)? } else { normalize_public_media_url(url)? };
     let proxy = proxy.map(validate_proxy).transpose()?;
-    let ytdlp = tools.join("yt-dlp.exe");
-    let ffmpeg = tools.join("ffmpeg.exe");
-    let ffprobe = tools.join("ffprobe.exe");
-    let deno = tools.join("deno.exe");
+    let ytdlp = tools.join(import_tool_name("yt-dlp"));
+    let ffmpeg = tools.join(import_tool_name("ffmpeg"));
+    let ffprobe = tools.join(import_tool_name("ffprobe"));
+    let deno = tools.join(import_tool_name("deno"));
     if [&ytdlp, &ffmpeg, &ffprobe, &deno]
         .iter()
         .any(|path| !path.is_file())
     {
         return Err(
-            "Компоненты импорта YouTube не установлены. Переустановите полную сборку плеера."
+            "Компоненты импорта аудио не установлены. Переустановите полную сборку плеера."
                 .into(),
         );
     }
     fs::create_dir_all(directory)
-        .map_err(|_| "Не удалось создать папку для загрузки YouTube.".to_string())?;
+        .map_err(|_| "Не удалось создать папку для загрузки аудио.".to_string())?;
     let random: [u8; 16] = rand::random();
     let working = directory.join(format!("youtube-{}", hex::encode(random)));
     fs::create_dir(&working)
-        .map_err(|_| "Не удалось подготовить папку импорта YouTube.".to_string())?;
+        .map_err(|_| "Не удалось подготовить папку импорта аудио.".to_string())?;
     let _temporary = WorkingDirectory(working.clone());
     let mut command = tokio::process::Command::new(&ytdlp);
     command
@@ -62,6 +66,8 @@ pub async fn download_youtube(
             "--no-colors",
             "--no-cookies",
             "--no-cookies-from-browser",
+            "--use-extractors",
+            "default,-generic",
             "--socket-timeout",
             "20",
             "--retries",
@@ -108,16 +114,16 @@ pub async fn download_youtube(
     command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     let mut child = command
         .spawn()
-        .map_err(|_| "Не удалось запустить компонент импорта YouTube.".to_string())?;
+        .map_err(|_| "Не удалось запустить компонент импорта аудио.".to_string())?;
     let mut process_tree = ProcessTree::new(child.id());
     let stdout = child
         .stdout
         .take()
-        .ok_or("Не удалось прочитать ответ YouTube.")?;
+        .ok_or("Не удалось прочитать ответ сервиса.")?;
     let stderr = child
         .stderr
         .take()
-        .ok_or("Не удалось прочитать ответ YouTube.")?;
+        .ok_or("Не удалось прочитать ответ сервиса.")?;
     let mut stdout_reader = tokio::spawn(drain_bounded(stdout));
     let mut stderr_reader = tokio::spawn(drain_bounded(stderr));
     let started = Instant::now();
@@ -127,18 +133,18 @@ pub async fn download_youtube(
             Ok(Err(_)) => {
                 stdout_reader.abort();
                 stderr_reader.abort();
-                return Err("Не удалось дождаться завершения импорта YouTube.".into());
+                return Err("Не удалось дождаться завершения импорта аудио.".into());
             }
             Err(_) => {
                 if started.elapsed() >= Duration::from_secs(300) {
                     stdout_reader.abort();
                     stderr_reader.abort();
-                    return Err("Импорт YouTube превысил 5 минут. Загрузка остановлена; проверьте подключение или VPN.".into());
+                    return Err("Импорт по ссылке превысил 5 минут. Загрузка остановлена; проверьте подключение или VPN.".into());
                 }
                 if !working_size_allowed(&working) {
                     stdout_reader.abort();
                     stderr_reader.abort();
-                    return Err("Аудио YouTube превышает 200 МБ. Загрузка остановлена.".into());
+                    return Err("Аудио по ссылке превышает 200 МБ. Загрузка остановлена.".into());
                 }
             }
         }
@@ -157,7 +163,7 @@ pub async fn download_youtube(
         Err(_) => {
             stdout_reader.abort();
             stderr_reader.abort();
-            return Err("Компонент импорта YouTube не завершил работу. Попробуйте ещё раз.".into());
+            return Err("Компонент импорта аудио не завершил работу. Попробуйте ещё раз.".into());
         }
     };
     process_tree.disarm();
@@ -166,19 +172,26 @@ pub async fn download_youtube(
     }
     let info_path = working.join("source.info.json");
     let info_metadata = fs::symlink_metadata(&info_path).map_err(|_| {
-        "YouTube не вернул файл: эфиры и записи длиннее 3 часов не поддерживаются.".to_string()
+        "Сервис не вернул файл: эфиры и записи длиннее 3 часов не поддерживаются.".to_string()
     })?;
     if !info_metadata.is_file() || info_metadata.len() > 2 * 1024 * 1024 {
         return Err("Некорректные данные импортированного трека YouTube.".into());
     }
     let info: Value = serde_json::from_slice(
-        &fs::read(&info_path).map_err(|_| "Не удалось прочитать данные YouTube.")?,
+        &fs::read(&info_path).map_err(|_| "Не удалось прочитать данные сервиса.")?,
     )
-    .map_err(|_| "YouTube вернул некорректные данные трека.".to_string())?;
+    .map_err(|_| "Сервис вернул некорректные данные трека.".to_string())?;
+    if info.get("duration").and_then(Value::as_f64).filter(|duration| duration.is_finite() && *duration > 0. && *duration <= MAX_DURATION).is_none() {
+        return Err("Сервис не подтвердил длительность полной записи. Файл не импортирован, чтобы не добавить превью или незавершённый поток.".into());
+    }
+    if info.get("has_drm").and_then(Value::as_bool) == Some(true)
+        || info.get("is_preview").and_then(Value::as_bool) == Some(true) {
+        return Err("Сервис предоставил защищённый поток или только превью. Полный аудиофайл по этой ссылке недоступен; выберите доступный исходный файл.".into());
+    }
     if info
         .get("_type")
         .and_then(Value::as_str)
-        .is_some_and(|kind| kind != "video")
+        .is_some_and(|kind| !matches!(kind, "video" | "audio" | "song"))
         || info.get("is_live").and_then(Value::as_bool) == Some(true)
         || info
             .get("duration")
@@ -187,7 +200,7 @@ pub async fn download_youtube(
                 !duration.is_finite() || duration <= 0. || duration > MAX_DURATION
             })
     {
-        return Err("Нужна отдельная запись YouTube длительностью до 3 часов. Эфиры и плейлисты не поддерживаются.".into());
+        return Err("Нужна отдельная запись длительностью до 3 часов. Эфиры и плейлисты не поддерживаются.".into());
     }
     let source = find_audio(&working, for_vk)?;
     let metadata = fs::symlink_metadata(&source)
@@ -195,19 +208,20 @@ pub async fn download_youtube(
     if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_AUDIO {
         return Err("Аудиофайл пуст или превышает 200 МБ. Импорт отменён.".into());
     }
-    let title = metadata_text(&info, &["track", "title"], "YouTube");
+    let title = metadata_text(&info, &["track", "title"], "Аудио по ссылке");
     let artist = metadata_text(&info, &["artist", "creator", "uploader", "channel"], "");
     let extension = source
         .extension()
         .and_then(|extension| extension.to_str())
-        .ok_or("Не удалось определить формат YouTube-аудио.")?;
+        .ok_or("Не удалось определить формат аудио.")?;
     let destination = directory.join(format!("import-{}.{}", hex::encode(random), extension));
     fs::rename(&source, &destination)
-        .map_err(|_| "Не удалось завершить сохранение аудио YouTube.".to_string())?;
+        .map_err(|_| "Не удалось завершить сохранение аудио сервиса.".to_string())?;
     Ok(DownloadedUrl {
         path: destination,
         title,
         artist,
+        expected_duration: info.get("duration").and_then(Value::as_f64),
     })
 }
 
@@ -240,6 +254,36 @@ pub fn normalize_youtube_url(input: &str) -> Result<String, String> {
     }.filter(|id| id.len() == 11 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'))
         .ok_or("Поддерживаются ссылки youtube.com/watch, youtube.com/shorts и youtu.be на отдельное видео.")?;
     Ok(format!("https://www.youtube.com/watch?v={id}"))
+}
+
+pub fn is_youtube_url(input: &str) -> bool {
+    Url::parse(input.trim()).ok().is_some_and(|url| matches!(url.host_str(), Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be" | "www.youtu.be")))
+}
+
+/// Recognized extractor hosts. Direct files on other public hosts are handled
+/// by the pinned HTTP downloader, never passed to an arbitrary page extractor.
+pub fn is_extractor_url(input: &str) -> bool {
+    is_youtube_url(input) || normalize_public_media_url(input).is_ok()
+}
+
+fn normalize_public_media_url(input: &str) -> Result<String, String> {
+    let mut url = Url::parse(input.trim()).map_err(|_| "Нужна полная HTTPS-ссылка на трек.")?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some()
+        || url.port_or_known_default() != Some(443) || input.len() > 8192 {
+        return Err("Нужна HTTPS-ссылка без логина, пароля и нестандартного порта.".into());
+    }
+    let host = url.host_str().unwrap_or_default();
+    let allowed = ["soundcloud.com", "on.soundcloud.com", "bandcamp.com", "audiomack.com", "mixcloud.com", "vimeo.com", "rutube.ru", "archive.org", "jamendo.com", "hearthis.at", "music.yandex.ru", "music.yandex.com", "music.yandex.by", "music.yandex.kz", "music.yandex.uz", "music.yandex.com.tr"];
+    if !allowed.iter().any(|domain| host == *domain || host.ends_with(&format!(".{domain}"))) {
+        return Err("Для этого сайта пока нужен прямой адрес аудиофайла. Pulse не подменяет трек результатом поиска VK.".into());
+    }
+    // Music links must identify one track. Profile/album/playlist downloads
+    // cannot silently import only the first item of a larger collection.
+    if host.starts_with("music.yandex.") && !(url.path().contains("/track/") || url.path().starts_with("/track/")) {
+        return Err("Вставьте ссылку на отдельный трек Яндекс Музыки. Альбомы и плейлисты пока не импортируются целиком.".into());
+    }
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 fn validate_proxy(input: &str) -> Result<String, String> {
@@ -292,10 +336,10 @@ fn metadata_text(info: &Value, keys: &[&str], fallback: &str) -> String {
 fn find_audio(directory: &Path, for_vk: bool) -> Result<PathBuf, String> {
     let mut files = Vec::new();
     for entry in fs::read_dir(directory)
-        .map_err(|_| "Не удалось прочитать загруженные файлы YouTube.".to_string())?
+        .map_err(|_| "Не удалось прочитать загруженные аудиофайлы.".to_string())?
     {
         let path = entry
-            .map_err(|_| "Не удалось проверить файл YouTube.".to_string())?
+            .map_err(|_| "Не удалось проверить аудиофайл.".to_string())?
             .path();
         let extension = path
             .extension()
@@ -314,7 +358,7 @@ fn find_audio(directory: &Path, for_vk: bool) -> Result<PathBuf, String> {
         }
     }
     if files.len() != 1 {
-        return Err("YouTube не вернул один готовый аудиофайл. Попробуйте другую запись.".into());
+        return Err("Сервис не вернул один готовый аудиофайл. Попробуйте другую запись.".into());
     }
     Ok(files.remove(0))
 }
@@ -347,12 +391,14 @@ fn working_size_allowed(directory: &Path) -> bool {
 
 fn friendly_tool_error(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output).to_ascii_lowercase();
-    if text.contains("sign in")
+    if text.contains("drm") || text.contains("protected") || text.contains("preview") || text.contains("unsupported url") || text.contains("not supported") {
+        "Сервис не предоставил полный доступный аудиофайл по этой ссылке. Защищённые потоки и превью не импортируются. Можно добавить исходный файл с компьютера или прямую ссылку на него; трек не заменяется результатом поиска VK.".into()
+    } else if text.contains("sign in")
         || text.contains("age-restricted")
         || text.contains("private video")
         || text.contains("members-only")
     {
-        "YouTube требует вход или ограничил доступ к записи. Выберите публичное видео; пароли и cookies браузера плеер не запрашивает.".into()
+        "Сервис требует вход или ограничил доступ к записи. Выберите публичную запись; пароли и cookies браузера плеер не запрашивает.".into()
     } else if text.contains("proxy")
         || text.contains("timed out")
         || text.contains("unable to download")
@@ -360,11 +406,11 @@ fn friendly_tool_error(output: &[u8]) -> String {
         || text.contains("http error 403")
         || text.contains("http error 429")
     {
-        "YouTube недоступен по текущему маршруту или временно ограничил загрузку. Включите свой VPN либо укажите доверенный зарубежный прокси в форме импорта.".into()
+        "Сервис недоступен по текущему маршруту или временно ограничил загрузку. Включите свой VPN либо укажите доверенный зарубежный прокси в форме импорта.".into()
     } else if text.contains("filesize") || text.contains("larger than") {
-        "Аудио YouTube превышает ограничение 200 МБ.".into()
+        "Аудио по ссылке превышает ограничение 200 МБ.".into()
     } else {
-        "Не удалось импортировать аудио YouTube. Запись может быть удалена, ограничена или временно недоступна; попробуйте другую публичную ссылку.".into()
+        "Не удалось импортировать аудио сервиса. Запись может быть удалена, ограничена или временно недоступна; попробуйте другую публичную ссылку.".into()
     }
 }
 
@@ -470,5 +516,16 @@ mod tests {
             metadata_text(&info, &["artist", "uploader"], "fallback"),
             "Artist"
         );
+    }
+    #[test]
+    fn public_extractors_are_separate_from_vk_matching_and_private_inputs() {
+        for value in ["https://artist.bandcamp.com/track/song", "https://soundcloud.com/artist/song", "https://music.yandex.ru/album/12/track/34", "https://vimeo.com/1234", "https://audiomack.com/artist/song/song"] {
+            assert!(is_extractor_url(value), "{value}");
+        }
+        for value in ["https://bandcamp.com.evil.test/a", "https://127.0.0.1/a", "https://localhost/a", "file:///song.mp3", "https://music.yandex.ru/album/12", "https://user:pass@vimeo.com/a", "https://vimeo.com:444/a", "https://open.spotify.com/track/123"] {
+            assert!(!is_extractor_url(value), "{value}");
+        }
+        assert!(friendly_tool_error(b"This content is DRM protected").contains("не заменяется"));
+        assert!(friendly_tool_error(b"Unsupported URL: secret").contains("полный"));
     }
 }

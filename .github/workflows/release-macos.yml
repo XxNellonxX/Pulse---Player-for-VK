@@ -1,0 +1,42 @@
+name: macOS build verification
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+          - arch: x64
+            target: x86_64-apple-darwin
+    runs-on: macos-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
+      PULSE_IMPORT_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run prepare:imports
+      - run: npm run tauri -- build --target ${{ matrix.target }} --bundles app,dmg --config src-tauri/tauri.macos.conf.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-macos-${{ matrix.arch }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg

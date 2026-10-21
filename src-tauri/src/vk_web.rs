@@ -17,6 +17,7 @@ const MAX_ITEMS: usize = 100_000;
 const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 const ADAPTER: &str = include_str!("vk_web_adapter.js");
 const DIRECT_AUDIO: &str = include_str!("vk_direct_audio.js");
+const EQUALIZER: &str = include_str!("../../src/shared/audioEqualizer.js");
 const HLS: &str = include_str!("../resources/vk_hls.js");
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -170,6 +171,17 @@ fn profile_dir(app: &AppHandle) -> std::path::PathBuf {
     )
 }
 
+// WKWebView has no custom directory support. A stable store identifier keeps
+// the VK login between launches; rotating profileId on logout also rotates it.
+#[cfg(any(target_os = "macos", test))]
+fn profile_store_identifier(profile: &std::path::Path) -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(profile.to_string_lossy().as_bytes());
+    let mut identifier = [0u8; 16];
+    identifier.copy_from_slice(&hash[..16]);
+    identifier
+}
+
 fn should_restore(app: &AppHandle) -> bool {
     match std::fs::read(session_path(app)) {
         Ok(bytes) => serde_json::from_slice::<StoredSession>(&bytes)
@@ -285,7 +297,7 @@ fn inject(window: &WebviewWindow, run_id: &str) -> Result<(), String> {
     let seed = cache_seed(app);
     let force = app.state::<AppState>().vk_web.lock().unwrap().force_full;
     let script = format!(
-        "(()=>{{if(window.top!==window.self||!['https://vk.com','https://vk.ru'].includes(location.origin))return;window.__PULSE_VK_WEB_RUN_ID={run_json};window.__PULSE_VK_WEB_CACHE={seed};window.__PULSE_VK_WEB_FULL_REFRESH={force};if(!window.__PULSE_HLS__){{{HLS}}}if(!window.__PULSE_CREATE_DIRECT_AUDIO__){{{DIRECT_AUDIO}}}{ADAPTER}\nwindow.__PULSE_VK_WEB__?.start({run_json},window.__PULSE_VK_WEB_CACHE,{{full:{force}}});delete window.__PULSE_VK_WEB_CACHE;}})();"
+        "(()=>{{if(window.top!==window.self||!['https://vk.com','https://vk.ru'].includes(location.origin))return;window.__PULSE_VK_WEB_RUN_ID={run_json};window.__PULSE_VK_WEB_CACHE={seed};window.__PULSE_VK_WEB_FULL_REFRESH={force};if(!window.__PULSE_HLS__){{{HLS}}}if(!window.__PULSE_CREATE_EQUALIZER__){{{EQUALIZER}}}if(!window.__PULSE_CREATE_DIRECT_AUDIO__){{{DIRECT_AUDIO}}}{ADAPTER}\nwindow.__PULSE_VK_WEB__?.start({run_json},window.__PULSE_VK_WEB_CACHE,{{full:{force}}});delete window.__PULSE_VK_WEB_CACHE;}})();"
     );
     window.eval(script).map_err(|e| e.to_string())
 }
@@ -452,7 +464,7 @@ async fn open_with_policy(
         session.visibility_revision = session.visibility_revision.wrapping_add(1);
         session.window_epoch
     };
-    let result = tauri::WebviewWindowBuilder::new(
+    let builder = tauri::WebviewWindowBuilder::new(
         &app,
         LABEL,
         tauri::WebviewUrl::External("https://vk.com/audio".parse().unwrap()),
@@ -461,12 +473,16 @@ async fn open_with_policy(
     .inner_size(1280., 850.)
     // Connecting and restoring stay in the background until VK actually
     // requests login. An existing signed-in session never flashes a VK tab.
-    .visible(policy == WindowPolicy::Manual)
+    .visible(policy == WindowPolicy::Manual);
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder
     // A click in Pulse cannot carry its transient browser activation into
     // the separate VK document. Pulse's explicit playback intent owns starts.
     .additional_browser_args("--autoplay-policy=no-user-gesture-required")
-    .data_directory(profile_dir(&app))
-    .on_navigation(crate::allowed_vk)
+    .data_directory(profile_dir(&app));
+    #[cfg(target_os = "macos")]
+    let builder = builder.data_store_identifier(profile_store_identifier(&profile_dir(&app)));
+    let result = builder.on_navigation(crate::allowed_vk)
     .on_page_load(move |window, payload| {
         let app = window.app_handle();
         match payload.event() {
@@ -1167,7 +1183,7 @@ fn validate_playback(value: Option<&Value>, run: &str, state: &PersistedState) -
         .filter(|value| matches!(*value, "idle" | "loading" | "ready" | "stalled" | "offline" | "recovering" | "error"))
         .unwrap_or("idle");
     Some(
-        json!({"id":id,"requestedId":requested_id,"playing":id.is_some() && value.get("playing")?.as_bool()?,"buffering":value.get("buffering")?.as_bool()?,"recovering":value.get("recovering").and_then(Value::as_bool).unwrap_or(false),"seeking":value.get("seeking").and_then(Value::as_bool).unwrap_or(false),"advertising":value.get("advertising").and_then(Value::as_bool).unwrap_or(false),"position":position,"duration":duration,"buffered":buffered,"bufferedAhead":buffered_ahead,"network":network,"error":value.get("error").and_then(Value::as_str).map(|error| clean_text(error, 2000)),"ended":value.get("ended")?.as_bool()?,"runId":run}),
+        json!({"id":id,"requestedId":requested_id,"playing":id.is_some() && value.get("playing")?.as_bool()?,"buffering":value.get("buffering")?.as_bool()?,"recovering":value.get("recovering").and_then(Value::as_bool).unwrap_or(false),"seeking":value.get("seeking").and_then(Value::as_bool).unwrap_or(false),"advertising":value.get("advertising").and_then(Value::as_bool).unwrap_or(false),"position":position,"duration":duration,"buffered":buffered,"bufferedAhead":buffered_ahead,"network":network,"error":value.get("error").and_then(Value::as_str).map(|error| clean_text(error, 2000)),"ended":value.get("ended")?.as_bool()?,"runId":run,"equalizerEnabled":value.get("equalizerEnabled").and_then(Value::as_bool).unwrap_or(false),"equalizerError":value.get("equalizerError").and_then(Value::as_str).map(|error| clean_text(error, 500))}),
     )
 }
 
@@ -1188,10 +1204,11 @@ pub async fn vk_web_control(
     id: Option<String>,
     position: Option<f64>,
     volume: Option<f64>,
+    equalizer: Option<crate::equalizer::EqualizerSettings>,
 ) -> Result<Value, String> {
     if !matches!(
         operation.as_str(),
-        "play" | "pause" | "resume" | "seek" | "volume" | "stop"
+        "play" | "pause" | "resume" | "seek" | "volume" | "stop" | "equalizer"
     ) {
         return Err("Неизвестная команда плеера VK.".into());
     }
@@ -1200,6 +1217,11 @@ pub async fn vk_web_control(
     {
         return Err("Некорректный параметр воспроизведения VK.".into());
     }
+    let equalizer = if operation == "equalizer" {
+        let mut value = equalizer.ok_or("Не заданы настройки эквалайзера.")?;
+        value.sanitize();
+        Some(value)
+    } else { None };
     let shared = app.state::<AppState>();
     let (epoch, navigation_revision, account) = {
         let session = shared.vk_web.lock().unwrap();
@@ -1228,7 +1250,7 @@ pub async fn vk_web_control(
         return Err("Завершите вход в VK в официальном окне.".into());
     }
     let request_id = random_id();
-    let request = json!({"operation":operation,"id":id,"position":position,"volume":volume,"requestId":request_id,"cachedTrack":cached_track});
+    let request = json!({"operation":operation,"id":id,"position":position,"volume":volume,"equalizer":equalizer,"requestId":request_id,"cachedTrack":cached_track});
     // Keep the individual receipt: another volume/seek command can replace
     // lastCommand while a previous play() promise is still resolving.
     let receipt_key = serde_json::to_string(&format!("__PULSE_RECEIPT_{request_id}")).unwrap();
@@ -1315,6 +1337,12 @@ mod tests {
     }
     fn track(owner: i64, audio: i64) -> Value {
         json!({"id":format!("vk-{owner}-{audio}"),"source":"vk","url":format!("vk-web://{owner}/{audio}"),"title":"Song","duration":12,"remote":{"ownerId":owner,"audioId":audio,"inLibrary":true}})
+    }
+    #[test]
+    fn wkwebview_store_identity_is_stable_and_rotates_with_the_vk_profile() {
+        let profile = std::path::Path::new("profile/vk-webview-aabbcc");
+        assert_eq!(profile_store_identifier(profile), profile_store_identifier(profile));
+        assert_ne!(profile_store_identifier(profile), profile_store_identifier(std::path::Path::new("profile/vk-webview-dd1122")));
     }
     #[test]
     fn bridge_origin_excludes_auth_subdomains_ports_and_lookalikes() {

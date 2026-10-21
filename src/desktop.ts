@@ -38,7 +38,7 @@ if (isTauri()) {
     searchVk: query => invoke('search_vk', { query }),
   artistMusic: input => invoke('vk_artist_music', { input }),
     resolveVkTrack: id => invoke('resolve_vk_track', { id }),
-    vkWebControl: command => invoke('vk_web_control', { id: null, position: null, volume: null, ...command }),
+    vkWebControl: command => invoke('vk_web_control', { id: null, position: null, volume: null, equalizer: null, ...command }),
     onVkUpdate(callback) {
       let disposed = false
       const pending = listen<VkSnapshot>('vk:web-update', event => { if (!disposed) callback(event.payload) })
@@ -50,6 +50,7 @@ if (isTauri()) {
       return () => { disposed = true; void pending.then(unlisten => unlisten()) }
     },
     getVersion: () => invoke('get_version'),
+    checkAppRelease: () => invoke('check_app_release'),
     exportDiagnostics: () => invoke('export_diagnostics'),
     onCommand(callback) {
       let disposed = false

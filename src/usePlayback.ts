@@ -3,18 +3,23 @@ import type { Dispatch, SetStateAction } from 'react'
 import type { PersistedState, VkWebCommand } from './shared/contracts'
 import { nextShuffledCycle, ownMusicIds, shuffledQueue } from './shuffle'
 import { normalizeBufferedRanges, readMediaBuffered, sameBufferedRanges, secondsBufferedAhead, type BufferedRange, type PlaybackNetwork } from './buffering'
+import './shared/audioEqualizer.js'
+import type { EqualizerGraph } from './shared/audioEqualizer'
 
 // Native transport allows 20s resolve + 25s load + 25s play, plus IPC margin.
 const WEB_START_TIMEOUT = 80000
 
 export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAction<PersistedState>>) {
   const audio = useRef<HTMLAudioElement | null>(null)
+  const equalizerGraph = useRef<EqualizerGraph | null>(null)
+  const localEqualizerSafe = useRef(false)
   const stateRef = useRef(state)
   stateRef.current = state
   const [playing, setPlaying] = useState(false)
   const [position, setPosition] = useState(state.position)
   const [duration, setDuration] = useState(0)
   const [error, setError] = useState('')
+  const [equalizerError, setEqualizerError] = useState('')
   const [buffering, setBuffering] = useState(false)
   const [advertising, setAdvertising] = useState(false)
   const [buffered, setBuffered] = useState<BufferedRange[]>([])
@@ -52,7 +57,37 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     if (!window.desktop?.vkWebControl) throw new Error('Подключение плеера VK недоступно в этой версии.')
     const result = await window.desktop.vkWebControl(command)
     if (!result.accepted) throw new Error(result.error || 'VK не подтвердил команду плеера.')
+    if (command.operation === 'equalizer') setEqualizerError(result.equalizerError || '')
   }, [])
+  const configureWebEqualizer = useCallback(async () => {
+    try { await controlWeb({ operation: 'equalizer', equalizer: stateRef.current.settings.equalizer }) }
+    catch { setEqualizerError('Эквалайзер VK пока недоступен. Трек продолжит играть без обработки.') }
+  }, [controlWeb])
+  const prepareLocalEqualizer = useCallback(async (element: HTMLAudioElement) => {
+    if (audio.current !== element || !element.getAttribute('src')) return
+    if (stateRef.current.settings.equalizer.enabled && !localEqualizerSafe.current && !equalizerGraph.current) { setEqualizerError('Этот источник не разрешает эквалайзер. Трек играет без обработки.'); return }
+    try {
+      if (stateRef.current.settings.equalizer.enabled && !equalizerGraph.current) equalizerGraph.current = globalThis.__PULSE_CREATE_EQUALIZER__(element)
+      const graph = equalizerGraph.current
+      if (graph && stateRef.current.settings.equalizer.enabled) {
+        let timeout: ReturnType<typeof setTimeout> | undefined
+        try { await Promise.race([graph.prepare(), new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('audio-context-timeout')), 1500) })]) }
+        finally { if (timeout) clearTimeout(timeout) }
+      }
+      if (audio.current !== element || graph !== equalizerGraph.current) return
+      graph?.apply(stateRef.current.settings.equalizer)
+      await graph?.resume()
+      if (audio.current === element) setEqualizerError('')
+    } catch {
+      if (audio.current !== element) return
+      if (equalizerGraph.current && !equalizerGraph.current.connected) { equalizerGraph.current.destroy(); equalizerGraph.current = null }
+      setEqualizerError('Эквалайзер недоступен для этого источника звука.')
+    }
+  }, [])
+  const playLocal = useCallback(async (element: HTMLAudioElement) => {
+    await prepareLocalEqualizer(element)
+    if (audio.current === element && playIntent.current) await element.play()
+  }, [prepareLocalEqualizer])
   const clearWebStall = useCallback(() => {
     if (webStallTimer.current) clearTimeout(webStallTimer.current)
     webStallTimer.current = null
@@ -103,6 +138,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     clearWebStall(); watchWebStall(id, false, true)
     webPending.current = id
     void controlWeb({ operation: 'volume', volume: stateRef.current.settings.volume }).then(async () => {
+      await configureWebEqualizer()
       if (sourceVersion.current !== version || !playIntent.current) return
       await controlWeb({ operation: 'play', id, position: startPosition })
       if (sourceVersion.current !== version) return
@@ -113,7 +149,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       clearWebStall(); playIntent.current = false; pendingStart.current = false
       setBuffering(false); setPlaying(false); setNetwork('error'); setError(error.message)
     })
-  }, [controlWeb, clearWebStall, watchWebStall, acceptSnippetStart])
+  }, [controlWeb, clearWebStall, watchWebStall, acceptSnippetStart, configureWebEqualizer])
 
   const next = useCallback((direction = 1, auto = false, failedSource = false) => {
     clearSnippet()
@@ -125,7 +161,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     let nextIndex = index + direction
     if (auto && s.settings.repeat === 'one' && !failedSource) {
       if (isWebTrack()) restartWeb()
-      else if (audio.current) { audio.current.currentTime = 0; void audio.current.play().catch(() => {}) }
+      else if (audio.current) { audio.current.currentTime = 0; void playLocal(audio.current).catch(() => {}) }
       return
     }
     let nextQueue: string[] | undefined
@@ -144,17 +180,18 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const selectedId = (nextQueue || available)[nextIndex]
     if (selectedId === s.currentTrackId) {
       if (isWebTrack()) restartWeb()
-      else if (audio.current) { audio.current.currentTime = 0; void audio.current.play().catch(() => setError('Не удалось перезапустить трек. Попробуйте снова.')) }
+      else if (audio.current) { audio.current.currentTime = 0; void playLocal(audio.current).catch(() => setError('Не удалось перезапустить трек. Попробуйте снова.')) }
       setState(prev => ({ ...prev, position: 0 }))
       return
     }
     setState(prev => ({ ...prev, ...(nextQueue ? { queue: nextQueue } : {}), currentTrackId: selectedId, position: 0, history: [selectedId, ...prev.history.filter(item => item !== selectedId)].slice(0, 300) }))
-  }, [setState, restartWeb, controlWeb, clearSnippet])
+  }, [setState, restartWeb, controlWeb, clearSnippet, playLocal])
 
   useEffect(() => window.desktop?.onVkPlayback?.(status => {
     const s = stateRef.current
     const track = s.tracks.find(item => item.id === s.currentTrackId)
     if (!track?.url.startsWith('vk-web://')) return
+    setEqualizerError(status.equalizerError || '')
     if (status.error && (status.requestedId === track.id || status.id === track.id)) {
       if (Number.isFinite(status.position) && (status.position > 0 || webLatestPosition.current === 0)) {
         webLatestPosition.current = status.position; webPosition.current = status.position
@@ -205,6 +242,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
 
   useEffect(() => {
     const element = new Audio()
+    localEqualizerSafe.current = false
     element.preload = 'metadata'
     element.volume = Math.min(1, Math.max(0, stateRef.current.settings.volume))
     audio.current = element
@@ -295,6 +333,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       for (const [type, handler] of handlers) element.removeEventListener(type, handler)
       sourceAbort.current?.abort()
       if (stallTimer.current) clearTimeout(stallTimer.current)
+      equalizerGraph.current?.destroy(); equalizerGraph.current = null
       element.pause(); element.removeAttribute('src'); element.load(); audio.current = null; loadedId.current = null
     }
   }, [setState, next, state.currentTrackId, reloadNonce, finishSnippet])
@@ -331,6 +370,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
             watchWebStall(current.id, false, true)
             webPending.current = current.id
             await controlWeb({ operation: 'volume', volume: stateRef.current.settings.volume })
+            await configureWebEqualizer()
             if (sourceVersion.current !== version || controller.signal.aborted || !playIntent.current) return
             await controlWeb({ operation: 'play', id: current.id, position: startPosition })
             if (sourceVersion.current !== version || controller.signal.aborted) { if (!stateRef.current.tracks.find(track => track.id === stateRef.current.currentTrackId)?.url.startsWith('vk-web://')) void controlWeb({ operation: 'stop' }).catch(() => {}); return }
@@ -345,6 +385,20 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         const resolved = current.source === 'vk' && window.desktop ? await window.desktop.resolveVkTrack(current.id) : current
         if (sourceVersion.current !== version || controller.signal.aborted) return
         if (!resolved.available || !resolved.url) throw new Error('unavailable')
+        const resolvedUrl = new URL(resolved.url, location.href)
+        // Local Tauri asset responses explicitly permit CORS; browser-local
+        // imports are blobs or same-origin URLs. Legacy remote API sources
+        // remain native Audio unless a readable CORS request is confirmed.
+        let readable = resolvedUrl.origin === location.origin || ['blob:', 'data:', 'asset:'].includes(resolvedUrl.protocol) || ['asset.localhost', 'tauri.localhost'].includes(resolvedUrl.hostname)
+        if (!readable && stateRef.current.settings.equalizer.enabled) {
+          const probe = new AbortController(), timer = setTimeout(() => probe.abort(), 1500)
+          try { const response = await fetch(resolved.url, { mode: 'cors', credentials: 'omit', headers: { Range: 'bytes=0-0' }, signal: probe.signal }); readable = response.ok && response.type !== 'opaque'; void response.body?.cancel() }
+          catch { /* leave the ordinary Audio path available */ }
+          finally { clearTimeout(timer) }
+        }
+        if (sourceVersion.current !== version || controller.signal.aborted) return
+        localEqualizerSafe.current = readable
+        if (readable) element.crossOrigin = 'anonymous'
         element.src = resolved.url
         element.load()
         const shouldStart = playIntent.current
@@ -360,7 +414,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
             controller.signal.addEventListener('abort', fail, { once: true })
             if (element.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) done()
           })
-          if (sourceVersion.current === version && playIntent.current && !controller.signal.aborted) { acceptSnippetStart(current.id, stateRef.current.position || 0); await element.play() }
+          if (sourceVersion.current === version && playIntent.current && !controller.signal.aborted) { acceptSnippetStart(current.id, stateRef.current.position || 0); await playLocal(element) }
         }
       } catch {
         if (sourceVersion.current === version && !controller.signal.aborted) { clearWebStall(); pendingStart.current = false; playIntent.current = false; setPlaying(false); setBuffering(false); setNetwork('error'); setError('Этот трек сейчас недоступен. Можно попробовать ещё раз.') }
@@ -369,7 +423,13 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     void load()
     if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: current.title, artist: current.artist, album: current.album })
     return () => { controller.abort(); clearWebStall(); if (current.url.startsWith('vk-web://') && (webLoaded.current === current.id || webPending.current === current.id)) { void controlWeb({ operation: 'stop' }).catch(() => {}); webLoaded.current = null; webPending.current = null; webPlaying.current = false } if (sourceVersion.current === version) sourceVersion.current++; if (stallTimer.current) clearTimeout(stallTimer.current) }
-  }, [current?.id, current?.url, reloadNonce, controlWeb, clearWebStall, watchWebStall, clearSnippet, acceptSnippetStart])
+  }, [current?.id, current?.url, reloadNonce, controlWeb, clearWebStall, watchWebStall, clearSnippet, acceptSnippetStart, playLocal, configureWebEqualizer])
+
+  useEffect(() => {
+    setEqualizerError('')
+    if (isWebTrack()) void controlWeb({ operation: 'equalizer', equalizer: state.settings.equalizer }).catch(() => setEqualizerError('Эквалайзер VK пока недоступен. Трек продолжит играть без обработки.'))
+    else if (audio.current) void prepareLocalEqualizer(audio.current)
+  }, [state.settings.equalizer, current?.id, controlWeb, prepareLocalEqualizer])
 
   useEffect(() => { if (audio.current) audio.current.volume = Math.min(1, Math.max(0, state.settings.volume)); if (isWebTrack() && webLoaded.current) void controlWeb({ operation: 'volume', volume: state.settings.volume }).catch(error => setError(error.message)) }, [state.settings.volume, controlWeb])
   const playTrack = useCallback((id: string, queue?: string[], startPosition = 0) => {
@@ -385,9 +445,9 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     if (loadedId.current === id && audio.current) {
       if (isWebTrack()) { restartWeb(start); return }
       if (audio.current.error || !audio.current.getAttribute('src')) { loadedId.current = null; setReloadNonce(value => value + 1) }
-      else { audio.current.currentTime = start; acceptSnippetStart(id, start); void audio.current.play().catch(() => setError('Не удалось запустить воспроизведение. Попробуйте снова.')) }
+      else { audio.current.currentTime = start; acceptSnippetStart(id, start); void playLocal(audio.current).catch(() => setError('Не удалось запустить воспроизведение. Попробуйте снова.')) }
     }
-  }, [setState, restartWeb, clearSnippet, acceptSnippetStart])
+  }, [setState, restartWeb, clearSnippet, acceptSnippetStart, playLocal])
   const playSnippet = useCallback((id: string, from: number, to: number) => {
     if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to <= from || to > 864000) { setError('VK не предоставил корректные границы сниппета.'); return }
     playTrack(id, undefined, from)
@@ -425,6 +485,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         clearWebStall(); watchWebStall(id, false, true)
         webEnded.current = ''
         void controlWeb({ operation: 'volume', volume: stateRef.current.settings.volume }).then(async () => {
+          await configureWebEqualizer()
           if (sourceVersion.current !== version || !playIntent.current) return
           await controlWeb(command)
           if (sourceVersion.current === version) { if (snippetRef.current?.id === id) acceptSnippetStart(id, snippetRef.current.from); webLoaded.current = id; webPending.current = null }
@@ -439,9 +500,9 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       if (!stateRef.current.currentTrackId) { const first = stateRef.current.queue[0] || stateRef.current.tracks[0]?.id; if (first) playTrack(first); return }
       playIntent.current = true
       if (element.error || !element.getAttribute('src')) { loadedId.current = null; setReloadNonce(value => value + 1); return }
-      void element.play().catch(() => { setPlaying(false); setError('Воспроизведение не началось. Проверьте доступность файла и повторите.') })
+      void playLocal(element).catch(() => { setPlaying(false); setError('Воспроизведение не началось. Проверьте доступность файла и повторите.') })
     } else { playIntent.current = false; element.pause(); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null }
-  }, [playTrack, controlWeb, clearWebStall, watchWebStall, acceptSnippetStart])
+  }, [playTrack, controlWeb, clearWebStall, watchWebStall, acceptSnippetStart, playLocal, configureWebEqualizer])
   const retry = useCallback(() => {
     if (!stateRef.current.currentTrackId) return
     if (isWebTrack()) {
@@ -477,5 +538,5 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     navigator.mediaSession.setActionHandler('seekto', detail => { if (detail.seekTime !== undefined) seek(detail.seekTime) })
   }, [toggle, next, previous, seek])
   const nextTrack = useCallback(() => next(), [next])
-  return { current, playing, position, duration, error, buffering, buffered, bufferedAhead, network, advertising, snippet, playSnippet, playTrack, retry, toggle, toggleShuffle, seek, next: nextTrack, previous, clearError: () => setError('') }
+  return { current, playing, position, duration, error, equalizerError, buffering, buffered, bufferedAhead, network, advertising, snippet, playSnippet, playTrack, retry, toggle, toggleShuffle, seek, next: nextTrack, previous, clearError: () => setError('') }
 }

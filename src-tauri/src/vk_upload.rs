@@ -308,7 +308,7 @@ pub(crate) async fn upload_files(
         return Ok(json!({"items":[],"cancelled":true,"accountId":expected.account_id}));
     }
     if files.len() > 20 {
-        return Err("За один раз можно загрузить до 20 файлов MP3.".into());
+        return Err("За один раз можно загрузить до 20 аудиофайлов.".into());
     }
     guard(&app, &expected)?;
     UPLOADING
@@ -319,7 +319,7 @@ pub(crate) async fn upload_files(
     let mut items = Vec::new();
     let mut seen = HashSet::new();
     let mut content = HashSet::new();
-    for (index, source) in files.into_iter().enumerate() {
+    for (index, mut source) in files.into_iter().enumerate() {
         let name = public_name(&source.path);
         let key = source
             .path
@@ -332,6 +332,29 @@ pub(crate) async fn upload_files(
         if !vk_web::check_upload_guard(&app, &expected) {
             items.push(json!({"name":name,"status":"skipped","message":"Аккаунт VK изменился. Файл не отправлен."}));
             continue;
+        }
+        // VK takes MP3. Preserve an existing MP3 byte for byte; convert other
+        // real audio formats without losing their original title/artist.
+        // Keep the guard alive until upload_one finishes, then delete only
+        // the generated conversion, never the user's original file.
+        let prepared;
+        {
+            let (title, artist) = metadata(&source);
+            let tools = crate::import_tools(&app)?;
+            let directory = crate::data_dir(&app).join("imports");
+            std::fs::create_dir_all(&directory).map_err(|_| "Не удалось создать папку подготовки аудио.")?;
+            progress(&app, "prepare", &format!("Проверяем полную звуковую дорожку для VK: {name}"), index + 1, total, None);
+            match crate::media_prepare::for_vk(&source.path, &tools, &directory).await {
+                Ok(value) => {
+                    source.path = value.path.clone(); source.title = title; source.artist = artist;
+                    prepared = value;
+                }
+                Err(message) => { items.push(json!({"name":name,"status":"failed","message":message})); continue; }
+            }
+            if !vk_web::check_upload_guard(&app, &expected) {
+                items.push(json!({"name":name,"status":"skipped","message":"Аккаунт VK изменился. Файл не отправлен."}));
+                continue;
+            }
         }
         let path = source.path.clone();
         let digest = tauri::async_runtime::spawn_blocking(move || fingerprint(&path))
@@ -349,6 +372,7 @@ pub(crate) async fn upload_files(
             _ => {}
         }
         let result = upload_one(&app, &expected, &source, index + 1, total).await;
+        drop(prepared);
         let mut item = match result {
             Ok(value) => value,
             Err(message) => json!({"status":"failed","message":message}),

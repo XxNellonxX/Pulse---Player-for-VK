@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AppSettings, PersistedState, Track, VkSnapshot } from './shared/contracts'
+import { normalizeEqualizer } from './shared/equalizer'
 
 export const defaultSettings: AppSettings = {
   theme: 'dark', style: 'minimal', accent: '#bdff62', density: 'comfortable', textScale: 1,
   reducedMotion: false, volume: 0.7, repeat: 'off', shuffle: false, closeToTray: false,
-  autoplay: false, autoSkip: true,
+  autoplay: false, autoSkip: true, equalizer: normalizeEqualizer(undefined),
 }
 export const initialState: PersistedState = {
   version: 1, tracks: [], playlists: [], history: [], queue: [], currentTrackId: null,
@@ -25,6 +26,7 @@ export function normalizeSettings(value: unknown): AppSettings {
     reducedMotion: input.reducedMotion === true, shuffle: input.shuffle === true,
     closeToTray: input.closeToTray === true, autoplay: input.autoplay === true,
     autoSkip: typeof input.autoSkip === 'boolean' ? input.autoSkip : defaultSettings.autoSkip,
+    equalizer: normalizeEqualizer(input.equalizer),
   }
 }
 function normalizeTrack(value: unknown): Track | null {
@@ -135,7 +137,15 @@ export function useLibraryState() {
     const previous = observed.current
     observed.current = state
     if (state === saved.current) return
-    const positionOnly = previous && previous.version === state.version && previous.tracks === state.tracks && previous.playlists === state.playlists && previous.history === state.history && previous.queue === state.queue && previous.currentTrackId === state.currentTrackId && previous.settings === state.settings
+    const sameCatalog = previous && previous.version === state.version && previous.tracks === state.tracks && previous.playlists === state.playlists && previous.history === state.history && previous.queue === state.queue && previous.currentTrackId === state.currentTrackId
+    const equalizerOnly = sameCatalog && previous.settings.equalizer !== state.settings.equalizer && Object.keys(previous.settings).every(key => key === 'equalizer' || previous.settings[key as keyof AppSettings] === state.settings[key as keyof AppSettings])
+    if (equalizerOnly) {
+      // A slider updates audio immediately. Coalesce disk writes while it is
+      // dragged so large libraries are not serialized for every pointer event.
+      saveTimer.current = setTimeout(() => { void persist() }, 250)
+      return () => { if (saveTimer.current) clearTimeout(saveTimer.current) }
+    }
+    const positionOnly = sameCatalog && previous.settings === state.settings
     if (!positionOnly) { void persist(); return }
     // Checkpoint progress without repeatedly serializing and writing the whole
     // catalog. Pause, hide and close still drain the latest snapshot immediately.

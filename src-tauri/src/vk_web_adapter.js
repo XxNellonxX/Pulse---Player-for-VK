@@ -44,6 +44,7 @@
   let ownedTrack = null;
   let desiredPlayback = null;
   let playbackError = null;
+  let equalizerError = null;
   let playbackIntentSequence = 0;
   let direct = null;
   function directPlayer() {
@@ -500,11 +501,11 @@
   }
   function playback() {
     refreshIdentity();
-    const result = { id: null, requestedId: desiredTrack || null, playing: false, buffering: false, advertising: false, position: 0, duration: 0, buffered: [], bufferedAhead: 0, network: 'idle', error: playbackError, ended: false, runId: state.runId };
+    const result = { id: null, requestedId: desiredTrack || null, playing: false, buffering: false, advertising: false, position: 0, duration: 0, buffered: [], bufferedAhead: 0, network: 'idle', error: playbackError, equalizerEnabled: false, equalizerError, ended: false, runId: state.runId };
     if (!account || !direct) return result;
     try {
       const audio = direct.read();
-      return { ...result, ...audio, id: desiredTrack || null, requestedId: desiredTrack || null, advertising: false, error: playbackError || audio.error };
+      return { ...result, ...audio, id: desiredTrack || null, requestedId: desiredTrack || null, advertising: false, error: playbackError || audio.error, equalizerError: audio.equalizerError || equalizerError };
     } catch { return { ...result, error: 'Не удалось прочитать состояние аудиоплеера.' }; }
   }
   async function resolveCachedTuple(id, run, owner) {
@@ -730,6 +731,10 @@
       else if (input.operation === 'volume') {
         if (typeof input.volume !== 'number' || !Number.isFinite(input.volume)) throw new Error('Некорректная громкость.');
         action = directPlayer().volume(Math.max(0, Math.min(1, input.volume)));
+      } else if (input.operation === 'equalizer') {
+        const value = input.equalizer;
+        if (!value || !Array.isArray(value.bands) || value.bands.length !== 10 || value.bands.some(band => typeof band !== 'number' || !Number.isFinite(band)) || typeof value.preamp !== 'number' || !Number.isFinite(value.preamp)) throw new Error('Некорректные параметры эквалайзера.');
+        action = Promise.resolve(directPlayer().equalizer(value)).then(result => { equalizerError = result?.equalizerError || null; reply.equalizerEnabled = result?.equalizerEnabled === true; reply.equalizerError = equalizerError; return result; });
       } else if (input.operation === 'seek') {
         if (typeof input.position !== 'number' || !Number.isFinite(input.position) || input.position < 0) throw new Error('Некорректная позиция.');
         const duration = playback().duration;
@@ -746,6 +751,7 @@
           if (error?.code === 'PULSE_DIRECT_CANCELLED' || playbackIntent !== playbackIntentSequence || commandAccount !== account) { reply.pending = false; return; }
           reply.accepted = false;
           reply.pending = false;
+          if (input.operation === 'equalizer') { reply.equalizerError = equalizerError || 'Эквалайзер недоступен. Трек продолжит играть без обработки.'; return; }
           reply.error = error instanceof Error && /^(VK |Источник VK |Для этого источника VK |Интерфейс источников VK)/.test(error.message) ? error.message : 'Не удалось воспроизвести доступный источник VK.';
           if (playbackIntent === playbackIntentSequence && commandAccount === account) playbackError = reply.error;
         });

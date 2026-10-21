@@ -19,6 +19,11 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 mod audio_session;
+mod equalizer;
+mod local_audio;
+mod media_prepare;
+mod source_page;
+mod updates;
 mod soundcloud;
 mod vk_auth;
 mod vk_sync;
@@ -127,6 +132,7 @@ pub struct Settings {
     pub autoplay: bool,
     #[serde(rename = "autoSkip")]
     pub auto_skip: bool,
+    pub equalizer: equalizer::EqualizerSettings,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -220,6 +226,7 @@ fn defaults() -> PersistedState {
             close_to_tray: false,
             autoplay: false,
             auto_skip: true,
+            equalizer: equalizer::EqualizerSettings::default(),
         },
     }
 }
@@ -308,6 +315,7 @@ fn sanitized(mut state: PersistedState, media: &HashMap<String, PathBuf>) -> Per
     }
     state.position = state.position.clamp(0., 864000.);
     state.settings.volume = state.settings.volume.clamp(0., 1.);
+    state.settings.equalizer.sanitize();
     state.settings.text_scale = state.settings.text_scale.clamp(0.85, 1.3);
     if !["dark", "light", "system", "high-contrast"].contains(&state.settings.theme.as_str()) {
         state.settings.theme = "dark".into();
@@ -560,6 +568,13 @@ fn import_progress(app: &AppHandle, phase: &str, message: &str, current: usize, 
         serde_json::json!({"phase":phase,"message":message,"current":current,"total":total}),
     );
 }
+fn import_tools(app: &AppHandle) -> Result<PathBuf, String> {
+    let mut tools = app.path().resource_dir().map_err(|_| "Папка инструментов импорта недоступна.")?.join("import-tools");
+    if cfg!(debug_assertions) && !tools.join(youtube::import_tool_name("yt-dlp")).is_file() {
+        tools = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/import-tools");
+    }
+    Ok(tools)
+}
 #[tauri::command]
 async fn upload_files_to_vk(app: AppHandle) -> Result<serde_json::Value, String> {
     let _permit = ImportPermit::acquire(&app)?;
@@ -570,8 +585,8 @@ async fn upload_files_to_vk(app: AppHandle) -> Result<serde_json::Value, String>
                 .map_err(|_| "Некорректный список тестовых файлов.")?
         } else {
             rfd::AsyncFileDialog::new()
-                .set_title("Загрузить MP3 в VK")
-                .add_filter("MP3", &["mp3"])
+                .set_title("Загрузить аудио в VK")
+                .add_filter("Аудио", &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "aiff", "aif", "webm"])
                 .pick_files()
                 .await
                 .unwrap_or_default()
@@ -591,20 +606,6 @@ async fn upload_files_to_vk(app: AppHandle) -> Result<serde_json::Value, String>
         })
         .collect();
     vk_upload::upload_files(app, sources, guard).await
-}
-fn youtube_url(input: &str) -> bool {
-    url::Url::parse(input).ok().is_some_and(|url| {
-        matches!(
-            url.host_str(),
-            Some(
-                "youtube.com"
-                    | "www.youtube.com"
-                    | "m.youtube.com"
-                    | "music.youtube.com"
-                    | "youtu.be"
-            )
-        )
-    })
 }
 #[tauri::command]
 async fn upload_local_track_to_vk(app: AppHandle, id: String) -> Result<serde_json::Value, String> {
@@ -660,17 +661,18 @@ async fn import_from_url(
     };
     let imports = data_dir(&app).join("imports");
     fs::create_dir_all(&imports).map_err(|_| "Не удалось создать папку загрузок.")?;
+    let tools = import_tools(&app)?;
     import_progress(&app, "download", "Скачиваем исходный аудиофайл…", 1, 1);
-    let downloaded = if youtube_url(&url) {
-        let mut tools = app
-            .path()
-            .resource_dir()
-            .map_err(|_| "Папка инструментов импорта недоступна.")?
-            .join("import-tools");
-        if cfg!(debug_assertions) && !tools.join("yt-dlp.exe").is_file() {
-            tools = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources/import-tools");
+    let is_soundcloud = url::Url::parse(url.trim()).ok().is_some_and(|u| matches!(u.host_str(), Some("soundcloud.com" | "www.soundcloud.com" | "on.soundcloud.com")));
+    let mut downloaded = if is_soundcloud {
+        // Prefer the author's original file. Public listening streams are a
+        // second option, explicitly described in the import form.
+        match soundcloud::download_url(&url, &imports).await {
+            Ok(file) => file,
+            Err(_) => youtube::download_media(&url, &imports, &tools, proxy.as_deref(), destination == "vk").await?,
         }
-        youtube::download_youtube(
+    } else if youtube::is_extractor_url(&url) {
+        youtube::download_media(
             &url,
             &imports,
             &tools,
@@ -678,10 +680,21 @@ async fn import_from_url(
             destination == "vk",
         )
         .await?
-    } else {
-        soundcloud::download_url(&url, &imports).await?
+    } else { soundcloud::download_url(&url, &imports).await? };
+    let mut path = downloaded.path.clone();
+    import_progress(&app, "verify", "Проверяем полную звуковую дорожку…", 1, 1);
+    let (codec, duration) = match media_prepare::verify_audio(&path, &tools, downloaded.expected_duration).await {
+        Ok(value) => value,
+        Err(error) => { let _ = fs::remove_file(&path); return Err(error); }
     };
-    let path = downloaded.path.clone();
+    if destination == "local" {
+        import_progress(&app, "prepare", "Готовим аудио для воспроизведения…", 1, 1);
+        match local_audio::prepare_download(&path, &tools, &imports, &codec, duration).await {
+            Ok(Some(playable)) => { let _ = fs::remove_file(&path); path = playable.clone(); downloaded.path = playable; }
+            Ok(None) => {},
+            Err(error) => { let _ = fs::remove_file(&path); return Err(error); }
+        }
+    }
     let tags = Probe::open(&path).and_then(|probe| probe.read()).ok();
     let tag = tags
         .as_ref()
@@ -695,6 +708,7 @@ async fn import_from_url(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(downloaded.artist);
     if let Some(guard) = guard {
+        import_progress(&app, "prepare", "Проверяем формат для загрузки в VK…", 1, 1);
         let source = vk_upload::UploadSource {
             path: path.clone(),
             title: (!title.is_empty()).then_some(title),
@@ -827,8 +841,8 @@ async fn remove_track(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 fn open_external(app: AppHandle, url: String) -> Result<(), String> {
     let parsed = url::Url::parse(&url).map_err(|_| "Некорректный URL")?;
-    if !allowed_vk(&parsed) {
-        return Err("Разрешены только ссылки VK".into());
+    if !allowed_vk(&parsed) && !updates::release_link(&url, true) && !updates::release_link(&url, false) {
+        return Err("Разрешены только ссылки VK и официальных релизов Pulse.".into());
     }
     app.opener()
         .open_url(url, None::<String>)
@@ -1504,6 +1518,7 @@ pub fn run() {
             search_vk,
             resolve_vk_track,
             get_version,
+            updates::check_app_release,
             export_diagnostics
         ])
         .run(context)

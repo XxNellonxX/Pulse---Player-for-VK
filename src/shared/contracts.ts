@@ -1,4 +1,5 @@
 import type { ArtistMusicRequest, ArtistMusicResult } from './artists'
+import type { EqualizerSettings } from './equalizer'
 export type RemoteTrack = { ownerId: number; audioId: number; accessKey?: string; inLibrary?: boolean; searchResult?: boolean }
 export type RemotePlaylist = { ownerId: number; playlistId: number; accessKey?: string }
 export type Track = {
@@ -18,6 +19,7 @@ export type AppSettings = {
   accent: string; density: 'comfortable' | 'compact'; textScale: number;
   reducedMotion: boolean; volume: number; repeat: 'off' | 'all' | 'one';
   shuffle: boolean; closeToTray: boolean; autoplay: boolean; autoSkip: boolean;
+  equalizer: EqualizerSettings;
 };
 export type PersistedState = {
   version: 1; tracks: Track[]; playlists: Playlist[]; history: string[];
@@ -32,8 +34,8 @@ export type VkStatus = {
 };
 export type VkSyncProgress = { phase: string; tracks: number; playlists: number; completedPlaylists: number };
 export type PlaybackNetwork = 'idle' | 'loading' | 'ready' | 'stalled' | 'offline' | 'recovering' | 'error';
-export type VkWebPlayback = { id: string | null; requestedId?: string | null; playing: boolean; buffering: boolean; recovering?: boolean; seeking?: boolean; advertising?: boolean; position: number; duration: number; buffered?: Array<[number, number]>; bufferedAhead?: number; network?: PlaybackNetwork; error?: string | null; ended: boolean; runId?: string };
-export type VkWebCommand = { operation: 'play' | 'pause' | 'resume' | 'seek' | 'volume' | 'stop'; id?: string; position?: number; volume?: number };
+export type VkWebPlayback = { id: string | null; requestedId?: string | null; playing: boolean; buffering: boolean; recovering?: boolean; seeking?: boolean; advertising?: boolean; position: number; duration: number; buffered?: Array<[number, number]>; bufferedAhead?: number; network?: PlaybackNetwork; error?: string | null; ended: boolean; runId?: string; equalizerEnabled?: boolean; equalizerError?: string | null };
+export type VkWebCommand = { operation: 'play' | 'pause' | 'resume' | 'seek' | 'volume' | 'stop' | 'equalizer'; id?: string; position?: number; volume?: number; equalizer?: EqualizerSettings };
 export type VkSnapshot = {
   status: VkStatus; tracks: Track[]; playlists: Playlist[]; complete: boolean;
   syncedAt?: number | null; error?: string; mutationConfirmed?: boolean;
@@ -47,6 +49,7 @@ export type DesktopCommand = 'play-pause' | 'next' | 'previous' | 'import';
 export type MusicImportItem = { name: string; status: 'uploaded' | 'local' | 'failed' | 'uncertain' | 'skipped'; message: string; trackId?: string; track?: Track };
 export type UploadBatchResult = { items: MusicImportItem[]; cancelled: boolean; accountId?: number };
 export type ImportProgress = { phase: string; message: string; current: number; total: number };
+export type AppRelease = { currentVersion: string; latestVersion: string | null; available: boolean; notes: string; releaseUrl: string | null; downloadUrl: string | null };
 export interface DesktopAPI {
   getState(): Promise<PersistedState | null>;
   saveState(state: PersistedState): Promise<void>;
@@ -68,10 +71,11 @@ export interface DesktopAPI {
   searchVk(query: string): Promise<Track[]>;
   artistMusic?(input: ArtistMusicRequest): Promise<ArtistMusicResult>;
   resolveVkTrack(id: string): Promise<Track>;
-  vkWebControl?(command: VkWebCommand): Promise<{ accepted: boolean; pending?: boolean; error?: string }>;
+  vkWebControl?(command: VkWebCommand): Promise<{ accepted: boolean; pending?: boolean; error?: string; equalizerError?: string | null }>;
   onVkUpdate?(callback: (snapshot: VkSnapshot) => void): () => void;
   onVkPlayback?(callback: (status: VkWebPlayback) => void): () => void;
   getVersion(): Promise<string>;
+  checkAppRelease?(): Promise<AppRelease>;
   exportDiagnostics(): Promise<string | null>;
   onCommand(callback: (command: DesktopCommand) => void): () => void;
   onCloseRequest?(callback: () => Promise<void>): () => void;

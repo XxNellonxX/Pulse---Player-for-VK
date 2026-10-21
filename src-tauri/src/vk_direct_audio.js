@@ -119,6 +119,11 @@
     let lastProgressAt = Date.now();
     let healthyRecoverySeconds = 0;
     let hasPlayed = false;
+    let equalizerSettings = { enabled: false, bands: Array(10).fill(0), preamp: 0 };
+    let equalizerGraph = null;
+    let equalizerError = null;
+    let equalizerSafe = false;
+    const corsProbes = new Map();
     const mediaPosition = () => Number.isFinite(media?.currentTime) ? media.currentTime : resumePosition;
     const position = () => recovering ? resumePosition : mediaPosition();
     function observeProgress() {
@@ -146,6 +151,7 @@
     const check = generation => { if (!isCurrent(generation)) throw cancelled(); };
     function cancelWaiting() { for (const cancel of [...waiting]) cancel(); }
     function disposeMedia() {
+      equalizerGraph?.destroy(); equalizerGraph = null; equalizerSafe = false;
       for (const off of attached.splice(0)) off();
       if (hls) { try { hls.destroy(); } catch { /* release best effort */ } hls = null; }
       if (media) {
@@ -178,10 +184,65 @@
       attached.push(off);
       return off;
     }
+    async function allowsEqualizer(source, generation) {
+      // HLS.js only loads readable CORS responses and hands MSE a same-origin
+      // blob. Native HLS requires a readable manifest check instead.
+      const Hls = w.__PULSE_HLS__ || w.Hls;
+      if (source.format === 'hls' && typeof Hls === 'function' && Hls.isSupported?.()) return true;
+      if (new URL(source.url).origin === w.location.origin) return true;
+      if (corsProbes.has(source.url)) return corsProbes.get(source.url);
+      if (typeof w.fetch !== 'function' || typeof w.AbortController !== 'function') return false;
+      const controller = new w.AbortController();
+      const cancel = () => controller.abort(); waiting.add(cancel);
+      const timer = setTimeout(cancel, 2500);
+      let allowed = false;
+      try {
+        // Read a single range, never download/cache the song or export the
+        // session-granted URL from this private document.
+        const response = await w.fetch(source.url, { method: 'GET', mode: 'cors', credentials: 'omit', headers: { Range: 'bytes=0-0' }, signal: controller.signal });
+        allowed = response.ok && response.type !== 'opaque';
+        try { await response.body?.cancel(); } catch { /* response already closed */ }
+      } catch { /* fail open to ordinary audio */ }
+      finally { clearTimeout(timer); waiting.delete(cancel); }
+      check(generation);
+      if (corsProbes.size >= 32) corsProbes.delete(corsProbes.keys().next().value);
+      corsProbes.set(source.url, allowed);
+      return allowed;
+    }
+    async function applyEqualizer() {
+      const target = media;
+      if (!target) { equalizerError = null; return; }
+      if (!equalizerSettings.enabled && !equalizerGraph) { equalizerError = null; return; }
+      if (!equalizerSafe && !equalizerGraph) { equalizerError = 'Эквалайзер недоступен для этого источника VK. Трек играет без обработки; новые настройки применятся к следующему доступному треку.'; return; }
+      try {
+        if (!equalizerGraph) {
+          if (typeof w.__PULSE_CREATE_EQUALIZER__ !== 'function') throw failure('Эквалайзер не загрузился. Перезапустите Pulse.');
+          equalizerGraph = w.__PULSE_CREATE_EQUALIZER__(target);
+        }
+        const graph = equalizerGraph;
+        if (equalizerSettings.enabled) {
+          let timer;
+          try { await Promise.race([graph.prepare(), new Promise((_resolve, reject) => { timer = setTimeout(() => reject(failure('Эквалайзер не запустился.')), 1500); })]); }
+          finally { clearTimeout(timer); }
+        }
+        if (media !== target || graph !== equalizerGraph) return;
+        graph.apply(equalizerSettings);
+        await graph.resume();
+        if (media === target) equalizerError = null;
+      } catch {
+        if (media === target && equalizerGraph && !equalizerGraph.connected) { equalizerGraph.destroy(); equalizerGraph = null; }
+        if (media === target) equalizerError = 'Эквалайзер недоступен в этом окне. Трек играет без обработки.';
+      }
+    }
     async function define(source, generation, timeout) {
       check(generation);
       disposeMedia();
+      equalizerError = null;
+      const readable = equalizerSettings.enabled ? await allowsEqualizer(source, generation) : false;
+      check(generation);
       const target = new w.Audio(); media = target;
+      equalizerSafe = readable;
+      if (readable) target.crossOrigin = 'anonymous';
       target.preload = 'auto'; target.volume = currentVolume;
       listen(target, 'playing', () => { if (!desired) target.pause(); else { buffering = false; ended = false; hasPlayed = true; lastProgressAt = Date.now(); } }, generation);
       listen(target, 'waiting', () => { observedPosition = position(); buffering = desired; }, generation);
@@ -229,8 +290,10 @@
         await bounded(loaded, timeout, generation, 'Источник VK не ответил. Проверьте соединение и повторите запуск.');
       } finally { releaseLoad(); }
       check(generation); ready = true; buffering = false; error = null;
+      await applyEqualizer();
+      check(generation);
     }
-    async function resolveSource(raw, player, generation, fallback = false) {
+    async function resolveSource(raw, player, generation, fallback = false, renewal = false) {
       const input = normalize(raw);
       let audio = input;
       // Artist/release APIs provide full streams and an access key rather
@@ -242,7 +305,7 @@
         check(generation);
         audio = normalize(result);
         if (audio.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
-      } else if (typeof player?._ensureHasURL === 'function') {
+      } else if (!(Array.isArray(raw) && safeSource(input.url) && !input.actionHash && !input.urlHash && !renewal) && typeof player?._ensureHasURL === 'function') {
         const result = await bounded(player._ensureHasURL({ ...input, url: undefined }), RESOLVE_TIMEOUT, generation, 'VK не подтвердил источник трека. Повторите запуск.');
         check(generation);
         audio = normalize(result);
@@ -254,10 +317,16 @@
       if (fallback && sources.length > 1) sources.push(sources.shift());
       let lastError;
       const deadline = Date.now() + LOAD_TIMEOUT;
-      for (const source of sources) {
+      for (let sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
+        const source = sources[sourceIndex];
         check(generation);
         if (Date.now() >= deadline) break;
-        try { await define(source, generation, Math.max(1, deadline - Date.now())); return; }
+        const remainingSources = sources.length - sourceIndex;
+        const remaining = Math.max(1, deadline - Date.now());
+        // Do not let an unresponsive primary consume the entire retry budget;
+        // each explicit VK fallback receives a bounded share of the deadline.
+        const sourceTimeout = Math.max(2500, Math.floor(remaining / remainingSources));
+        try { await define(source, generation, Math.min(remaining, sourceTimeout)); return; }
         catch (failureValue) { if (failureValue?.code === CANCELLED) throw failureValue; lastError = failureValue; }
       }
       throw lastError || failure('Источник VK не загрузился.');
@@ -280,7 +349,7 @@
         while (recoveryCount < 2) {
           recoveryCount++;
           try {
-            await resolveSource(sourceInput, sourcePlayer, generation, recoveryCount > 1);
+            await resolveSource(sourceInput, sourcePlayer, generation, recoveryCount > 1, true);
             check(generation);
             if (revision !== action || !desired) throw cancelled();
             const target = media;
@@ -332,6 +401,8 @@
         const revision = ++action; const target = media;
         desired = true; ended = false; error = null; buffering = target.readyState < 3;
         try {
+          if (equalizerSettings.enabled || equalizerGraph) await applyEqualizer();
+          if (!isCurrent(generation) || action !== revision || !desired || media !== target) throw cancelled();
           const playing = Promise.resolve(target.play()).then(() => {
             if (!isCurrent(generation) || action !== revision || !desired || media !== target) { if (!isCurrent(generation) || media !== target || !desired) target.pause(); throw cancelled(); }
           });
@@ -372,6 +443,12 @@
         currentVolume = Math.max(0, Math.min(1, value));
         if (media) media.volume = currentVolume;
       },
+      async equalizer(value) {
+        const bands = Array.isArray(value?.bands) && value.bands.length === 10 ? value.bands : [];
+        equalizerSettings = { enabled: value?.enabled === true, bands: Array.from({ length: 10 }, (_, index) => typeof bands[index] === 'number' && Number.isFinite(bands[index]) ? Math.max(-12, Math.min(12, bands[index])) : 0), preamp: typeof value?.preamp === 'number' && Number.isFinite(value.preamp) ? Math.max(-12, Math.min(0, value.preamp)) : 0 };
+        await applyEqualizer();
+        return { equalizerEnabled: Boolean(equalizerGraph?.active), equalizerError };
+      },
       read() {
         if (!destroyed && account && !isCurrent(epoch)) { invalidate(); error = 'Сеанс VK изменился. Подключите аккаунт заново.'; account = 0; }
         observeProgress();
@@ -388,7 +465,7 @@
         const range = buffered.find(([start, end]) => start <= current + .05 && end > current);
         const bufferedAhead = range ? Math.max(0, range[1] - current) : 0;
         const network = error ? 'error' : w.navigator?.onLine === false && desired ? 'offline' : recovering ? 'recovering' : !media ? (buffering ? 'loading' : 'idle') : buffering && desired ? (ready && hasPlayed ? 'stalled' : 'loading') : media.readyState >= 3 || bufferedAhead > .25 ? 'ready' : media.networkState === 2 ? 'loading' : 'idle';
-        return { playing: Boolean(!recovering && media && desired && !media.paused && !media.ended), buffering: buffering || recovering, recovering, seeking: Boolean(media?.seeking), position: current, duration, buffered, bufferedAhead, network, ended, error };
+        return { playing: Boolean(!recovering && media && desired && !media.paused && !media.ended), buffering: buffering || recovering, recovering, seeking: Boolean(media?.seeking), position: current, duration, buffered, bufferedAhead, network, ended, error, equalizerEnabled: Boolean(equalizerGraph?.active), equalizerError };
       },
       destroy() { invalidate(); destroyed = true; error = null; },
     };

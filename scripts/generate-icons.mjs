@@ -14,10 +14,10 @@ try {
   ], { cwd: root, stdio: 'inherit', windowsHide: true });
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`Icon generator exited with ${result.status}`);
-  for (const name of ['icon.ico', 'icon.png', '32x32.png', '64x64.png', '128x128.png', '128x128@2x.png']) {
+  for (const name of ['icon.ico', 'icon.icns', 'icon.png', '32x32.png', '64x64.png', '128x128.png', '128x128@2x.png']) {
     copyFileSync(path.join(temporary, name), path.join(icons, name));
   }
-  console.log('Windows app and tray icons regenerated from src-tauri/icons/app-icon.svg');
+  console.log('Windows and macOS app icons regenerated from src-tauri/icons/app-icon.svg');
 } finally {
   // This is exclusively the directory created above, never an input or output directory.
   rmSync(temporary, { recursive: true, force: true });

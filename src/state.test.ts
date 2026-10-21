@@ -24,3 +24,12 @@ it('repairs legacy or malformed appearance settings without losing valid user pr
   const settings = normalizeSettings({ theme: 'broken', style: 'bad', palette: 'url(evil)', accent: 'red; color: transparent', textScale: Infinity, volume: 5, repeat: 'broken', reducedMotion: true })
   expect(settings.theme).toBe('dark'); expect(settings.palette).toBeUndefined(); expect(settings.volume).toBe(1); expect(settings.textScale).toBe(1); expect(settings.reducedMotion).toBe(true)
 })
+
+it('restores a saved equalizer without losing library metadata or settings', () => {
+  const equalizer = { enabled: true, preset: 'custom', bands: [3, 2, 1, 0, -1, -2, -3, 0, 1, 2], preamp: -4.5 }
+  const restored = hydrateState(JSON.parse(JSON.stringify({ tracks: [track], settings: { equalizer, volume: .45 } })))
+  expect(restored.settings.equalizer).toEqual(equalizer)
+  expect(restored.settings.volume).toBe(.45)
+  expect(restored.tracks[0].id).toBe(track.id)
+  expect(normalizeSettings({}).equalizer).toEqual({ enabled: false, preset: 'flat', bands: Array(10).fill(0), preamp: 0 })
+})

@@ -1,4 +1,7 @@
-yt-dlp 2026.08.19: https://github.com/yt-dlp/yt-dlp (Unlicense; packaged third-party notices included in its official distribution)
+Pulse URL import tools for win32/x64. Started only during a requested URL import.
+yt-dlp 2026.08.19: https://github.com/yt-dlp/yt-dlp (Unlicense; official packaged third-party notices apply)
 Deno 2.9.7: https://github.com/denoland/deno (MIT)
-FFmpeg Windows essentials by gyan.dev: https://www.gyan.dev/ffmpeg/builds/ (GPLv3 build; source: https://ffmpeg.org/download.html)
-These programs are started only for a user-requested URL import.
+FFmpeg Windows essentials by gyan.dev: https://www.gyan.dev/ffmpeg/builds/ (GPLv3; upstream sources https://ffmpeg.org/download.html)
+yt-dlp.exe: https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe SHA-256 66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a
+ffmpeg.exe: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip SHA-256 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+deno.exe: https://github.com/denoland/deno/releases/download/v2.9.7/deno-x86_64-pc-windows-msvc.zip SHA-256 a0c3101b4158d1dfb7d6a78a7bf0f3de80c96bb423c152beec8beb22786f2238
