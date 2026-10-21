@@ -51,34 +51,12 @@ window.XMLHttpRequest=class{constructor(){this.upload={};this.status=200;}open(m
 window.getAudioPlayer=()=>({getCurrentAudio:()=>null,isPlaying:()=>false,isPaused:()=>true});
 </script><p>Controlled upload fixture. No real VK access.</p>`;
 
-const hiddenHelper=path.join(root,'hide-qa-windows.ps1');
-await writeFile(hiddenHelper,`param([int]$QaOwner)
-Add-Type -TypeDefinition @'
-using System;using System.Runtime.InteropServices;
-public class QaUploadWindows {
- public delegate bool Visit(IntPtr window,IntPtr arg);
- [DllImport("user32.dll")] public static extern bool EnumWindows(Visit visit,IntPtr arg);
- [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window,out int owner);
- [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
- [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window,int show);
-}
-'@
-while(Get-Process -Id $QaOwner -ErrorAction SilentlyContinue){
- [QaUploadWindows]::EnumWindows({param($QaWindow,$QaArg)
-  $QaProcess=0;[void][QaUploadWindows]::GetWindowThreadProcessId($QaWindow,[ref]$QaProcess)
-  if($QaProcess -eq $QaOwner -and [QaUploadWindows]::IsWindowVisible($QaWindow)){[void][QaUploadWindows]::ShowWindowAsync($QaWindow,0)}
-  return $true
- },[IntPtr]::Zero)|Out-Null
- Start-Sleep -Milliseconds 50
-}
-`);
-let child,hiddenWindows,browser,page,remote;
-const output=[];let failures=0;
+let child,browser,page,remote;
+const output=[],results=[];let failures=0;
 async function until(fn,message,timeout=12000){const end=Date.now()+timeout;while(Date.now()<end){if(await fn())return;await new Promise(resolve=>setTimeout(resolve,100));}throw Error(message);}
-async function check(name,fn){try{await fn();console.log('PASS '+name);}catch(e){failures++;console.log('FAIL '+name+': '+e.stack);}}
+async function check(name,fn){try{await fn();results.push({name,pass:true});console.log('PASS '+name);}catch(e){failures++;results.push({name,pass:false,error:e.stack});console.log('FAIL '+name+': '+e.stack);}}
 try{
  child=spawn(exe,[],{windowsHide:true,env:{...process.env,VK_PLAYER_QA_PROFILE:profile,VK_PLAYER_QA_FILES:JSON.stringify([file,corrupt,duplicate]),WEBVIEW2_USER_DATA_FOLDER:path.join(root,'browser'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port=9225 --autoplay-policy=no-user-gesture-required --host-resolver-rules="MAP vk.com 127.0.0.1,MAP vk.ru 127.0.0.1"'},stdio:['ignore','pipe','pipe']});
- hiddenWindows=spawn('powershell.exe',['-NoProfile','-ExecutionPolicy','Bypass','-File',hiddenHelper,'-QaOwner',String(child.pid)],{windowsHide:true,stdio:'ignore'});
  child.stdout.on('data',x=>output.push(String(x)));child.stderr.on('data',x=>output.push(String(x)));
  for(let i=0;i<100;i++){try{browser=await chromium.connectOverCDP('http://127.0.0.1:9225',{timeout:600});break;}catch{}if(child.exitCode!==null)throw Error('QA binary exited '+child.exitCode+' '+output.join(''));await new Promise(r=>setTimeout(r,150));}
  assert.ok(browser);
@@ -153,7 +131,7 @@ try{
  console.log(JSON.stringify({passed:5-failures,failed:failures}));
 }finally{
  if(child?.exitCode===null){const exit=new Promise(r=>child.once('exit',r));child.kill();await Promise.race([exit,new Promise(r=>setTimeout(r,3000))]);}
- if(hiddenWindows?.exitCode===null)hiddenWindows.kill();
+ await writeFile(new URL('./tauri-vk-upload-results.json',import.meta.url),JSON.stringify({checkedAt:new Date().toISOString(),results,output},null,2)+'\n');
  await browser?.close().catch(()=>{});await new Promise(r=>setTimeout(r,500));await rm(root,{recursive:true,force:true}).catch(()=>{});
 }
 if(failures)process.exitCode=1;

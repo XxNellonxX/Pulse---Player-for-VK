@@ -777,50 +777,97 @@ async fn import_files(app: AppHandle) -> Result<Vec<Track>, String> {
             .map(|f| f.path().to_path_buf())
             .collect()
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        let shared = app.state::<AppState>();
+    // Validate the bytes and decode the whole track before it enters the
+    // library. A container may retain a false header duration after truncation;
+    // the same bounded decoder used for VK uploads catches that case here.
+    let tools = import_tools(&app)?;
+    let imports = data_dir(&app).join("imports");
+    fs::create_dir_all(&imports).map_err(|_| "Не удалось создать папку подготовки аудио.")?;
+    let mut candidates = Vec::<(PathBuf, PathBuf)>::new();
+    let mut errors = Vec::<String>::new();
+    let mut selected = HashSet::new();
+    for file in files {
+        let Ok(path) = fs::canonicalize(file) else {
+            errors.push("Не удалось открыть выбранный файл.".into());
+            continue;
+        };
+        if !is_audio(&path) { continue; }
+        if !selected.insert(path.clone()) { continue; }
+        let (codec, duration) = match media_prepare::verify_audio(&path, &tools, None).await {
+            Ok(value) => value,
+            Err(error) => { errors.push(error); continue; }
+        };
+        match local_audio::prepare_download(&path, &tools, &imports, &codec, duration).await {
+            Ok(Some(playable)) => candidates.push((path, playable)),
+            Ok(None) => candidates.push((path.clone(), path)),
+            Err(error) => errors.push(error),
+        }
+    }
+    let prepared: Vec<PathBuf> = candidates.iter().map(|(original, playable)| if original == playable { None } else { Some(playable.clone()) }).flatten().collect();
+    let import_app = app.clone();
+    let prepared_for_commit = prepared.clone();
+    let result: Result<(Vec<Track>, Vec<String>), String> = tauri::async_runtime::spawn_blocking(move || {
+        let shared = import_app.state::<AppState>();
         let _lock = shared.storage_lock.lock().unwrap();
+        let before = shared.state.lock().unwrap().clone();
+        let media_before = shared.media.lock().unwrap().clone();
         let mut added = vec![];
-        let mut errors = vec![];
-        for file in files {
-            if let Ok(path) = fs::canonicalize(file) {
-                if !is_audio(&path) {
-                    continue;
-                }
-                match inspect(&path) {
-                    Ok(track) => {
-                        app.asset_protocol_scope()
-                            .allow_file(&path)
-                            .map_err(|e| e.to_string())?;
-                        shared.media.lock().unwrap().insert(track.id.clone(), path);
-                        added.push(track);
+        for (original, path) in candidates {
+            match inspect(&path) {
+                Ok(mut track) => {
+                    if original != path {
+                        match fs::metadata(&original).map_err(|error| error.to_string()).and_then(|value| fingerprint(&original, value.len())) {
+                            Ok(id) => track.id = id,
+                            Err(error) => { errors.push(error); continue; }
+                        }
                     }
-                    Err(error) => errors.push(error),
+                    if original != path && path.file_stem().is_some_and(|name| name.to_string_lossy() == track.title) {
+                        track.title = original.file_stem().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Без названия".into());
+                    }
+                    if let Err(error) = import_app.asset_protocol_scope().allow_file(&path) {
+                        errors.push(error.to_string());
+                        continue;
+                    }
+                    shared.media.lock().unwrap().insert(track.id.clone(), path);
+                    added.push(track);
                 }
+                Err(error) => errors.push(error),
             }
         }
         {
             let mut state = shared.state.lock().unwrap();
             for track in &added {
-                if !state.tracks.iter().any(|t| t.id == track.id) {
-                    state.tracks.push(track.clone());
-                }
+                if let Some(existing) = state.tracks.iter_mut().find(|value| value.id == track.id) { *existing = track.clone(); }
+                else { state.tracks.push(track.clone()); }
             }
         }
         if !added.is_empty() {
-            save_locked(&app, &shared)?;
+            if let Err(error) = save_locked(&import_app, &shared) {
+                *shared.state.lock().unwrap() = before;
+                *shared.media.lock().unwrap() = media_before;
+                return Err(error);
+            }
         }
-        if !errors.is_empty() {
-            let _ = app.emit_to(
-                "main",
-                "app:notice",
-                format!("Не удалось добавить файлов: {}", errors.len()),
-            );
+        let media = shared.media.lock().unwrap();
+        for path in prepared_for_commit { if !media.values().any(|value| *value == path) { let _ = fs::remove_file(path); } }
+        for old_path in media_before.values() {
+            if old_path.starts_with(&imports) && old_path.file_name().is_some_and(|name| name.to_string_lossy().starts_with("playable-")) && !media.values().any(|value| value == old_path) {
+                let _ = fs::remove_file(old_path);
+            }
         }
-        Ok(added)
+        Ok((added, errors))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    if result.is_err() {
+        for path in prepared { let _ = fs::remove_file(path); }
+    }
+    let (added, errors) = result?;
+    if !errors.is_empty() {
+        let detail: String = errors[0].chars().take(300).collect();
+        let _ = app.emit_to("main", "app:notice", format!("Не удалось добавить файлов: {}. {}", errors.len(), detail));
+    }
+    Ok(added)
 }
 #[tauri::command]
 async fn remove_track(app: AppHandle, id: String) -> Result<(), String> {
