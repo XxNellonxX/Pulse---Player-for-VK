@@ -25,6 +25,11 @@ if (isTauri()) {
       const pending = listen<ImportProgress>('import:progress', event => { if (!disposed) callback(event.payload) })
       return () => { disposed = true; void pending.then(unlisten => unlisten()) }
     },
+    onAppNotice(callback) {
+      let disposed = false
+      const pending = listen<string>('app:notice', event => { if (!disposed && typeof event.payload === 'string') callback(event.payload.slice(0, 1000)) })
+      return () => { disposed = true; void pending.then(unlisten => unlisten()) }
+    },
     removeTrack: id => invoke('remove_track', { id }),
     openExternal: url => invoke('open_external', { url }),
     openVkMusic: () => invoke('open_vk_music'),

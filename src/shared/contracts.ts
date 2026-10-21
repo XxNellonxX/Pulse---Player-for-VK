@@ -58,6 +58,7 @@ export interface DesktopAPI {
   uploadLocalTrackToVk?(id: string): Promise<UploadBatchResult>;
   importFromUrl?(url: string, destination: 'vk' | 'local', proxy?: string): Promise<UploadBatchResult>;
   onImportProgress?(callback: (progress: ImportProgress) => void): () => void;
+  onAppNotice?(callback: (message: string) => void): () => void;
   removeTrack(id: string): Promise<void>;
   openExternal(url: string): Promise<void>;
   openVkMusic(): Promise<void>;

@@ -98,6 +98,7 @@ function App() {
   }, [ready, state.playlists, vkStatus?.user?.id, showToast])
   useEffect(() => { if (storageError) showToast(storageError, 'error') }, [storageError, showToast])
   useEffect(() => { if (vkStatus?.state === 'error') showToast(vkStatus.message, 'error') }, [vkStatus?.state, vkStatus?.message, showToast])
+  useEffect(() => window.desktop?.onAppNotice?.(message => showToast(message, 'error')), [showToast])
   useEffect(() => { setAddedAliases({}); addingTracks.current.clear(); setAddingTrackIds(new Set()) }, [vkStatus?.user?.id])
   useEffect(() => { if (!playback.playing && !playback.buffering) void flushState() }, [playback.playing, playback.buffering, state.position, flushState])
 
