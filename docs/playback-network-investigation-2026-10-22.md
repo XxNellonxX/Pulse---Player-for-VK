@@ -65,13 +65,50 @@ one DNS address as a dependable remedy. No HTTP 403 was observed in these
 failures: the diagnostic timed out before receiving headers. Advertising,
 client throttling, token expiry and regional blocking remain unproven causes.
 
+## Follow-up using the actual VK website player
+
+The same affected track was selected through the website's ordinary play
+button in the isolated profile. It **did start**, after approximately
+**21.9 seconds**: its first segment timed out after about 10 seconds, and the
+retry returned HTTP 200 after another approximately 9.3 seconds. The player
+then exposed about 45.95 seconds of buffered audio. A separate 45-second
+observation of that same item showed continuous media-clock progress while
+future segment requests retried. No Cookie or Authorization header and no
+associated cookies were present on the inspected CDN requests.
+
+This updates the interpretation of the short probes above: no bytes within a
+5–7 second observation window does **not** establish permanent unavailability.
+Pulse's four-second source budget was prematurely destroying a viable initial
+HLS attempt whenever a private fallback callback existed, even if that callback
+only supplied the identical URL. The deduplication then prevented another
+attempt. This is a demonstrated application control-flow defect independent
+of why the CDN initially responds slowly.
+
+The corrective design keeps the current download and its readiness listeners
+alive while looking up an alternative. A duplicate or empty response cannot
+cancel that download. A distinct, validated same-track candidate is prepared
+alongside the original and can replace it only after actual audio readiness.
+At most two decoder candidates prepare concurrently. The losing candidate is
+closed; merely granting a different URL is not evidence that it plays.
+The overall load remains bounded; this does not guarantee an
+instant first byte from an external service.
+
+A later native UI rerun still found six non-official tracks with no media-clock
+progress after about 25.5 seconds, while the catalog control played. A separate
+muted HLS instance then observed one of those exact items for 45 seconds, with
+no production timeout change. Both manifest attempts timed out at about
+20 seconds each without receiving response headers or bytes. HLS reported
+fatal `manifestLoadTimeOut` at about 40 seconds, and still had no audio buffer
+or media-clock progress at 45 seconds. The source-selection/cancellation fixes
+therefore do not establish a universal service-availability remedy.
+
 ## Consequences for implementation
 
 A local relay is an in-process or loopback downloader/cache used only by Pulse.
 It does **not** give the computer a foreign IP address or change its upstream
 network route. It can preserve bytes already downloaded and isolate playback
 from short gaps, but cannot serve a segment that neither native HTTP nor the
-WebView can obtain. These tests do not justify presenting a local relay,
+WebView can obtain. The short probes do not justify presenting a local relay,
 User-Agent replacement, HTTP/2, or a different DNS answer as a completed fix
 for the affected tracks. No public third-party proxy was used.
 
@@ -83,9 +120,10 @@ source fix preserves the chain of exact API, original/decodable tuple, and
 hash reload, with URL deduplication and account/identity/restriction checks.
 The controlled case previously reached a roughly 15-second failure; the fixed
 case obtained playable data in under 100 ms. This is source selection, not
-the retained-upload file binding. Both affected live records in this network
+the retained-upload file binding. Both affected live records in the initial network
 investigation had empty original tuple URLs, so that controlled fix is not
-evidence that their unavailable CDN segments are repaired.
+evidence that their slow CDN segments are repaired. The premature cancellation
+defect observed later is a separate issue.
 
 A verified retained original can play without downloading VK segments. That
 file-persistence path remains separate from these network and candidate tests.

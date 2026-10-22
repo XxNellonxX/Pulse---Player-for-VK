@@ -105,3 +105,39 @@ credentials, or vendor proxy configurations were copied into production.
 Any implementation should be written independently and validated against
 actual response statuses, first-byte timing, byte throughput, and full-track
 playback for the failing imported tracks.
+
+### Narrow follow-up: shared media client and conditional headers
+
+Further static tracing on 2026-10-22 resolves part of the upstream-client
+uncertainty above. Playback receives the shared client constructed by
+`Lzَۖؗ;->Signature(Context)`. Its traced interceptors do not inject an
+official-client User-Agent. The ordinary OkHttp bridge in
+`Lzؙؗٚ;->Signature(...)` adds a generic `User-Agent` only when the request
+does not already have one. No User-Agent value was extracted or copied.
+No `Cookie` injection or dependency on website cookies was established in
+this media wiring.
+
+The media `Authorization` wrapper is conditional: its callback reads the
+active playback provider's nullable `ad()` result. Ordinary VK providers
+return null, including `Lzؔۙۢ;`, the direct `AudioTrack` provider
+`Lzًؑٝ;`, and own-library provider `Lzٔ۠ۜ;`. Separate libvkmusic/radio
+providers can return a value. Their use of `Authorization` is not evidence
+that the ordinary `vkx://vk` track path requires that header.
+
+The shared client really installs the application-scoped `Lzٌؘ۟;`
+`ProxySelector`. It selects configured proxy state for selected hosts and
+otherwise delegates to the platform selector, with a direct-connection
+fallback. A separate conditional interceptor can rewrite an upstream host
+while preserving the original `Host` header. These are configured upstream
+routing capabilities; neither proves that a proxy is enabled for a given
+track or that playback uses a localhost relay. No vendor proxy addresses,
+credentials, or configuration values were extracted or incorporated.
+
+For the normal `vkx://vk` resolver, `Lzؕۨۜ;` selects the returned
+`AudioTrack` URL after the exact `audio.getById` request. The inspected
+request constructor adds `audios`; this resolver does not consume a separate
+`audio_streams` list, header bundle, or alternative media-source object.
+Its replacement `DataSpec` preserves the existing headers, offsets, length
+and cache key. Runtime configuration, actual granted URLs, and network
+behavior still require live verification; these observations do not identify
+the cause of Pulse's reported buffering.
