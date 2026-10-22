@@ -5,12 +5,21 @@ import { nextShuffledCycle, ownMusicIds, shuffledQueue } from './shuffle'
 import { normalizeBufferedRanges, readMediaBuffered, sameBufferedRanges, secondsBufferedAhead, type BufferedRange, type PlaybackNetwork } from './buffering'
 import './shared/audioEqualizer.js'
 import type { EqualizerGraph } from './shared/audioEqualizer'
+import type Hls from 'hls.js'
+import { releaseSoundCloudSource, soundCloudSource } from './sourceResolution'
 
 // Native transport allows 20s resolve + 25s load + 25s play, plus IPC margin.
 const WEB_START_TIMEOUT = 80000
 
 export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAction<PersistedState>>) {
   const audio = useRef<HTMLAudioElement | null>(null)
+  const externalHls = useRef<Hls | null>(null)
+  const externalUrl = useRef<string | null>(null)
+  const forcedExternalId = useRef<string | null>(null)
+  const externalAttempted = useRef(new Set<string>())
+  const externalRecovery = useRef<{ id: string | null; renewals: number; bypass: boolean }>({ id: null, renewals: 0, bypass: false })
+  const externalFallback = useRef<(id: string) => boolean>(() => false)
+  const [sourceLabel, setSourceLabel] = useState('')
   const equalizerGraph = useRef<EqualizerGraph | null>(null)
   const localEqualizerSafe = useRef(false)
   const stateRef = useRef(state)
@@ -91,6 +100,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
   }, [])
   const playLocal = useCallback(async (element: HTMLAudioElement) => {
+    externalHls.current?.startLoad(-1)
     await prepareLocalEqualizer(element)
     if (audio.current === element && playIntent.current) await element.play()
   }, [prepareLocalEqualizer])
@@ -100,6 +110,30 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     webStallAd.current = false
     webStallRecovery.current = false
   }, [])
+  const recoverExternal = useCallback(() => {
+    const id = stateRef.current.currentTrackId
+    if (!id || !externalUrl.current || !playIntent.current || externalRecovery.current.id !== id || externalRecovery.current.bypass) return false
+    const element = audio.current
+    const position = element && element.readyState >= HTMLMediaElement.HAVE_METADATA && Number.isFinite(element.currentTime) ? element.currentTime : stateRef.current.position
+    // Refresh an expired grant once for this exact recording, then try the
+    // original VK item once. Neither transition changes the library identity.
+    if (externalRecovery.current.renewals === 0) externalRecovery.current.renewals = 1
+    else {
+      externalRecovery.current.bypass = true
+      forcedExternalId.current = null
+      externalAttempted.current.add(id)
+    }
+    sourceVersion.current++
+    transport.current = { id, kind: 'pending' }
+    sourceAbort.current?.abort(); externalHls.current?.stopLoad(); element?.pause()
+    loadedId.current = null; pendingStart.current = true
+    if (stallTimer.current) clearTimeout(stallTimer.current)
+    stallTimer.current = null
+    setState(previous => previous.currentTrackId === id ? { ...previous, position } : previous)
+    setPosition(position); setError(''); setPlaying(false); setBuffering(true); setNetwork('recovering')
+    setReloadNonce(value => value + 1)
+    return true
+  }, [setState])
   const watchWebStall = useCallback((id: string, advertisement = false, reset = false, recovery = false) => {
     if (reset && webStallTimer.current) { clearTimeout(webStallTimer.current); webStallTimer.current = null }
     if (webStallTimer.current) return
@@ -109,6 +143,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     webStallTimer.current = setTimeout(() => {
       webStallTimer.current = null
       if (!playIntent.current || stateRef.current.currentTrackId !== id || !isWebTrack()) return
+      if (externalFallback.current(id)) return
       playIntent.current = false; pendingStart.current = false; webPlaying.current = false; webPaused.current = true
       setPlaying(false); setBuffering(false); setAdvertising(false); setNetwork('error')
       setError(advertisement
@@ -204,6 +239,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         setPosition(status.position)
         setState(previous => previous.currentTrackId === track.id ? { ...previous, position: status.position } : previous)
       }
+      if (externalFallback.current(track.id)) return
       clearWebStall(); setError(status.error); setPlaying(false); setBuffering(false); setAdvertising(false); setNetwork('error')
       playIntent.current = false; pendingStart.current = false; webPlaying.current = false; webPaused.current = true
       webLoaded.current = null; webPending.current = null; webRecovering.current = false
@@ -287,6 +323,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const failed = () => {
       if (stallTimer.current) clearTimeout(stallTimer.current)
       stallTimer.current = null
+      if (!playIntent.current) return
+      if (recoverExternal()) return
       // A removed or unreadable retained copy must still allow the exact VK
       // item to play. Retry through VK once, without skipping the library item.
       if (ownedSourceId.current && ownedSourceId.current === stateRef.current.currentTrackId) {
@@ -329,7 +367,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       if (!isWebTrack()) setNetwork(ownedSourceId.current !== stateRef.current.currentTrackId && navigator.onLine === false ? 'offline' : 'stalled')
       if (!stallTimer.current) stallTimer.current = setTimeout(() => { stallTimer.current = null; if (playIntent.current && !element.ended) failed() }, 15000)
     }
-    on('playing', () => { recovered(); setPlaying(true); setError('') })
+    on('playing', () => { if (!playIntent.current) { element.pause(); return }; recovered(); setPlaying(true); setError('') })
     on('pause', () => {
       setPlaying(false)
       if (loadedId.current === stateRef.current.currentTrackId && !isWebTrack() && Number.isFinite(element.currentTime)) {
@@ -342,21 +380,27 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     on('stalled', () => { updateBuffer(); if (element.readyState < 3) waiting() })
     on('canplay', recovered)
     on('error', failed)
-    on('ended', () => { if (snippetRef.current) { if (snippetReady.current) finishSnippet() } else next(1, true) })
+    on('ended', () => { if (!playIntent.current) return; if (snippetRef.current) { if (snippetReady.current) finishSnippet() } else next(1, true) })
     return () => {
       active = false
       for (const [type, handler] of handlers) element.removeEventListener(type, handler)
       sourceAbort.current?.abort()
       if (stallTimer.current) clearTimeout(stallTimer.current)
       equalizerGraph.current?.destroy(); equalizerGraph.current = null
+      externalHls.current?.destroy(); externalHls.current = null
+      if (externalUrl.current) { releaseSoundCloudSource(externalUrl.current); externalUrl.current = null }
       element.pause(); element.removeAttribute('src'); element.load(); audio.current = null; loadedId.current = null
     }
-  }, [setState, next, state.currentTrackId, reloadNonce, finishSnippet])
+  }, [setState, next, state.currentTrackId, reloadNonce, finishSnippet, recoverExternal])
 
   useEffect(() => {
     const element = audio.current
     if (!element) return
     const version = ++sourceVersion.current
+    if (externalRecovery.current.id !== current?.id) externalRecovery.current = { id: current?.id || null, renewals: 0, bypass: false }
+    if (forcedExternalId.current !== current?.id) forcedExternalId.current = null
+    if (current?.id) externalAttempted.current = new Set([...externalAttempted.current].filter(id => id === current.id))
+    setSourceLabel('')
     transport.current = { id: current?.id || null, kind: 'pending' }
     ownedSourceId.current = null
     if (ownedFailedId.current !== current?.id) ownedFailedId.current = null
@@ -386,7 +430,28 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           catch (error) { if (!current.url.startsWith('vk-web://')) throw error }
         }
         if (sourceVersion.current !== version || controller.signal.aborted) return
+        if (resolved.source === 'vk' && playIntent.current && window.desktop?.resolveSoundCloud && !externalRecovery.current.bypass) {
+          const forced = forcedExternalId.current === current.id
+          try {
+            const source = await soundCloudSource(current, stateRef.current.settings, controller.signal, forced)
+            if (sourceVersion.current !== version || controller.signal.aborted) { if (source) releaseSoundCloudSource(source.url); return }
+            if (source) {
+              externalUrl.current = source.url
+              resolved = { ...current, url: source.url }
+              setSourceLabel(source.explicit === true ? 'SoundCloud · explicit' : 'SoundCloud')
+            } else if (forced) throw new Error('VK не запустил трек. SoundCloud ещё не подключён или соответствие не найдено — откройте информацию о треке.')
+          } catch (cause) {
+            if (controller.signal.aborted) throw cause
+            if (forced && externalRecovery.current.renewals === 0) throw cause
+            externalRecovery.current.bypass = true
+            externalAttempted.current.add(current.id)
+            forcedExternalId.current = null
+            // An optional provider failure leaves the existing VK path usable.
+          }
+        }
+        if (sourceVersion.current !== version || controller.signal.aborted) return
         if (resolved.url.startsWith('vk-web://')) {
+          setSourceLabel('VK')
           transport.current = { id: current.id, kind: 'web' }
           const startPosition = stateRef.current.position || 0
           webEnded.current = ''; webPosition.current = startPosition; webLatestPosition.current = startPosition; webProgress.current = startPosition; webSeeking.current = false; webPaused.current = !playIntent.current; webAtEnd.current = false
@@ -410,6 +475,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         if (!resolved.available || !resolved.url) throw new Error('unavailable')
         transport.current = { id: current.id, kind: 'local' }
         ownedSourceId.current = current.source === 'vk' && resolved.source === 'local' ? current.id : null
+        if (!externalUrl.current) setSourceLabel(ownedSourceId.current ? 'Сохранённый оригинал' : 'Локальный файл')
         const resolvedUrl = new URL(resolved.url, location.href)
         // Local Tauri asset responses explicitly permit CORS; browser-local
         // imports are blobs or same-origin URLs. Legacy remote API sources
@@ -424,8 +490,14 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         if (sourceVersion.current !== version || controller.signal.aborted) return
         localEqualizerSafe.current = readable
         if (readable) element.crossOrigin = 'anonymous'
-        element.src = resolved.url
-        element.load()
+        const HlsEngine = externalUrl.current ? (await import('hls.js')).default : null
+        if (sourceVersion.current !== version || controller.signal.aborted) return
+        if (HlsEngine?.isSupported()) {
+          const engine = new HlsEngine({ enableWorker: false, autoStartLoad: playIntent.current, maxBufferLength: 90, maxMaxBufferLength: 120, backBufferLength: 20, maxBufferSize: 8 * 1024 * 1024 })
+          externalHls.current = engine
+          engine.on(HlsEngine.Events.ERROR, (_, detail) => { if (detail.fatal && audio.current === element && sourceVersion.current === version && playIntent.current) element.dispatchEvent(new Event('error')) })
+          engine.attachMedia(element); engine.loadSource(resolved.url)
+        } else { element.src = resolved.url; element.load() }
         const shouldStart = playIntent.current
         if (shouldStart) {
           playIntent.current = true
@@ -441,14 +513,24 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           })
           if (sourceVersion.current === version && playIntent.current && !controller.signal.aborted) { acceptSnippetStart(current.id, stateRef.current.position || 0); await playLocal(element) }
         }
-      } catch {
-        if (sourceVersion.current === version && !controller.signal.aborted) { clearWebStall(); pendingStart.current = false; playIntent.current = false; setPlaying(false); setBuffering(false); setNetwork('error'); setError('Этот трек сейчас недоступен. Можно попробовать ещё раз.') }
+      } catch (cause) {
+        if (sourceVersion.current === version && !controller.signal.aborted && !recoverExternal()) { clearWebStall(); pendingStart.current = false; playIntent.current = false; setPlaying(false); setBuffering(false); setNetwork('error'); setError(cause instanceof Error && forcedExternalId.current === current.id ? cause.message : 'Этот трек сейчас недоступен. Можно попробовать ещё раз.') }
       }
     }
     void load()
     if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: current.title, artist: current.artist, album: current.album })
     return () => { controller.abort(); clearWebStall(); if (current.url.startsWith('vk-web://') && (webLoaded.current === current.id || webPending.current === current.id)) { void controlWeb({ operation: 'stop' }).catch(() => {}); webLoaded.current = null; webPending.current = null; webPlaying.current = false } if (sourceVersion.current === version) sourceVersion.current++; if (stallTimer.current) clearTimeout(stallTimer.current) }
-  }, [current?.id, current?.url, reloadNonce, controlWeb, clearWebStall, watchWebStall, clearSnippet, acceptSnippetStart, playLocal, configureWebEqualizer])
+  }, [current?.id, current?.url, reloadNonce, controlWeb, clearWebStall, watchWebStall, clearSnippet, acceptSnippetStart, playLocal, configureWebEqualizer, recoverExternal])
+
+  externalFallback.current = id => {
+    if (!playIntent.current || !stateRef.current.settings.preferSoundCloud || !window.desktop?.resolveSoundCloud || externalRecovery.current.bypass || externalAttempted.current.has(id)) return false
+    externalAttempted.current.add(id); forcedExternalId.current = id
+    clearWebStall(); webPlaying.current = false; webPending.current = null
+    void controlWeb({ operation: 'pause' }).catch(() => {})
+    playIntent.current = true; loadedId.current = null
+    setError(''); setBuffering(true); setReloadNonce(value => value + 1)
+    return true
+  }
 
   useEffect(() => {
     setEqualizerError('')
@@ -489,6 +571,9 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   }, [setState])
   const toggle = useCallback(() => {
     if (isWebTrack()) {
+      if (!webLoaded.current && !playIntent.current && stateRef.current.settings.preferSoundCloud && window.desktop?.resolveSoundCloud) {
+        playIntent.current = true; setReloadNonce(value => value + 1); return
+      }
       if (webPlaying.current || playIntent.current && (pendingStart.current || webRecovering.current)) {
         // Cancelling a source renewal disposes its partially loaded media.
         // The following Play must obtain a fresh source at the saved position.
@@ -520,13 +605,13 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
     const element = audio.current
     if (!element) return
-    if (playIntent.current && pendingStart.current) { playIntent.current = false; pendingStart.current = false; sourceAbort.current?.abort(); element.pause(); setPlaying(false); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null; return }
+    if (playIntent.current && pendingStart.current) { playIntent.current = false; pendingStart.current = false; sourceAbort.current?.abort(); externalHls.current?.stopLoad(); element.pause(); setPlaying(false); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null; return }
     if (element.paused) {
       if (!stateRef.current.currentTrackId) { const first = stateRef.current.queue[0] || stateRef.current.tracks[0]?.id; if (first) playTrack(first); return }
       playIntent.current = true
       if (element.error || !element.getAttribute('src')) { loadedId.current = null; setReloadNonce(value => value + 1); return }
       void playLocal(element).catch(() => { setPlaying(false); setError('Воспроизведение не началось. Проверьте доступность файла и повторите.') })
-    } else { playIntent.current = false; element.pause(); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null }
+    } else { playIntent.current = false; externalHls.current?.stopLoad(); element.pause(); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null }
   }, [playTrack, controlWeb, clearWebStall, watchWebStall, acceptSnippetStart, playLocal, configureWebEqualizer])
   const retry = useCallback(() => {
     if (!stateRef.current.currentTrackId) return
@@ -537,10 +622,17 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
     loadedId.current = null
     ownedFailedId.current = null
+    externalRecovery.current = { id: stateRef.current.currentTrackId, renewals: 0, bypass: false }
+    externalAttempted.current.clear(); forcedExternalId.current = null
     playIntent.current = true
     setError('')
     setReloadNonce(value => value + 1)
   }, [setState])
+  const reloadSource = useCallback(() => {
+    externalRecovery.current = { id: stateRef.current.currentTrackId, renewals: 0, bypass: false }
+    externalAttempted.current.clear(); forcedExternalId.current = null
+    loadedId.current = null; setReloadNonce(value => value + 1)
+  }, [])
   const seek = useCallback((value: number) => {
     clearSnippet()
     if (isWebTrack() && Number.isFinite(value)) {
@@ -564,5 +656,5 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     navigator.mediaSession.setActionHandler('seekto', detail => { if (detail.seekTime !== undefined) seek(detail.seekTime) })
   }, [toggle, next, previous, seek])
   const nextTrack = useCallback(() => next(), [next])
-  return { current, playing, position, duration, error, equalizerError, buffering, buffered, bufferedAhead, network, advertising, snippet, playSnippet, playTrack, retry, toggle, toggleShuffle, seek, next: nextTrack, previous, clearError: () => setError('') }
+  return { current, playing, position, duration, error, equalizerError, buffering, buffered, bufferedAhead, network, advertising, sourceLabel, reloadSource, snippet, playSnippet, playTrack, retry, toggle, toggleShuffle, seek, next: nextTrack, previous, clearError: () => setError('') }
 }

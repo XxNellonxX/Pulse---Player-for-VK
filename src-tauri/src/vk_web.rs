@@ -846,6 +846,7 @@ fn validate_snapshot(value: &Value) -> Result<(Vec<Track>, Vec<Playlist>), Strin
         track.title = clean_text(&track.title, 500);
         track.artist = clean_text(&track.artist, 500);
         crate::clean_artist_refs(&mut track.artist_refs);
+        crate::clean_track_evidence(&mut track);
         track.album = clean_text(&track.album, 500);
         track.artwork = safe_artwork(track.artwork);
         track.added_at = now();

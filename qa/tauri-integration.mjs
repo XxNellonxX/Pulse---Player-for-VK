@@ -44,6 +44,7 @@ try {
   await page.locator('.app-shell').waitFor({ timeout: 20000 });
   assert.equal(await page.evaluate(() => typeof window.desktop?.importFiles), 'function');
   console.log('PASS Tauri native bridge and renderer start');
+  await page.getByRole('button', { name: 'Локальные файлы', exact: true }).click();
   await page.getByRole('button', { name: 'Добавить файлы', exact: true }).first().click();
   await page.getByRole('button', { name: 'Воспроизвести QA native Tauri', exact: true }).waitFor({ timeout: 15000 });
   console.log('PASS Tauri imports real WAV metadata');

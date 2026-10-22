@@ -26,6 +26,9 @@ mod owned_uploads;
 mod source_page;
 mod updates;
 mod soundcloud;
+mod soundcloud_catalog;
+mod soundcloud_player;
+mod musicbrainz_catalog;
 mod vk_auth;
 mod vk_sync;
 mod vk_library_actions;
@@ -54,6 +57,14 @@ pub struct Track {
     pub remote: Option<RemoteTrack>,
     #[serde(rename = "artistRefs", default, skip_serializing_if = "Vec::is_empty")]
     pub artist_refs: Vec<ArtistRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isrc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit: Option<bool>,
+    #[serde(rename = "artistCard", skip_serializing_if = "Option::is_none")]
+    pub artist_card: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ArtistRef {
@@ -67,6 +78,17 @@ pub(crate) fn clean_artist_refs(refs: &mut Vec<ArtistRef>) {
         && ids.insert(artist.id.clone()));
     refs.truncate(20);
     for artist in refs { artist.name = artist.name.chars().filter(|c| !c.is_control()).take(200).collect(); }
+}
+pub(crate) fn clean_track_evidence(track: &mut Track) {
+    track.version = track.version.take().map(|s| s.chars().filter(|c| !c.is_control()).take(200).collect::<String>()).filter(|s| !s.trim().is_empty());
+    track.isrc = track.isrc.take().map(|s| s.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>().to_ascii_uppercase()).filter(|s| {
+        let bytes = s.as_bytes();
+        bytes.len() == 12 && bytes[..2].iter().all(u8::is_ascii_uppercase)
+            && bytes[2..5].iter().all(u8::is_ascii_alphanumeric) && bytes[5..].iter().all(u8::is_ascii_digit)
+    });
+    track.artist_card = if !track.artist_refs.is_empty() { Some("present".into()) } else {
+        track.artist_card.take().filter(|s| ["present", "absent", "unknown"].contains(&s.as_str()))
+    };
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RemoteTrack {
@@ -134,6 +156,10 @@ pub struct Settings {
     #[serde(rename = "autoSkip")]
     pub auto_skip: bool,
     pub equalizer: equalizer::EqualizerSettings,
+    #[serde(rename = "preferSoundCloud")]
+    pub prefer_soundcloud: bool,
+    #[serde(rename = "preferExplicit")]
+    pub prefer_explicit: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -228,6 +254,8 @@ fn defaults() -> PersistedState {
             autoplay: false,
             auto_skip: true,
             equalizer: equalizer::EqualizerSettings::default(),
+            prefer_soundcloud: true,
+            prefer_explicit: true,
         },
     }
 }
@@ -277,6 +305,8 @@ fn sanitized(mut state: PersistedState, media: &HashMap<String, PathBuf>) -> Per
         track.artist = track.artist.chars().take(500).collect();
         track.album = track.album.chars().take(500).collect();
         track.duration = track.duration.clamp(0., 864000.);
+        clean_artist_refs(&mut track.artist_refs);
+        clean_track_evidence(track);
         if track.source != "vk" {
             track.source = "local".into();
             track.remote = None;
@@ -552,6 +582,7 @@ fn inspect(path: &Path) -> Result<Track, String> {
         available: true,
         remote: None,
         artist_refs: Vec::new(),
+        version: None, isrc: None, explicit: None, artist_card: None,
     })
 }
 #[tauri::command]
@@ -1102,7 +1133,13 @@ fn map_vk_audio(item: &serde_json::Value) -> Option<Track> {
         .and_then(|v| v.get("photo_300"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    Some(Track {
+    let mut artist_refs = item.get("main_artists").and_then(|v| v.as_array()).into_iter().flatten()
+        .chain(item.get("featured_artists").and_then(|v| v.as_array()).into_iter().flatten())
+        .filter_map(|v| Some(ArtistRef { id: v.get("id").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))?, name: v.get("name")?.as_str()?.to_string() })).collect::<Vec<_>>();
+    clean_artist_refs(&mut artist_refs);
+    let artist_card = if !artist_refs.is_empty() { Some("present".into()) } else if item.get("main_artists").is_some_and(|v| v.as_array().is_some_and(Vec::is_empty))
+        && item.get("featured_artists").is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty)) { Some("absent".into()) } else { None };
+    let mut track = Track {
         id: format!("vk-{owner}-{audio}"),
         title,
         artist,
@@ -1117,7 +1154,11 @@ fn map_vk_audio(item: &serde_json::Value) -> Option<Track> {
         source: "vk".into(),
         added_at: now(),
         available: !url.is_empty(),
-        artist_refs: Vec::new(),
+        artist_refs,
+        version: item.get("subtitle").and_then(|v| v.as_str()).map(str::to_owned),
+        isrc: item.get("isrc").and_then(|v| v.as_str()).map(str::to_owned),
+        explicit: item.get("is_explicit").and_then(|v| v.as_bool()),
+        artist_card,
         remote: Some(RemoteTrack {
             search_result: false,
             owner_id: owner,
@@ -1128,7 +1169,9 @@ fn map_vk_audio(item: &serde_json::Value) -> Option<Track> {
                 .map(str::to_owned),
             in_library: false,
         }),
-    })
+    };
+    clean_track_evidence(&mut track);
+    Some(track)
 }
 fn auth_for(shared: &State<'_, AppState>) -> Result<Arc<VkAuthManager>, String> {
     shared
@@ -1356,10 +1399,17 @@ pub(crate) fn merge_web_search_results(state: &mut PersistedState, tracks: &mut 
         let known: HashMap<_, _> = state.tracks.iter().map(|track| (track.id.as_str(), track)).collect();
         for track in tracks.iter_mut() {
             clean_artist_refs(&mut track.artist_refs);
+            clean_track_evidence(track);
             if let Some(existing) = known.get(track.id.as_str()) {
                 let fresh_artists = std::mem::take(&mut track.artist_refs);
+                let evidence = (track.version.clone(), track.isrc.clone(), track.explicit, track.artist_card.clone());
                 *track = (*existing).clone();
                 if !fresh_artists.is_empty() { track.artist_refs = fresh_artists; }
+                track.version = evidence.0.or(track.version.clone());
+                track.isrc = evidence.1.or(track.isrc.clone());
+                track.explicit = evidence.2.or(track.explicit);
+                track.artist_card = evidence.3.or(track.artist_card.clone());
+                clean_track_evidence(track);
                 if let Some(remote) = track.remote.as_mut() {
                     // A playlist-only result must remain playable if that playlist
                     // disappears while the search results are still displayed.
@@ -1596,6 +1646,10 @@ pub fn run() {
     let context = tauri::generate_context!();
     audio_session::prepare_process(&context.config().identifier);
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("pulse-media", |context, request, responder| {
+            let app = context.app_handle().clone();
+            tauri::async_runtime::spawn(async move { responder.respond(soundcloud_player::serve(app, request).await); });
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1620,6 +1674,7 @@ pub fn run() {
                 .build(),
         )
         .manage(AppState::default())
+        .manage(soundcloud_player::SourceState::default())
         .setup(|app| {
             audio_session::start();
             init_auth(&app.state::<AppState>());
@@ -1657,6 +1712,18 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_state,
+            soundcloud_player::soundcloud_status,
+            soundcloud_player::configure_soundcloud,
+            soundcloud_player::search_soundcloud,
+            soundcloud_player::resolve_soundcloud_candidate,
+            soundcloud_player::bind_soundcloud,
+            soundcloud_player::soundcloud_binding,
+            soundcloud_player::resolve_soundcloud,
+            soundcloud_player::release_soundcloud,
+            musicbrainz_catalog::search_catalog_artists,
+            musicbrainz_catalog::get_catalog_artist,
+            musicbrainz_catalog::status_catalog_route,
+            musicbrainz_catalog::configure_catalog_route,
             save_state,
             finish_close,
             import_files,
@@ -1690,6 +1757,42 @@ pub fn run() {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn recording_evidence_survives_storage_without_promoting_unknown_artist_cards() {
+        let mut state = defaults();
+        state.tracks.push(Track { id: "vk-1-7".into(), source: "vk".into(), url: "vk-web://1/7".into(),
+            remote: Some(RemoteTrack { owner_id: 1, audio_id: 7, access_key: None, in_library: true, search_result: false }),
+            version: Some("Live\u{0000}".into()), isrc: Some("us-abc-26-12345".into()), explicit: Some(false),
+            artist_card: Some("unknown".into()), ..Default::default() });
+        let saved = sanitized(state, &HashMap::new());
+        let restored: PersistedState = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(restored.tracks[0].version.as_deref(), Some("Live"));
+        assert_eq!(restored.tracks[0].isrc.as_deref(), Some("USABC2612345"));
+        assert_eq!(restored.tracks[0].explicit, Some(false));
+        assert_eq!(restored.tracks[0].artist_card.as_deref(), Some("unknown"));
+        assert!(restored.settings.prefer_soundcloud);
+        assert!(restored.settings.prefer_explicit);
+    }
+    #[test]
+    fn native_vk_mapping_uses_real_artist_metadata_and_preserves_recording_version() {
+        let base = serde_json::json!({ "owner_id": 1, "id": 7, "artist": "Artist", "title": "Song", "duration": 180,
+            "subtitle": "Live", "isrc": "US-ABC-26-12345", "is_explicit": true });
+        let unknown = map_vk_audio(&base).unwrap();
+        assert!(unknown.artist_card.is_none());
+        assert_eq!(unknown.version.as_deref(), Some("Live"));
+        assert_eq!(unknown.isrc.as_deref(), Some("USABC2612345"));
+        assert_eq!(unknown.explicit, Some(true));
+        let mut empty = base.clone(); empty["main_artists"] = serde_json::json!([]);
+        assert_eq!(map_vk_audio(&empty).unwrap().artist_card.as_deref(), Some("absent"));
+        empty["featured_artists"] = serde_json::json!([{ "id": "../broken", "name": "Artist" }]);
+        assert!(map_vk_audio(&empty).unwrap().artist_card.is_none());
+        empty["featured_artists"] = serde_json::json!([{ "id": "123", "name": "Artist" }]);
+        let linked = map_vk_audio(&empty).unwrap();
+        assert_eq!(linked.artist_card.as_deref(), Some("present"));
+        assert_eq!(linked.artist_refs[0].id, "123");
+        empty["isrc"] = serde_json::json!("123456789012");
+        assert!(map_vk_audio(&empty).unwrap().isrc.is_none());
+    }
     fn search_fixture(id: i64, in_library: bool) -> Track {
         Track { id: format!("vk-1-{id}"), source: "vk".into(), title: format!("Track {id}"),
             remote: Some(RemoteTrack { owner_id: 1, audio_id: id, access_key: None,

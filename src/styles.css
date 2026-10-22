@@ -165,3 +165,5 @@ input[type=range] { accent-color: var(--accent); }
 .cached-sync-notice small { display: inline; margin-top: 0; margin-left: 10px; font-size: 10px; }
 .cached-sync-notice .secondary-button { min-height: 28px; padding: 0 9px; font-size: 10px; }
 :root,body { color: var(--text); }
+
+.track-info-card { max-height: calc(100vh - 48px); overflow-y: auto; }

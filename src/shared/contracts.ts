@@ -7,6 +7,8 @@ export type Track = {
   artwork?: string; url: string; source: 'local' | 'vk'; addedAt: number;
   available: boolean; remote?: RemoteTrack;
   artistRefs?: Array<{ id: string; name: string }>;
+  version?: string; isrc?: string; explicit?: boolean;
+  artistCard?: 'present' | 'absent' | 'unknown';
 };
 export type Playlist = {
   id: string; title: string; trackIds: string[]; createdAt: number;
@@ -20,6 +22,7 @@ export type AppSettings = {
   reducedMotion: boolean; volume: number; repeat: 'off' | 'all' | 'one';
   shuffle: boolean; closeToTray: boolean; autoplay: boolean; autoSkip: boolean;
   equalizer: EqualizerSettings;
+  preferSoundCloud: boolean; preferExplicit: boolean;
 };
 export type PersistedState = {
   version: 1; tracks: Track[]; playlists: Playlist[]; history: string[];
@@ -51,6 +54,18 @@ export type UploadBatchResult = { items: MusicImportItem[]; cancelled: boolean; 
 export type ImportProgress = { phase: string; message: string; current: number; total: number };
 export type AppRelease = { currentVersion: string; latestVersion: string | null; available: boolean; notes: string; releaseUrl: string | null; downloadUrl: string | null };
 export interface DesktopAPI {
+  searchCatalogArtists?(query: string, offset?: number): Promise<import('./catalog').CatalogArtistSearch>;
+  getCatalogArtist?(id: string, offset?: number): Promise<import('./catalog').CatalogArtistPage>;
+  statusCatalogRoute?(): Promise<{ proxy: boolean; available?: boolean; message: string }>;
+  configureCatalogRoute?(proxy: string): Promise<void>;
+  soundCloudStatus?(): Promise<{ configured: boolean; proxy: boolean; message: string }>;
+  configureSoundCloud?(input: { clientId: string; clientSecret: string; proxy?: string }): Promise<void>;
+  searchSoundCloud?(query: string): Promise<{ collection: import('./sourceMatching').SoundCloudCandidate[]; hasMore?: boolean }>;
+  resolveSoundCloudCandidate?(url: string): Promise<import('./sourceMatching').SoundCloudCandidate>;
+  bindSoundCloud?(trackId: string, sourceId: string | null, selection?: 'user' | 'metadata'): Promise<void>;
+  soundCloudBinding?(trackId: string): Promise<import('./sourceMatching').SoundCloudBinding | null>;
+  resolveSoundCloud?(trackId: string): Promise<{ url: string; title: string; explicit?: boolean; sourceId: string }>;
+  releaseSoundCloud?(url?: string): Promise<void>;
   getState(): Promise<PersistedState | null>;
   saveState(state: PersistedState): Promise<void>;
   importFiles(): Promise<Track[]>;

@@ -47,8 +47,12 @@
       const tuple = [];
       tuple[0] = raw.id; tuple[1] = raw.owner_id; tuple[2] = raw.url; tuple[3] = raw.title; tuple[4] = raw.artist; tuple[5] = raw.duration;
       tuple[6] = raw.album?.id; tuple[9] = raw.has_lyrics; tuple[10] = 0; tuple[12] = { audio_streams: raw.audio_streams || [] }; tuple[13] = '';
-      tuple[14] = photo(raw.thumb) || photo(raw.album?.thumb) || ''; tuple[16] = raw.subtitle; tuple[17] = raw.main_artists || []; tuple[18] = raw.featured_artists || [];
+      tuple[14] = photo(raw.thumb) || photo(raw.album?.thumb) || ''; tuple[16] = raw.subtitle; tuple[17] = raw.main_artists; tuple[18] = raw.featured_artists;
       tuple[19] = raw.album; tuple[20] = raw.track_code; tuple[21] = raw.restriction_status || 0; tuple[24] = raw.access_key;
+      Object.defineProperty(tuple, '__pulseRecordingMetadata', { value: {
+        ...(typeof raw.is_explicit === 'boolean' ? { is_explicit: raw.is_explicit } : typeof raw.explicit === 'boolean' ? { explicit: raw.explicit } : {}),
+        ...(typeof raw.isrc === 'string' ? { isrc: raw.isrc } : {}),
+      } });
       // API audio objects do not carry the website's old reload hashes. Keep
       // their exact source refresh inside this account-bound document so a
       // queued artist track can recover after its signed URL expires.

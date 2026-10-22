@@ -5,7 +5,7 @@ import { normalizeEqualizer } from './shared/equalizer'
 export const defaultSettings: AppSettings = {
   theme: 'dark', style: 'minimal', accent: '#bdff62', density: 'comfortable', textScale: 1,
   reducedMotion: false, volume: 0.7, repeat: 'off', shuffle: false, closeToTray: false,
-  autoplay: false, autoSkip: true, equalizer: normalizeEqualizer(undefined),
+  autoplay: false, autoSkip: true, equalizer: normalizeEqualizer(undefined), preferSoundCloud: true, preferExplicit: true,
 }
 export const initialState: PersistedState = {
   version: 1, tracks: [], playlists: [], history: [], queue: [], currentTrackId: null,
@@ -27,6 +27,7 @@ export function normalizeSettings(value: unknown): AppSettings {
     closeToTray: input.closeToTray === true, autoplay: input.autoplay === true,
     autoSkip: typeof input.autoSkip === 'boolean' ? input.autoSkip : defaultSettings.autoSkip,
     equalizer: normalizeEqualizer(input.equalizer),
+    preferSoundCloud: input.preferSoundCloud !== false, preferExplicit: input.preferExplicit !== false,
   }
 }
 function normalizeTrack(value: unknown): Track | null {
@@ -40,6 +41,10 @@ function normalizeTrack(value: unknown): Track | null {
     artwork: typeof item.artwork === 'string' ? item.artwork : undefined, url: typeof item.url === 'string' ? item.url : '',
     source: item.source === 'vk' ? 'vk' : 'local', addedAt: Number.isFinite(Number(item.addedAt)) ? Number(item.addedAt) : Date.now(),
     available: item.available !== false, remote: item.remote,
+    version: typeof item.version === 'string' ? item.version.slice(0, 200) : undefined,
+    isrc: typeof item.isrc === 'string' ? item.isrc : undefined,
+    explicit: typeof item.explicit === 'boolean' ? item.explicit : undefined,
+    artistCard: item.artistCard === 'present' || item.artistCard === 'absent' ? item.artistCard : 'unknown',
     artistRefs: Array.isArray(item.artistRefs) ? item.artistRefs.filter(ref => ref && typeof ref.id === 'string' && /^[\w-]{1,100}$/.test(ref.id) && typeof ref.name === 'string').slice(0, 20) : undefined,
   }
 }
@@ -64,8 +69,8 @@ export function applyVkSnapshot(previous: PersistedState, snapshot: VkSnapshot):
   const transient = previous.tracks.filter(track => track.source === 'vk' && track.remote?.inLibrary === false && (snapshot.mode !== 'web' || track.remote?.searchResult === true) && pinned.has(track.id) && !incoming.has(track.id))
   const tracks = [...previous.tracks.filter(track => track.source !== 'vk'), ...snapshot.tracks.map(track => {
     const old = known.get(track.id)
-    const next = { ...track, addedAt: old?.addedAt ?? track.addedAt }
-    return old && old.title === next.title && old.artist === next.artist && old.album === next.album && old.duration === next.duration && old.artwork === next.artwork && old.url === next.url && old.available === next.available && old.source === next.source && old.remote?.ownerId === next.remote?.ownerId && old.remote?.audioId === next.remote?.audioId && old.remote?.accessKey === next.remote?.accessKey && old.remote?.inLibrary === next.remote?.inLibrary && old.remote?.searchResult === next.remote?.searchResult && JSON.stringify(old.artistRefs || []) === JSON.stringify(next.artistRefs || []) ? old : next
+    const next = { ...track, artistCard: track.artistCard || 'unknown' as const, addedAt: old?.addedAt ?? track.addedAt }
+    return old && old.title === next.title && old.artist === next.artist && old.album === next.album && old.duration === next.duration && old.artwork === next.artwork && old.url === next.url && old.available === next.available && old.source === next.source && old.version === next.version && old.isrc === next.isrc && old.explicit === next.explicit && old.artistCard === next.artistCard && old.remote?.ownerId === next.remote?.ownerId && old.remote?.audioId === next.remote?.audioId && old.remote?.accessKey === next.remote?.accessKey && old.remote?.inLibrary === next.remote?.inLibrary && old.remote?.searchResult === next.remote?.searchResult && JSON.stringify(old.artistRefs || []) === JSON.stringify(next.artistRefs || []) ? old : next
   }), ...transient]
   const previousPlaylists = new Map(previous.playlists.map(playlist => [playlist.id, playlist]))
   const playlists = [...previous.playlists.filter(playlist => !playlist.remote), ...snapshot.playlists.map(playlist => {

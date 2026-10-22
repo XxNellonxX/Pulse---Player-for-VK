@@ -6,6 +6,24 @@ import type { DesktopAPI, DesktopCommand, Track, PersistedState, VkSnapshot, VkW
 if (isTauri()) {
   const track = (value: Track): Track => value.source === 'local' && !/^(asset:|https?:)/.test(value.url) ? { ...value, url: convertFileSrc(value.url) } : value
   const api: DesktopAPI = {
+    searchCatalogArtists: (query, offset = 0) => invoke('search_catalog_artists', { query, offset }),
+    getCatalogArtist: (id, offset = 0) => invoke('get_catalog_artist', { id, offset }),
+    statusCatalogRoute: () => invoke('status_catalog_route'),
+    configureCatalogRoute: proxy => invoke('configure_catalog_route', { proxy }),
+    soundCloudStatus: () => invoke('soundcloud_status'),
+    configureSoundCloud: input => invoke('configure_soundcloud', { proxy: null, ...input }),
+    searchSoundCloud: async query => {
+      const page = await invoke<{ items: import('./shared/sourceMatching').SoundCloudCandidate[]; nextHref?: string }>('search_soundcloud', { query })
+      return { collection: page.items, hasMore: Boolean(page.nextHref) }
+    },
+    resolveSoundCloudCandidate: url => invoke('resolve_soundcloud_candidate', { url }),
+    bindSoundCloud: (trackId, sourceId, selection = 'user') => invoke('bind_soundcloud', { trackId, sourceId, selection }),
+    soundCloudBinding: trackId => invoke('soundcloud_binding', { trackId }),
+    resolveSoundCloud: async trackId => {
+      const source = await invoke<{ path: string; title: string; explicit?: boolean; sourceId: string }>('resolve_soundcloud', { trackId })
+      return { ...source, url: convertFileSrc(source.path, 'pulse-media') }
+    },
+    releaseSoundCloud: url => invoke('release_soundcloud', { sessionId: url ? new URL(url).pathname.split('/').filter(Boolean)[0] : null }),
     getState: async () => {
       const value = await invoke<PersistedState | null>('get_state')
       return value ? { ...value, tracks: value.tracks.map(track) } : null

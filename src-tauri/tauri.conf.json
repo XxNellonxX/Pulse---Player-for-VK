@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VK Player",
-  "version": "0.4.3",
+  "version": "0.5.0-preview.1",
   "identifier": "ru.vkplayer.desktop",
   "build": {
     "beforeDevCommand": "npm run dev:web",
@@ -26,7 +26,7 @@
         "enable": true,
         "scope": []
       },
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https: http://asset.localhost asset: blob:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-src 'none'"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' https: http://asset.localhost asset: blob: pulse-media: http://pulse-media.localhost; connect-src 'self' ipc: http://ipc.localhost pulse-media: http://pulse-media.localhost; object-src 'none'; base-uri 'self'; frame-src 'none'"
     }
   },
   "bundle": {

@@ -1,6 +1,6 @@
 [package]
 name = "vk-player"
-version = "0.4.3"
+version = "0.5.0-preview.1"
 description = "VK Player desktop"
 edition = "2021"
 rust-version = "1.77.2"
@@ -25,7 +25,7 @@ hex = "0.4"
 base64 = "0.22"
 rand = "0.8"
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 tokio = { version = "1", features = ["net", "io-util", "time", "sync", "rt", "process"] }
 keyring = { version = "3", features = ["windows-native", "apple-native"] }
 rfd = "0.15"

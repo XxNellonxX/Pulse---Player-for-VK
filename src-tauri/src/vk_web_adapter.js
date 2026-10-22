@@ -140,6 +140,15 @@
       return /^\d{1,30}$/.test(id) && typeof artist?.name === 'string' ? [{ id, name: text(artist.name, 200) }] : [];
     }).filter((artist, index, all) => all.findIndex(item => item.id === artist.id) === index).slice(0, 20);
     const performer = tupleValue(raw, 'AUDIO_ITEM_INDEX_PERFORMER', 4, ['artist', 'performer']);
+    const version = text(tupleValue(raw, 'AUDIO_ITEM_INDEX_SUBTITLE', 16, ['subtitle', 'version']) || '', 200);
+    // Array slots for content ratings/ISRC are not a stable website contract.
+    // Only an explicit object field or our private object-to-tuple metadata
+    // may supply them; absence never means a clean/censored edition.
+    const metadata = Array.isArray(raw) ? raw.__pulseRecordingMetadata : raw;
+    const explicit = typeof metadata?.is_explicit === 'boolean' ? metadata.is_explicit : typeof metadata?.explicit === 'boolean' ? metadata.explicit : undefined;
+    const isrcValue = typeof metadata?.isrc === 'string' ? metadata.isrc.replace(/[\s-]/g, '').toUpperCase() : '';
+    const artistCard = artistRefs.length ? 'present' : Array.isArray(artists) && artists.length === 0
+      && (featured == null || Array.isArray(featured) && featured.length === 0) ? 'absent' : 'unknown';
     return {
       id: identity.key, title: text(tupleValue(raw, 'AUDIO_ITEM_INDEX_TITLE', 3, ['title']) || 'Без названия'),
       artist: text(performer || (Array.isArray(artists) ? artists.map(a => a?.name).filter(Boolean).join(', ') : '') || 'Неизвестный исполнитель'),
@@ -149,6 +158,8 @@
       ...(artwork ? { artwork } : {}), url: `vk-web://${identity.owner}/${identity.id}`,
       source: 'vk', addedAt: 0, available: !restriction,
       ...(artistRefs.length ? { artistRefs } : {}),
+      ...(version ? { version } : {}), ...(typeof explicit === 'boolean' ? { explicit } : {}),
+      ...(/^[A-Z]{2}[A-Z0-9]{3}\d{7}$/.test(isrcValue) ? { isrc: isrcValue } : {}), artistCard,
       remote: { ownerId: identity.owner, audioId: identity.id, inLibrary },
     };
   }
@@ -552,11 +563,15 @@
       put('AUDIO_ITEM_INDEX_EXTRA', 12, { audio_streams: Array.isArray(value.audio_streams) ? value.audio_streams : [] });
       put('AUDIO_ITEM_INDEX_HASHES', 13, '');
       put('AUDIO_ITEM_INDEX_COVER_URL', 14, value.thumb?.photo_600 || value.thumb?.photo_300 || value.album?.thumb?.photo_600 || value.album?.thumb?.photo_300 || '');
-      tuple[16] = value.subtitle;
-      put('AUDIO_ITEM_INDEX_MAIN_ARTISTS', 17, value.main_artists || []);
-      put('AUDIO_ITEM_INDEX_FEAT_ARTISTS', 18, value.featured_artists || []);
+      put('AUDIO_ITEM_INDEX_SUBTITLE', 16, value.subtitle);
+      put('AUDIO_ITEM_INDEX_MAIN_ARTISTS', 17, value.main_artists);
+      put('AUDIO_ITEM_INDEX_FEAT_ARTISTS', 18, value.featured_artists);
       put('AUDIO_ITEM_INDEX_ALBUM', 19, value.album); tuple[20] = value.track_code;
       put('AUDIO_ITEM_INDEX_RESTRICTION', 21, value.restriction_status || 0); tuple[24] = value.access_key;
+      Object.defineProperty(tuple, '__pulseRecordingMetadata', { value: {
+        ...(typeof value.is_explicit === 'boolean' ? { is_explicit: value.is_explicit } : typeof value.explicit === 'boolean' ? { explicit: value.explicit } : {}),
+        ...(typeof value.isrc === 'string' ? { isrc: value.isrc } : {}),
+      } });
       if (value.available === false || value.isRestricted === true) tuple.available = false;
       return tuple;
     };
