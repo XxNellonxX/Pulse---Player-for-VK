@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
-import { Check, Cloud, ExternalLink, Link2, LoaderCircle, Search, ShieldCheck, Unlink } from 'lucide-react'
+import { Check, Cloud, ExternalLink, FileKey2, Link2, LoaderCircle, Search, ShieldCheck, Unlink } from 'lucide-react'
 import type { AppSettings, Track } from './shared/contracts'
 import { rankSoundCloudCandidates, recordingCensorship, type RankedSourceCandidate, type SoundCloudCandidate, type SoundCloudBinding } from './shared/sourceMatching'
 import './SoundCloudSources.css'
 
-type SoundCloudStatus = { configured: boolean; proxy: boolean; message: string };
+type SoundCloudStatus = { configured: boolean; proxy: boolean; message: string; managed?: boolean };
 type SettingsProps = { settings?: Pick<AppSettings, 'preferSoundCloud' | 'preferExplicit'>; onChange?: (patch: Partial<AppSettings>) => void };
 const failure = (error: unknown) => {
   // Tauri rejects invoke promises with the native command's public string.
@@ -21,51 +21,100 @@ const openLink = (value?: string) => {
 };
 
 function SoundCloudApiGuide() {
-  return <aside className="sc-api-guide"><strong>Если у вас обычный аккаунт SoundCloud</strong><p>Вход в аккаунт сам по себе не выдаёт Client ID и Client Secret. Проверьте, доступно ли создание приложения в кабинете SoundCloud.</p><button type="button" className="sc-text-button" onClick={() => openLink('https://soundcloud.com/you/apps')}>Открыть кабинет приложений <ExternalLink size={12} /></button><p>Если создание приложения недоступно, поиск и привязка через официальный API пока не заработают. Доступ одобряет SoundCloud; платная подписка не гарантирует его получение.</p></aside>;
+  return <aside className="sc-api-guide"><strong>Если у вас обычный аккаунт SoundCloud</strong><p>Для регистрации нового API-приложения SoundCloud сейчас требует Artist Pro. После создания приложения скопируйте Client ID и Client Secret из кабинета. Вход в обычный аккаунт сам по себе эти ключи не выдаёт.</p><button type="button" className="sc-text-button" onClick={() => openLink('https://soundcloud.com/you/apps')}>Открыть кабинет приложений <ExternalLink size={12} /></button><p>Существующие ключи можно импортировать сразу. При этом платная подписка не гарантирует доступ ко всем трекам: права, регион и возможность полного воспроизведения определяет SoundCloud.</p></aside>;
 }
 
 export function SoundCloudSettings({ settings, onChange }: SettingsProps) {
   const [status, setStatus] = useState<SoundCloudStatus | null>(null);
   const [clientId, setClientId] = useState(''), [clientSecret, setClientSecret] = useState(''), [proxy, setProxy] = useState('');
-  const [busy, setBusy] = useState(false), [error, setError] = useState(''), [saved, setSaved] = useState(false), [editProxy, setEditProxy] = useState(false);
-  const alive = useRef(true), generation = useRef(0);
+  const [operation, setOperation] = useState<'load' | 'save' | 'import' | 'check' | null>('load');
+  const [error, setError] = useState(''), [message, setMessage] = useState(''), [verified, setVerified] = useState(false), [editProxy, setEditProxy] = useState(false);
+  const alive = useRef(true), generation = useRef(0), activeOperation = useRef<string | null>('load');
+  const busy = operation !== null;
   useEffect(() => {
     alive.current = true;
     const run = ++generation.current;
-    if (window.desktop?.soundCloudStatus) void window.desktop.soundCloudStatus().then(value => { if (alive.current && run === generation.current) setStatus(value); }, cause => { if (alive.current && run === generation.current) setError(failure(cause)); });
-    else setError('Подключение SoundCloud доступно в настольном Pulse.');
+    activeOperation.current = 'load'; setOperation('load');
+    if (window.desktop?.soundCloudStatus) void window.desktop.soundCloudStatus().then(value => { if (alive.current && run === generation.current) setStatus(value); }, cause => { if (alive.current && run === generation.current) setError(failure(cause)); }).finally(() => { if (alive.current && run === generation.current) { activeOperation.current = null; setOperation(null); } });
+    else { setError('Подключение SoundCloud доступно в настольном Pulse.'); activeOperation.current = null; setOperation(null); }
     return () => { alive.current = false; generation.current++; };
   }, []);
+  const beginOperation = (next: 'save' | 'import' | 'check') => {
+    if (activeOperation.current) return null;
+    activeOperation.current = next; setOperation(next); setError(''); setMessage('');
+    return ++generation.current;
+  };
+  const endOperation = (run: number) => { if (alive.current && run === generation.current) { activeOperation.current = null; setOperation(null); } };
+  const clearInputs = () => { setClientId(''); setClientSecret(''); setProxy(''); setEditProxy(false); };
+  const editConnection = () => {
+    setMessage(''); setVerified(false);
+    if (verified) setStatus(previous => previous ? { ...previous, message: 'Сохраните изменения и проверьте доступ к API заново.' } : previous);
+  };
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy || !window.desktop?.configureSoundCloud) return;
+    if (activeOperation.current || !window.desktop?.configureSoundCloud) return;
     if (Boolean(clientId.trim()) !== Boolean(clientSecret.trim())) { setError('Введите Client ID и Client Secret вместе.'); return; }
     if (!status?.configured && (!clientId.trim() || !clientSecret.trim())) { setError('Для первого подключения нужны Client ID и Client Secret приложения SoundCloud.'); return; }
-    const run = ++generation.current;
-    setBusy(true); setError(''); setSaved(false);
+    const run = beginOperation('save');
+    if (run === null) return;
     try {
       await window.desktop.configureSoundCloud({ clientId: clientId.trim(), clientSecret: clientSecret.trim(), ...(editProxy || !status?.configured ? { proxy: proxy.trim() } : {}) });
       if (!alive.current || run !== generation.current) return;
       // Secrets are never read back into the renderer or persisted in browser storage.
-      setClientId(''); setClientSecret(''); setProxy(''); setEditProxy(false);
+      clearInputs(); setVerified(false); setMessage('Настройки сохранены');
+      setStatus({ configured: true, proxy: editProxy || !status?.configured ? Boolean(proxy.trim()) : status.proxy, message: 'Настройки сохранены. Доступ к API пока не проверен.' });
       const next = await window.desktop.soundCloudStatus?.();
-      if (alive.current && run === generation.current) { if (next) setStatus(next); setSaved(true); }
+      if (alive.current && run === generation.current && next) setStatus(next);
     } catch (cause) { if (alive.current && run === generation.current) setError(failure(cause)); }
-    finally { if (alive.current && run === generation.current) setBusy(false); }
+    finally { endOperation(run); }
+  };
+  const importCredentials = async () => {
+    const api = window.desktop?.importSoundCloudCredentials;
+    if (!api) return;
+    const run = beginOperation('import');
+    if (run === null) return;
+    try {
+      // The native dialog reads the file; the renderer receives status only.
+      const next = await api();
+      if (!alive.current || run !== generation.current || !next) return;
+      clearInputs(); setStatus(next); setVerified(false); setMessage('Файл ключей импортирован. Проверьте доступ к API.');
+    } catch (cause) { if (alive.current && run === generation.current) setError(failure(cause)); }
+    finally { endOperation(run); }
+  };
+  const checkConnection = async () => {
+    const api = window.desktop?.checkSoundCloudConnection;
+    if (!api) return;
+    const run = beginOperation('check');
+    if (run === null) return;
+    setVerified(false);
+    try {
+      const next = await api();
+      if (!alive.current || run !== generation.current) return;
+      setStatus(next); setVerified(next.configured); setMessage(next.message);
+    } catch (cause) {
+      if (alive.current && run === generation.current) {
+        setError(failure(cause));
+        setStatus(previous => previous ? { ...previous, message: previous.managed ? 'Сервис SoundCloud сейчас недоступен. Попробуйте позже.' : 'Доступ к API не подтверждён. Проверьте ключи и подключение.' } : previous);
+      }
+    }
+    finally { endOperation(run); }
   };
   return <section className="settings-section sc-settings" aria-label="SoundCloud">
     <div className="settings-section-heading"><h2>SoundCloud</h2><p>Другой источник звука для вашей библиотеки.</p></div>
-    <div className={`sc-connection ${status?.configured ? 'is-ready' : ''}`}><span className="sc-service-icon"><Cloud size={23} /></span><div><strong>{status?.configured ? 'Подключение настроено' : 'Подключите приложение'}</strong><p>{status?.message || 'Pulse использует официальный API SoundCloud.'}</p><span className="sc-route">{status?.proxy ? 'SoundCloud через отдельный прокси' : 'Прямое соединение'}</span></div>{status?.configured && <ShieldCheck size={18} />}</div>
+    <div className={`sc-connection ${verified ? 'is-ready' : ''}`}><span className="sc-service-icon"><Cloud size={23} /></span><div><strong>{verified ? 'Авторизация и поиск проверены' : status?.managed ? 'SoundCloud через Pulse' : status?.configured ? 'Ключи сохранены' : status ? 'Подключите приложение' : 'Проверяем подключение'}</strong><p>{status?.message || 'Pulse использует официальный API SoundCloud.'}</p>{status && <span className="sc-route">{status.managed ? 'Подключение настроено в Pulse. VK работает напрямую.' : status.proxy ? 'SoundCloud через отдельный прокси' : 'Прямое соединение'}</span>}</div>{verified && <ShieldCheck size={18} />}</div>
     {status?.configured === false && <SoundCloudApiGuide />}
     {settings && onChange && <div className="sc-preferences"><label className="sc-preference"><span><strong>Предпочитать SoundCloud</strong><small>Для треков без карточки артиста VK и при ошибке источника. При неоднозначном совпадении можно выбрать версию.</small></span><input type="checkbox" checked={settings.preferSoundCloud} onChange={event => onChange({ preferSoundCloud: event.target.checked })} /></label><label className="sc-preference"><span><strong>Предпочитать версии Explicit</strong><small>Среди подходящих записей выше версии с пометкой Explicit. Замена известной Clean-версии подтверждается вручную. Отсутствие пометки не означает цензуру.</small></span><input type="checkbox" checked={settings.preferExplicit} onChange={event => onChange({ preferExplicit: event.target.checked })} /></label></div>}
-    <form className="sc-config-form" onSubmit={event => void save(event)}>
+    {status?.managed && <div className="sc-managed-connection"><p className="sc-private-note">Отдельные ключи и настройка сети не нужны. Доступность полной записи зависит от SoundCloud.</p>{error && <p className="sc-message is-error" role="alert">{error}</p>}{message && <p className="sc-message" role="status">{message}</p>}<button type="button" className="secondary-button" disabled={busy || !window.desktop?.checkSoundCloudConnection} onClick={() => void checkConnection()}>{operation === 'check' ? <LoaderCircle size={15} className="spin" /> : <ShieldCheck size={15} />}{operation === 'check' ? 'Проверяем доступ' : 'Проверить доступ'}</button></div>}
+    {!status && error && <p className="sc-message is-error" role="alert">{error}</p>}
+    {status && !status.managed && <form className="sc-config-form" onSubmit={event => void save(event)}>
       <div className="sc-form-intro"><strong>{status?.configured ? 'Обновить подключение' : 'Ключи приложения SoundCloud'}</strong><p>{status?.configured ? 'Чтобы сохранить прежние ключи, оставьте оба поля пустыми.' : 'Client ID и Client Secret выдаёт SoundCloud для зарегистрированного приложения. Пароль от аккаунта сюда не нужен.'}</p><button type="button" className="sc-text-button" onClick={() => openLink('https://developers.soundcloud.com/docs/api/guide')}>О документации SoundCloud <ExternalLink size={12} /></button></div>
-      <div className="sc-credential-fields"><label>Client ID<input type="password" autoComplete="off" spellCheck={false} value={clientId} onChange={event => { setClientId(event.target.value); setSaved(false); }} placeholder={status?.configured ? 'Оставить прежний' : 'Client ID приложения'} disabled={busy} /></label><label>Client Secret<input type="password" autoComplete="new-password" spellCheck={false} value={clientSecret} onChange={event => { setClientSecret(event.target.value); setSaved(false); }} placeholder={status?.configured ? 'Оставить прежний' : 'Client Secret приложения'} disabled={busy} /></label></div>
-      {status?.configured && !editProxy ? <div className="sc-proxy-summary"><span>{status.proxy ? 'Прокси сохранён. Адрес и пароль скрыты.' : 'SoundCloud подключается напрямую.'}</span><button type="button" className="sc-text-button" onClick={() => setEditProxy(true)} disabled={busy}>Изменить маршрут</button></div> : <label className="sc-proxy-field">Прокси для SoundCloud<input type="password" autoComplete="off" spellCheck={false} value={proxy} onChange={event => { setProxy(event.target.value); setSaved(false); }} placeholder="http://логин:пароль@сервер:порт" disabled={busy} /><small>Пустое поле — прямое соединение. Этот маршрут применяется только к SoundCloud. VK подключается напрямую.</small></label>}
-      <p className="sc-private-note"><ShieldCheck size={14} /> Ключи хранятся в защищённом хранилище системы. Сохранение настроек ещё не подтверждает доступ API — он проверяется при поиске.</p>
-      {error && <p className="sc-message is-error" role="alert">{error}</p>}{saved && <p className="sc-message" role="status"><Check size={14} /> Настройки сохранены</p>}
-      <div className="sc-form-actions"><button type="submit" className="primary-button" disabled={busy || !window.desktop?.configureSoundCloud}>{busy ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{busy ? 'Сохраняем' : 'Сохранить подключение'}</button></div>
-    </form>
+      <div className="sc-file-import"><div><strong>Ключи из файла</strong><p>Заполните в JSON поля <code>clientId</code> и <code>clientSecret</code>, затем импортируйте файл. Pulse сохранит ключи в защищённом хранилище системы; после успешного импорта файл можно удалить.</p></div><button type="button" className="secondary-button" onClick={() => void importCredentials()} disabled={busy || !window.desktop?.importSoundCloudCredentials}>{operation === 'import' ? <LoaderCircle size={15} className="spin" /> : <FileKey2 size={15} />}{operation === 'import' ? 'Выбираем файл' : 'Импортировать файл ключей'}</button></div>
+      <div className="sc-credential-fields"><label>Client ID<input type="password" autoComplete="off" spellCheck={false} value={clientId} onChange={event => { setClientId(event.target.value); editConnection(); }} placeholder={status?.configured ? 'Оставить прежний' : 'Client ID приложения'} disabled={busy} /></label><label>Client Secret<input type="password" autoComplete="new-password" spellCheck={false} value={clientSecret} onChange={event => { setClientSecret(event.target.value); editConnection(); }} placeholder={status?.configured ? 'Оставить прежний' : 'Client Secret приложения'} disabled={busy} /></label></div>
+      {status?.configured && !editProxy ? <div className="sc-proxy-summary"><span>{status.proxy ? 'Прокси сохранён. Адрес и пароль скрыты.' : 'SoundCloud подключается напрямую.'}</span><button type="button" className="sc-text-button" onClick={() => { setEditProxy(true); editConnection(); }} disabled={busy}>Изменить маршрут</button></div> : <label className="sc-proxy-field">Прокси для SoundCloud<input type="password" aria-label="Прокси для SoundCloud" autoComplete="off" spellCheck={false} value={proxy} onChange={event => { setProxy(event.target.value); editConnection(); }} placeholder="http://логин:пароль@сервер:порт" disabled={busy} /><small>Пустое поле — прямое соединение. Этот маршрут применяется только к SoundCloud. VK подключается напрямую.</small></label>}
+      <p className="sc-private-note"><ShieldCheck size={14} /> Сохранение ключей ещё не подтверждает доступ к API. Кнопка «Проверить доступ» проверяет авторизацию и публичный поиск. Доступность полного звука проверяется отдельно при воспроизведении.</p>
+      {error && <p className="sc-message is-error" role="alert">{error}</p>}{message && <p className="sc-message" role="status"><Check size={14} />{message}</p>}
+      <div className="sc-form-actions"><button type="button" className="secondary-button" disabled={busy || !status?.configured || !!clientId || !!clientSecret || editProxy || !window.desktop?.checkSoundCloudConnection} title={clientId || clientSecret || editProxy ? 'Сначала сохраните изменения подключения' : 'Проверить сохранённые ключи и публичный поиск SoundCloud'} onClick={() => void checkConnection()}>{operation === 'check' ? <LoaderCircle size={15} className="spin" /> : <ShieldCheck size={15} />}{operation === 'check' ? 'Проверяем доступ' : 'Проверить доступ'}</button><button type="submit" className="primary-button" disabled={busy || !window.desktop?.configureSoundCloud}>{operation === 'save' ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}{operation === 'save' ? 'Сохраняем' : 'Сохранить подключение'}</button></div>
+    </form>}
   </section>;
 }
 

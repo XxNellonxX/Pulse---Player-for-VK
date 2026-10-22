@@ -8,6 +8,9 @@ playwright-report/
 .env
 .env.*
 !.env.example
+config/soundcloud-credentials.json
+config/soundcloud-credentials.local.json
+config/pulse-service.json
 src-tauri/target/
 src-tauri/gen/
 asar-audit-*/

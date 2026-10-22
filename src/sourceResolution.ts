@@ -29,7 +29,7 @@ export async function soundCloudSource(track: Track, settings: AppSettings, sign
   catch (cause) {
     if (!signal.aborted && controller.signal.aborted) {
       if (!failed) return null
-      throw new Error('SoundCloud не ответил за 15 секунд. Проверьте отдельный маршрут в настройках источников.')
+      throw new Error('SoundCloud не ответил за 15 секунд. Проверьте подключение и повторите попытку.')
     }
     throw cause
   } finally {

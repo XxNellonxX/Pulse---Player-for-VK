@@ -40,6 +40,7 @@ pub enum CatalogError {
     Unauthorized,
     NotFound,
     Forbidden,
+    Expired,
     RateLimited { retry_after_seconds: Option<u64> },
     Upstream,
     InvalidResponse,
@@ -55,6 +56,7 @@ impl fmt::Display for CatalogError {
             Self::Unauthorized => write!(f, "SoundCloud отклонил авторизацию приложения."),
             Self::NotFound => write!(f, "SoundCloud не нашёл запрошенный ресурс."),
             Self::Forbidden => write!(f, "SoundCloud ограничил доступ к этому ресурсу."),
+            Self::Expired => write!(f, "Срок действия аудиоссылки истёк. Требуется обновить источник SoundCloud."),
             Self::RateLimited {
                 retry_after_seconds,
             } => match retry_after_seconds {
@@ -75,6 +77,14 @@ impl fmt::Display for CatalogError {
 }
 
 impl std::error::Error for CatalogError {}
+
+fn gateway_error(status: u16) -> CatalogError {
+    match status { 400 => CatalogError::InvalidRequest, 401 => CatalogError::Unauthorized,
+        403 => CatalogError::Forbidden, 404 => CatalogError::NotFound,
+        410 => CatalogError::Expired,
+        429 => CatalogError::RateLimited { retry_after_seconds: None },
+        503 => CatalogError::Unavailable, _ => CatalogError::Network }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -128,6 +138,7 @@ pub struct MediaResource {
 
 #[derive(Clone)]
 pub struct SoundCloudCatalog {
+    gateway: Option<crate::gateway_client::Gateway>,
     client_id: String,
     client_secret: String,
     proxy: Option<String>,
@@ -149,8 +160,25 @@ struct AccessToken {
 }
 
 impl SoundCloudCatalog {
+    pub fn is_managed(&self) -> bool { self.gateway.is_some() }
+    pub fn from_gateway(gateway: crate::gateway_client::Gateway) -> Self {
+        Self { gateway: Some(gateway), client_id: String::new(), client_secret: String::new(), proxy: None,
+            token: Arc::new(Mutex::new(None)), clients: Arc::new(Mutex::new(Vec::new())) }
+    }
+    pub fn validate_source(&self, value: &str) -> Result<String, CatalogError> {
+        match &self.gateway { Some(gateway) => gateway.media_url(value).map_err(|_| CatalogError::InvalidRequest), None => validate_media_url(value) }
+    }
     pub fn uses_proxy(&self) -> bool {
         self.proxy.is_some()
+    }
+
+    /// Verifies app authorization and one bounded public catalog request.
+    /// This intentionally does not claim that a full audio stream is playable.
+    pub async fn check_connection(&self) -> Result<(), CatalogError> {
+        timeout(Duration::from_secs(30), self.search("soundcloud", None, 1))
+            .await
+            .map_err(|_| CatalogError::Network)?
+            .map(|_| ())
     }
 
     /// Reads optional runtime configuration. No secret value is returned or logged.
@@ -170,13 +198,18 @@ impl SoundCloudCatalog {
         client_secret: String,
         proxy: Option<String>,
     ) -> Result<Self, CatalogError> {
-        if !valid_credential(&client_id) || !valid_credential(&client_secret) {
+        if !valid_credential(&client_id)
+            || !valid_credential(&client_secret)
+            || placeholder_credential(&client_id)
+            || placeholder_credential(&client_secret)
+        {
             return Err(CatalogError::InvalidConfig);
         }
         if let Some(value) = proxy.as_deref() {
             validate_proxy(value)?;
         }
         Ok(Self {
+            gateway: None,
             client_id,
             client_secret,
             proxy,
@@ -205,6 +238,13 @@ impl SoundCloudCatalog {
             url
         };
         let value = self.api_json(url).await?;
+        let mut value = value;
+        if let Some(gateway) = &self.gateway {
+            if let Some(cursor) = value.get("next_href").and_then(Value::as_str) {
+                let cursor = gateway.upstream_cursor(cursor).map_err(|_|CatalogError::InvalidResponse)?;
+                value["next_href"] = Value::String(cursor);
+            }
+        }
         parse_page(&value)
     }
 
@@ -224,7 +264,7 @@ impl SoundCloudCatalog {
         }
         let url = api_url_segments(&["tracks", &urn, "streams"])?;
         let value = self.api_json(url).await?;
-        let sources = parse_streams(&value)?;
+        let sources = parse_streams_with(&value, |url| self.validate_source(url))?;
         Ok(StreamGrant { track, sources })
     }
 
@@ -236,6 +276,11 @@ impl SoundCloudCatalog {
         media_url: &str,
         range: Option<&str>,
     ) -> Result<MediaResource, CatalogError> {
+        if let Some(gateway) = &self.gateway {
+            let resource = gateway.media(media_url, range).await.map_err(gateway_error)?;
+            return Ok(MediaResource { status: resource.status, bytes: resource.bytes, content_type: resource.content_type,
+                content_range: resource.content_range, final_url: resource.final_url });
+        }
         timeout(
             Duration::from_secs(45),
             self.fetch_media_inner(media_url, range),
@@ -367,6 +412,11 @@ impl SoundCloudCatalog {
     }
 
     async fn api_json(&self, url: Url) -> Result<Value, CatalogError> {
+        if let Some(gateway) = &self.gateway {
+            validate_api_url(&url)?;
+            let url = gateway.soundcloud_url(&url).map_err(|_|CatalogError::InvalidRequest)?;
+            return gateway.json(url).await.map_err(gateway_error);
+        }
         timeout(Duration::from_secs(30), self.api_json_inner(url))
             .await
             .map_err(|_| CatalogError::Network)?
@@ -437,24 +487,9 @@ impl SoundCloudCatalog {
     async fn exchange_token(&self, refresh: Option<&str>) -> Result<AccessToken, CatalogError> {
         let url = Url::parse(TOKEN_URL).map_err(|_| CatalogError::InvalidConfig)?;
         let client = self.client_for(&url).await?;
-        let mut form = vec![(
-            "grant_type",
-            if refresh.is_some() {
-                "refresh_token"
-            } else {
-                "client_credentials"
-            },
-        )];
-        if let Some(refresh) = refresh {
-            form.push(("refresh_token", refresh));
-        }
         let response = timeout(
             Duration::from_secs(20),
-            client
-                .post(url)
-                .basic_auth(&self.client_id, Some(&self.client_secret))
-                .form(&form)
-                .send(),
+            self.token_request(&client, refresh).send(),
         )
         .await
         .map_err(|_| CatalogError::Network)?
@@ -466,6 +501,25 @@ impl SoundCloudCatalog {
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| CatalogError::InvalidResponse)?;
         parse_token(&value)
+    }
+
+    fn token_request(&self, client: &Client, refresh: Option<&str>) -> reqwest::RequestBuilder {
+        let request = client
+            .post(TOKEN_URL)
+            .header(header::ACCEPT, "application/json");
+        match refresh {
+            // The current official guide places these credentials in the form
+            // for refresh. Client credentials grants remain strictly Basic-only.
+            Some(token) => request.form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", token),
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+            ]),
+            None => request
+                .basic_auth(&self.client_id, Some(&self.client_secret))
+                .form(&[("grant_type", "client_credentials")]),
+        }
     }
 
     async fn client_for(&self, url: &Url) -> Result<Client, CatalogError> {
@@ -524,7 +578,11 @@ impl SoundCloudCatalog {
     }
 }
 
+#[cfg(test)]
 fn parse_streams(value: &Value) -> Result<Vec<StreamSource>, CatalogError> {
+    parse_streams_with(value, validate_media_url)
+}
+fn parse_streams_with(value: &Value, validate: impl Fn(&str) -> Result<String, CatalogError>) -> Result<Vec<StreamSource>, CatalogError> {
     if !value.is_object() {
         return Err(CatalogError::InvalidResponse);
     }
@@ -535,7 +593,7 @@ fn parse_streams(value: &Value) -> Result<Vec<StreamSource>, CatalogError> {
     ] {
         if let Some(address) = value.get(key).filter(|value| !value.is_null()) {
             let address = address.as_str().ok_or(CatalogError::InvalidResponse)?;
-            let address = validate_media_url(address)?;
+            let address = validate(address)?;
             if sources
                 .iter()
                 .all(|source: &StreamSource| source.url != address)
@@ -695,6 +753,31 @@ fn clean_text(value: &str, max: usize) -> String {
 
 fn valid_credential(value: &str) -> bool {
     !value.is_empty() && value.len() <= 8192 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+fn placeholder_credential(value: &str) -> bool {
+    let normalized = value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "clientid"
+            | "clientsecret"
+            | "yourclientid"
+            | "yourclientsecret"
+            | "changeme"
+            | "replaceme"
+            | "example"
+    ) || normalized.contains("placeholder")
+        || normalized.starts_with("pasteclient")
+        || normalized.starts_with("pasteyour")
+        || normalized.starts_with("insertyour")
+        || normalized.starts_with("insertclient")
+        || normalized.contains("clientidhere")
+        || normalized.contains("clientsecrethere")
+        || (value.starts_with('<') && value.ends_with('>'))
 }
 
 fn clean_query(value: &str) -> Result<String, CatalogError> {
@@ -980,7 +1063,7 @@ fn validate_proxy(value: &str) -> Result<(), CatalogError> {
     let url = Url::parse(value).map_err(|_| CatalogError::InvalidConfig)?;
     if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
         || url.host_str().is_none()
-        || url.port_or_known_default().is_none()
+        || !url.port_or_known_default().is_some_and(|port| port != 0)
         || !matches!(url.path(), "" | "/")
         || url.query().is_some()
         || url.fragment().is_some()
@@ -1064,7 +1147,7 @@ fn public_v4(ip: Ipv4Addr) -> bool {
         || a >= 224)
 }
 
-fn public_ip(ip: IpAddr) -> bool {
+pub(crate) fn public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(value) => public_v4(value),
         IpAddr::V6(value) => {
@@ -1075,6 +1158,7 @@ fn public_ip(ip: IpAddr) -> bool {
             (segments[0] & 0xe000) == 0x2000
                 && !(segments[0] == 0x2001 && (segments[1] <= 0x01ff || segments[1] == 0xdb8))
                 && segments[0] != 0x2002
+                && segments[0] != 0x3fff
         }
     }
 }
@@ -1082,6 +1166,20 @@ fn public_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_expiry_is_distinct_from_provider_failures_without_exposing_details() {
+        assert_eq!(gateway_error(410), CatalogError::Expired);
+        assert_eq!(gateway_error(404), CatalogError::NotFound);
+        assert_eq!(gateway_error(403), CatalogError::Forbidden);
+        assert_eq!(gateway_error(429), CatalogError::RateLimited { retry_after_seconds: None });
+        assert_eq!(gateway_error(503), CatalogError::Unavailable);
+        assert_eq!(gateway_error(502), CatalogError::Network);
+        assert_eq!(gateway_error(504), CatalogError::Network);
+        let message = gateway_error(410).to_string();
+        assert!(message.contains("истёк") && message.contains("обновить"));
+        assert!(!message.contains("https:") && !message.contains("token"));
+    }
     use serde_json::json;
 
     #[test]
@@ -1150,6 +1248,8 @@ mod tests {
         assert!(validate_media_url("http://127.0.0.1/private").is_err());
         assert!(validate_media_url("https://user:secret@cf-hls-media.sndcdn.com/a.m3u8").is_err());
         assert!(validate_proxy("file:///tmp/proxy").is_err());
+        assert!(validate_proxy("socks5h://proxy.example:0").is_err());
+        assert!(validate_proxy("http://proxy.example:0").is_err());
         assert!(validate_proxy("http://127.0.0.1:8080").is_ok());
         let error = CatalogError::RateLimited {
             retry_after_seconds: Some(30),
@@ -1202,6 +1302,63 @@ mod tests {
         }
         let brief = parse_token(&json!({"access_token":"short","expires_in":1})).unwrap();
         assert!(brief.expires_at <= Instant::now() + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn client_credentials_uses_only_sensitive_basic_and_refresh_uses_documented_form() {
+        let provider =
+            SoundCloudCatalog::from_config("request-id".into(), "request-secret".into(), None)
+                .unwrap();
+        let client = Client::builder().no_proxy().build().unwrap();
+        let initial = provider.token_request(&client, None).build().unwrap();
+        assert_eq!(initial.method(), "POST");
+        assert_eq!(initial.url().as_str(), TOKEN_URL);
+        let authorization = &initial.headers()[header::AUTHORIZATION];
+        assert!(authorization.is_sensitive());
+        assert!(authorization.to_str().unwrap().starts_with("Basic "));
+        let initial_form = url::form_urlencoded::parse(initial.body().unwrap().as_bytes().unwrap())
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(initial_form.len(), 1);
+        assert_eq!(
+            initial_form.get("grant_type").unwrap(),
+            "client_credentials"
+        );
+        let renewal = provider
+            .token_request(&client, Some("single-use-refresh"))
+            .build()
+            .unwrap();
+        assert!(renewal.headers().get(header::AUTHORIZATION).is_none());
+        let renewal_form = url::form_urlencoded::parse(renewal.body().unwrap().as_bytes().unwrap())
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(renewal_form.len(), 4);
+        assert_eq!(renewal_form.get("grant_type").unwrap(), "refresh_token");
+        assert_eq!(
+            renewal_form.get("refresh_token").unwrap(),
+            "single-use-refresh"
+        );
+        assert_eq!(renewal_form.get("client_id").unwrap(), "request-id");
+        assert_eq!(renewal_form.get("client_secret").unwrap(), "request-secret");
+    }
+
+    #[test]
+    fn template_credentials_are_rejected_before_any_network_request() {
+        for value in [
+            "PASTE_CLIENT_ID_HERE",
+            "PASTE_CLIENT_SECRET_HERE",
+            "YOUR_CLIENT_ID",
+            "<CLIENT_SECRET>",
+            "replace-me",
+        ] {
+            assert!(placeholder_credential(value));
+            assert!(SoundCloudCatalog::from_config(
+                value.into(),
+                "real-looking-secret-value".into(),
+                None
+            )
+            .is_err());
+        }
+        assert!(!placeholder_credential("9d39a4cb62109e2782b8ce52f5d98311"));
+        assert!(!placeholder_credential("real-looking-secret-value"));
     }
 
     #[test]
@@ -1282,6 +1439,9 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "2001:db8::1",
+            "2001::1",
+            "2002::1",
+            "3fff::1",
         ] {
             assert!(!public_ip(value.parse().unwrap()), "accepted {value}");
         }

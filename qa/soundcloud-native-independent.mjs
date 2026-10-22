@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { spawn, execFile } from 'node:child_process';
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
@@ -9,16 +9,27 @@ import path from 'node:path';
 import { assertIsolatedNativeBinary } from './assert-isolated-native.mjs';
 
 // Run alone: the QA app identifier owns one Windows WebView2 environment.
-// This never logs in, writes provider credentials or accesses a real library.
+// This never logs in, writes valid provider credentials or accesses a real library.
 // Valid grants / upstream audio / expired allocated sessions need separate QA.
+// Optional PULSE_QA_CREDENTIALS=invalid|cancel exercises the debug-only file picker
+// using only a private temporary file. Invalid files must never write a keychain entry.
 const exe = process.env.TAURI_QA_EXE || path.join(process.env.LOCALAPPDATA, 'vk-player-build/target/debug/vk-player.exe');
 await assertIsolatedNativeBinary(exe);
 const root = await mkdtemp(path.join(os.tmpdir(), 'pulse-sc-native-independent-'));
 const profile = path.join(root, 'profile');
+// The native picker fixture deliberately requires an existing isolated profile.
+await mkdir(profile);
 const port = Number(process.env.PULSE_QA_CDP_PORT || 9236);
 assert.ok(port > 1024 && port < 65536);
 const env = { ...process.env, VK_PLAYER_QA_PROFILE: profile, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port} --autoplay-policy=no-user-gesture-required` };
-for (const name of ['WEBVIEW2_USER_DATA_FOLDER', 'VK_PLAYER_QA_FILES', 'PULSE_SOUNDCLOUD_CLIENT_ID', 'PULSE_SOUNDCLOUD_CLIENT_SECRET', 'PULSE_SOUNDCLOUD_PROXY']) delete env[name];
+for (const name of ['WEBVIEW2_USER_DATA_FOLDER', 'VK_PLAYER_QA_FILES', 'VK_PLAYER_QA_SOUNDCLOUD_FILE', 'PULSE_SOUNDCLOUD_CLIENT_ID', 'PULSE_SOUNDCLOUD_CLIENT_SECRET', 'PULSE_SOUNDCLOUD_PROXY']) delete env[name];
+const credentialMode = process.env.PULSE_QA_CREDENTIALS;
+if (credentialMode && !['invalid', 'cancel'].includes(credentialMode)) throw Error('Unknown credential QA mode');
+const credentialFixture = path.join(root, 'independent-credentials.json');
+if (credentialMode) {
+  env.VK_PLAYER_QA_SOUNDCLOUD_FILE = credentialMode === 'cancel' ? '' : credentialFixture;
+  if (credentialMode === 'invalid') await writeFile(credentialFixture, '{}');
+}
 const output = [], errors = [], results = [], responses = [];
 const memoryMode = process.env.PULSE_QA_MEMORY === '1', execFileAsync = promisify(execFile);
 let memory;
@@ -176,6 +187,66 @@ try {
     assert.equal(await page.getByLabel('Прокси для MusicBrainz', { exact: true }).getAttribute('type'), 'password');
     assert.equal(await page.getByLabel('Client Secret', { exact: true }).count(), 0);
     assert.deepEqual(errors, []);
+  });
+  if (credentialMode) await test('new native verification rejects an unconfigured provider promptly without claiming access', async () => {
+    const result = await page.evaluate(async () => {
+      const started = performance.now();
+      try { return { value: await window.desktop.checkSoundCloudConnection(), elapsed: performance.now() - started }; }
+      catch (cause) { return { failure: String(cause), elapsed: performance.now() - started }; }
+    });
+    assert.ok(result.failure); assert.equal(result.value, undefined);
+    assert.match(result.failure, /SoundCloud|хранилищ|доступ/i);
+    assert.ok(result.elapsed < 2000, 'No-key API check performed a network timeout');
+    assert.equal((await page.evaluate(() => window.desktop.soundCloudStatus())).configured, false);
+  });
+  if (credentialMode === 'cancel') await test('native file picker cancellation returns null and preserves untouched provider state', async () => {
+    const before = await page.evaluate(async () => ({ provider: await window.desktop.soundCloudStatus(), state: await window.desktop.getState() }));
+    assert.equal(await page.evaluate(() => window.desktop.importSoundCloudCredentials()), null);
+    assert.deepEqual(await page.evaluate(async () => ({ provider: await window.desktop.soundCloudStatus(), state: await window.desktop.getState() })), before);
+  });
+  if (credentialMode === 'invalid') await test('actual native import rejects malformed, placeholder and oversized files without leaking or changing credentials', async () => {
+    const privateValue = 'independent-native-private-value';
+    const fixtures = [
+      '', '{}', 'not JSON ' + privateValue,
+      JSON.stringify({ clientId: 'PASTE_CLIENT_ID_HERE', clientSecret: 'PASTE_CLIENT_SECRET_HERE' }),
+      JSON.stringify({ clientId: 'fixture-id' }),
+      JSON.stringify({ clientId: 123, clientSecret: privateValue }),
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, accessToken: privateValue }),
+      `{"clientId":"first","clientId":"second","clientSecret":"${privateValue}"}`,
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, proxy: `ftp://qa-user:${privateValue}@proxy.example:2121` }),
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, proxy: `http://qa-user:${privateValue}@proxy.example:8080/path` }),
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, proxy: 'http://' }),
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, proxy: 'socks5h://proxy.example:0' }),
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, proxy: 'http://proxy.example:0' }),
+      JSON.stringify({ clientId: 'fixture-id', clientSecret: privateValue, proxy: false }),
+      Buffer.alloc(16 * 1024 + 1, ' '),
+    ];
+    const before = await page.evaluate(async () => ({ provider: await window.desktop.soundCloudStatus(), state: await window.desktop.getState() }));
+    let rejected = 0;
+    for (const fixture of fixtures) {
+      await writeFile(credentialFixture, fixture);
+      const actual = await page.evaluate(async () => {
+        try { return { value: await window.desktop.importSoundCloudCredentials() }; }
+        catch (cause) { return { failure: String(cause) }; }
+      });
+      assert.ok(actual.failure, 'Invalid credential file fabricated success');
+      assert.equal(actual.value, undefined);
+      assert.equal(actual.failure.includes(privateValue), false, 'Native error disclosed file contents or proxy credentials');
+      assert.equal(actual.failure.includes(credentialFixture), false, 'Native error disclosed the selected file path');
+      assert.deepEqual(await readFile(credentialFixture), Buffer.from(fixture), 'Import modified the selected credential file');
+      assert.deepEqual(await page.evaluate(async () => ({ provider: await window.desktop.soundCloudStatus(), state: await window.desktop.getState() })), before);
+      rejected++;
+    }
+    await rm(credentialFixture);
+    const missing = await page.evaluate(async () => {
+      try { return { value: await window.desktop.importSoundCloudCredentials() }; }
+      catch (cause) { return { failure: String(cause) }; }
+    });
+    assert.ok(missing.failure); assert.equal(missing.value, undefined);
+    assert.equal(missing.failure.includes(credentialFixture), false);
+    assert.equal(output.join('').includes(privateValue), false, 'Native logs disclosed credential fixture content');
+    assert.deepEqual(errors, []);
+    console.log('INVALID_CREDENTIAL_FIXTURES ' + (rejected + 1));
   });
   console.log(JSON.stringify({ results, limits: ['No real SoundCloud API keys or valid native media grant', 'No physical macOS test'], profile }));
   if (results.some(result => !result.ok)) process.exitCode = 1;

@@ -2,7 +2,7 @@
 //! No signed provider URLs, secrets or audio files are persisted.
 use crate::{
     soundcloud_catalog::{
-        validate_media_url, validate_range, Candidate, CatalogPage, SoundCloudCatalog,
+        validate_range, Candidate, CatalogError, CatalogPage, SoundCloudCatalog,
     },
     vk_web, AppState,
 };
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -21,17 +21,21 @@ use tauri::{
     AppHandle, Manager, State,
 };
 use url::Url;
+#[cfg(test)]
+use crate::soundcloud_catalog::validate_media_url;
 
 const MAX_BINDING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BINDINGS: usize = 10_000;
 const MAX_SESSION_URLS: usize = 2048;
 const SESSION_TTL_MS: i64 = 60 * 60 * 1000;
+const MAX_CREDENTIAL_FILE_BYTES: usize = 16 * 1024;
 
 pub struct SourceState {
     catalog: Mutex<Option<Arc<SoundCloudCatalog>>>,
     sessions: Mutex<HashMap<String, Session>>,
     bindings_lock: Mutex<()>,
     configuration_lock: Mutex<()>,
+    credential_dialog_lock: tokio::sync::Mutex<()>,
     generation: AtomicU64,
     media_slots: tokio::sync::Semaphore,
 }
@@ -42,6 +46,7 @@ impl Default for SourceState {
             sessions: Mutex::new(HashMap::new()),
             bindings_lock: Mutex::new(()),
             configuration_lock: Mutex::new(()),
+            credential_dialog_lock: tokio::sync::Mutex::new(()),
             generation: AtomicU64::new(0),
             media_slots: tokio::sync::Semaphore::new(4),
         }
@@ -59,6 +64,14 @@ struct Session {
 struct Configuration {
     client_id: String,
     client_secret: String,
+    proxy: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ImportedCredentials {
+    client_id: String,
+    client_secret: String,
+    #[serde(default)]
     proxy: Option<String>,
 }
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -88,6 +101,8 @@ pub struct Status {
     configured: bool,
     proxy: bool,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed: Option<bool>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +178,11 @@ fn catalog(app: &AppHandle) -> Result<Arc<SoundCloudCatalog>, String> {
     if let Some(client) = cache.as_ref() {
         return Ok(client.clone());
     }
+    if let Some(gateway) = crate::gateway_client::Gateway::configured()? {
+        let client = Arc::new(SoundCloudCatalog::from_gateway(gateway));
+        *cache = Some(client.clone());
+        return Ok(client);
+    }
     let stored = stored_configuration(&credential_entry(app)?)?;
     let client = match stored {
         Some(config) => {
@@ -180,9 +200,18 @@ fn catalog(app: &AppHandle) -> Result<Arc<SoundCloudCatalog>, String> {
 fn bindings(app: &AppHandle) -> Result<Vec<Binding>, String> {
     read_bindings(&crate::data_dir(app).join("source-links.json"))
 }
-fn manual_binding_conflict(all: &[Binding], account: i64, track_id: &str, incoming: SourceSelection) -> bool {
-    matches!(incoming, SourceSelection::Metadata) && all.iter().any(|binding|
-        binding.account_id == account && binding.track_id == track_id && matches!(binding.selection, SourceSelection::User))
+fn manual_binding_conflict(
+    all: &[Binding],
+    account: i64,
+    track_id: &str,
+    incoming: SourceSelection,
+) -> bool {
+    matches!(incoming, SourceSelection::Metadata)
+        && all.iter().any(|binding| {
+            binding.account_id == account
+                && binding.track_id == track_id
+                && matches!(binding.selection, SourceSelection::User)
+        })
 }
 
 fn public_metadata_url(value: Option<String>, artwork: bool) -> Option<String> {
@@ -307,12 +336,14 @@ pub async fn soundcloud_status(app: AppHandle) -> Status {
         Ok(client) => Status {
             configured: true,
             proxy: client.uses_proxy(),
-            message: "SoundCloud настроен. Доступ к API проверяется при поиске.".into(),
+            message: if client.is_managed() { "Подключение через Pulse настроено. Доступ проверяется при поиске и воспроизведении." } else { "SoundCloud настроен. Доступ к API проверяется при поиске." }.into(),
+            managed: client.is_managed().then_some(true),
         },
         Err(message) => Status {
             configured: false,
             proxy: false,
             message,
+            managed: None,
         },
     }
 }
@@ -323,14 +354,26 @@ pub async fn configure_soundcloud(
     client_secret: String,
     proxy: Option<String>,
 ) -> Result<(), String> {
+    apply_configuration(&app, &client_id, &client_secret, proxy.as_deref()).map(|_| ())
+}
+
+fn apply_configuration(
+    app: &AppHandle,
+    client_id: &str,
+    client_secret: &str,
+    proxy: Option<&str>,
+) -> Result<Arc<SoundCloudCatalog>, String> {
+    if crate::gateway_client::Gateway::configured()?.is_some() {
+        return Err("В этой сборке подключение SoundCloud обслуживает Pulse. Личные ключи не нужны.".into());
+    }
     let shared = app.state::<SourceState>();
     let _lock = shared.configuration_lock.lock().unwrap();
-    let entry = credential_entry(&app)?;
+    let entry = credential_entry(app)?;
     let previous = stored_configuration(&entry)?;
     let config = merge_configuration(
-        &client_id,
-        &client_secret,
-        proxy.as_deref(),
+        client_id,
+        client_secret,
+        proxy,
         previous.as_ref(),
         &environment_configuration(),
     )?;
@@ -347,8 +390,127 @@ pub async fn configure_soundcloud(
         .map_err(|_| "Система не разрешила сохранить доступ SoundCloud. Настройки не изменены.")?;
     shared.generation.fetch_add(1, Ordering::SeqCst);
     shared.sessions.lock().unwrap().clear();
-    *shared.catalog.lock().unwrap() = Some(Arc::new(client));
-    Ok(())
+    let client = Arc::new(client);
+    *shared.catalog.lock().unwrap() = Some(client.clone());
+    Ok(client)
+}
+
+fn parse_credential_file(bytes: &[u8]) -> Result<ImportedCredentials, String> {
+    if bytes.len() > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(
+            "Файл доступа SoundCloud превышает допустимые 16 КиБ. Настройки не изменены.".into(),
+        );
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let mut parsed: ImportedCredentials = serde_json::from_slice(bytes).map_err(|_| "Нужен JSON с полями clientId и clientSecret и, при необходимости, proxy. Настройки не изменены.")?;
+    parsed.client_id = parsed.client_id.trim().into();
+    parsed.client_secret = parsed.client_secret.trim().into();
+    SoundCloudCatalog::from_config(parsed.client_id.clone(), parsed.client_secret.clone(), parsed.proxy.as_deref().filter(|value| !value.trim().is_empty()).map(|value| value.trim().to_owned()))
+        .map_err(|_| "В файле должны быть настоящие Client ID и Client Secret SoundCloud. Замените поля шаблона; настройки не изменены.".to_string())?;
+    Ok(parsed)
+}
+
+fn read_credential_file(path: &Path) -> Result<ImportedCredentials, String> {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        return Err("Выберите файл JSON с доступом SoundCloud. Настройки не изменены.".into());
+    }
+    let file = std::fs::File::open(path).map_err(|_| {
+        "Не удалось прочитать выбранный файл доступа SoundCloud. Настройки не изменены."
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        "Не удалось прочитать выбранный файл доступа SoundCloud. Настройки не изменены."
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_CREDENTIAL_FILE_BYTES as u64 {
+        return Err(
+            "Нужен обычный JSON-файл размером не больше 16 КиБ. Настройки не изменены.".into(),
+        );
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CREDENTIAL_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            "Не удалось прочитать выбранный файл доступа SoundCloud. Настройки не изменены."
+        })?;
+    parse_credential_file(&bytes)
+}
+
+#[cfg(debug_assertions)]
+fn qa_credential_file_selection(
+    identifier: &str,
+    profile: Option<&Path>,
+    file: Option<std::ffi::OsString>,
+) -> Option<Option<PathBuf>> {
+    if identifier != "ru.vkplayer.independentqa"
+        || !profile.is_some_and(|path| path.is_absolute() && path.is_dir())
+    {
+        return None;
+    }
+    file.map(|path| (!path.is_empty()).then(|| PathBuf::from(path)))
+}
+
+async fn select_credential_file(app: &AppHandle) -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        let profile = std::env::var_os("VK_PLAYER_QA_PROFILE").map(PathBuf::from);
+        if let Some(selection) = qa_credential_file_selection(
+            &app.config().identifier,
+            profile.as_deref(),
+            std::env::var_os("VK_PLAYER_QA_SOUNDCLOUD_FILE"),
+        ) {
+            return selection;
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = app;
+    rfd::AsyncFileDialog::new()
+        .set_title("Импорт доступа SoundCloud")
+        .add_filter("SoundCloud JSON", &["json"])
+        .pick_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}
+
+#[tauri::command]
+pub async fn import_soundcloud_credentials(app: AppHandle) -> Result<Option<Status>, String> {
+    let shared = app.state::<SourceState>();
+    let _dialog = shared
+        .credential_dialog_lock
+        .try_lock()
+        .map_err(|_| "Окно выбора доступа SoundCloud уже открыто.")?;
+    let Some(path) = select_credential_file(&app).await else {
+        return Ok(None);
+    };
+    let imported = tauri::async_runtime::spawn_blocking(move || read_credential_file(&path))
+        .await
+        .map_err(|_| "Не удалось прочитать файл доступа SoundCloud. Настройки не изменены.")??;
+    let client = apply_configuration(
+        &app,
+        &imported.client_id,
+        &imported.client_secret,
+        imported.proxy.as_deref(),
+    )?;
+    Ok(Some(Status { configured: true, proxy: client.uses_proxy(), managed: None, message: "Ключи SoundCloud импортированы и сохранены в защищённом хранилище системы. Нажмите «Проверить доступ», чтобы проверить API.".into() }))
+}
+
+#[tauri::command]
+pub async fn check_soundcloud_connection(app: AppHandle) -> Result<Status, String> {
+    let shared = app.state::<SourceState>();
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let client = catalog(&app)?;
+    client
+        .check_connection()
+        .await
+        .map_err(|error| error.to_string())?;
+    if generation != shared.generation.load(Ordering::SeqCst) {
+        return Err(
+            "Настройки SoundCloud изменились во время проверки. Повторите проверку подключения."
+                .into(),
+        );
+    }
+    Ok(Status { configured: true, proxy: client.uses_proxy(), managed: client.is_managed().then_some(true), message: "Авторизация и публичный поиск SoundCloud проверены. Воспроизведение этой проверкой не подтверждено.".into() })
 }
 #[tauri::command]
 pub async fn search_soundcloud(app: AppHandle, query: String) -> Result<CatalogPage, String> {
@@ -378,7 +540,10 @@ pub async fn soundcloud_binding(
     Ok(bindings(&app)?
         .into_iter()
         .find(|b| b.account_id == guard.account_id && b.track_id == track_id)
-        .map(|b| SelectedCandidate { candidate: b.candidate, selection: b.selection }))
+        .map(|b| SelectedCandidate {
+            candidate: b.candidate,
+            selection: b.selection,
+        }))
 }
 #[tauri::command]
 pub async fn bind_soundcloud(
@@ -520,6 +685,7 @@ fn session_current(created_at: i64, generation: u64, active_generation: u64, now
         && now.saturating_sub(created_at) < SESSION_TTL_MS
 }
 
+#[cfg(test)]
 fn register_media_url(
     urls: &mut Vec<String>,
     upstream: &Url,
@@ -528,6 +694,9 @@ fn register_media_url(
 ) -> Result<String, String> {
     let upstream = validate_media_url(upstream.as_str())
         .map_err(|_| "Источник вернул неподдерживаемую ссылку HLS.")?;
+    register_checked_media_url(urls, upstream, origin, token)
+}
+fn register_checked_media_url(urls: &mut Vec<String>, upstream: String, origin: &str, token: &str) -> Result<String,String> {
     let position = match urls.iter().position(|url| url == &upstream) {
         Some(index) => index,
         None => {
@@ -620,6 +789,15 @@ fn is_manifest(bytes: &[u8], content_type: &str) -> bool {
                 .starts_with("#EXTM3U")
         })
 }
+
+fn source_error_response(error: CatalogError) -> Response<Vec<u8>> {
+    if matches!(error, CatalogError::Expired) {
+        media_response(410, "text/plain", b"Source expired".to_vec(), None)
+    } else {
+        media_response(502, "text/plain", b"Source unavailable".to_vec(), None)
+    }
+}
+
 pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8>> {
     if request.method() == "OPTIONS" {
         return media_response(204, "text/plain", vec![], None);
@@ -670,7 +848,7 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
     }
     let resource = match client.fetch_media(&url, range).await {
         Ok(r) => r,
-        Err(_) => return media_response(502, "text/plain", b"Source unavailable".to_vec(), None),
+        Err(error) => return source_error_response(error),
     };
     if generation != shared.generation.load(Ordering::SeqCst)
         || !vk_web::check_upload_guard(&app, &guard)
@@ -700,7 +878,8 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
             if session.generation != shared.generation.load(Ordering::SeqCst) {
                 return Err("Сеанс завершён.".into());
             }
-            register_media_url(&mut session.urls, &upstream, &origin, token)
+            let checked = client.validate_source(upstream.as_str()).map_err(|_|"Неподдерживаемый медиаканал.")?;
+            register_checked_media_url(&mut session.urls, checked, &origin, token)
         });
         match result {
             Ok(text) => text.into_bytes(),
@@ -731,12 +910,165 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
 mod tests {
     use super::*;
 
+    #[test]
+    fn expired_source_returns_renewable_410_while_other_failures_keep_502() {
+        let expired = source_error_response(CatalogError::Expired);
+        assert_eq!(expired.status().as_u16(), 410);
+        assert_eq!(expired.body().as_slice(), b"Source expired");
+        assert_eq!(expired.headers().get("cache-control").unwrap(), "no-store");
+        for error in [
+            CatalogError::Network,
+            CatalogError::Unauthorized,
+            CatalogError::Forbidden,
+            CatalogError::NotFound,
+            CatalogError::RateLimited { retry_after_seconds: Some(60) },
+            CatalogError::Unavailable,
+            CatalogError::InvalidResponse,
+        ] {
+            let response = source_error_response(error);
+            assert_eq!(response.status().as_u16(), 502);
+            assert_eq!(response.body().as_slice(), b"Source unavailable");
+        }
+    }
+
     fn config(id: &str, proxy: Option<&str>) -> Configuration {
         Configuration {
             client_id: id.into(),
             client_secret: format!("{id}-secret"),
             proxy: proxy.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn credential_json_is_strict_and_never_returns_parser_or_secret_details() {
+        let imported = parse_credential_file(
+            br#"{"clientId":"fixture-id","clientSecret":"fixture-private-secret"}"#,
+        )
+        .unwrap();
+        assert_eq!(imported.client_id, "fixture-id");
+        assert!(imported.proxy.is_none());
+        for invalid in [
+            br#"{"clientId":"PASTE_CLIENT_ID_HERE","clientSecret":"PASTE_CLIENT_SECRET_HERE"}"#.as_slice(),
+            br#"{"client_id":"fixture-id","client_secret":"fixture-private-secret"}"#,
+            br#"{"clientId":"fixture-id","clientSecret":"fixture-private-secret","accessToken":"do-not-store"}"#,
+            br#"{"clientId":"one","clientId":"two","clientSecret":"fixture-private-secret"}"#,
+            br#"{"clientId":123,"clientSecret":"fixture-private-secret"}"#,
+            br#"{"clientId":"fixture-id","clientSecret":"fixture-private-secret","proxy":"file:///private"}"#,
+            b"not json: fixture-private-secret",
+        ] {
+            let error = parse_credential_file(invalid).err().unwrap();
+            assert!(!error.contains("fixture-private-secret") && !error.contains("do-not-store") && !error.contains("file:///private"));
+        }
+        assert!(parse_credential_file(&vec![b' '; MAX_CREDENTIAL_FILE_BYTES + 1]).is_err());
+        let mut bom = vec![0xef, 0xbb, 0xbf];
+        bom.extend_from_slice(
+            br#"{"clientId":"fixture-id","clientSecret":"fixture-private-secret"}"#,
+        );
+        assert!(parse_credential_file(&bom).is_ok());
+    }
+
+    #[test]
+    fn importing_keys_preserves_an_omitted_route_and_honors_explicit_direct_route() {
+        let saved = config("saved", Some("http://localhost:8888"));
+        let environment = config("env", Some("http://localhost:9999"));
+        let imported =
+            parse_credential_file(br#"{"clientId":"new-id","clientSecret":"new-secret"}"#).unwrap();
+        let merged = merge_configuration(
+            &imported.client_id,
+            &imported.client_secret,
+            imported.proxy.as_deref(),
+            Some(&saved),
+            &environment,
+        )
+        .unwrap();
+        assert_eq!(merged.client_id, "new-id");
+        assert_eq!(merged.proxy.as_deref(), Some("http://localhost:8888"));
+        let direct = parse_credential_file(
+            br#"{"clientId":"new-id","clientSecret":"new-secret","proxy":""}"#,
+        )
+        .unwrap();
+        let merged = merge_configuration(
+            &direct.client_id,
+            &direct.client_secret,
+            direct.proxy.as_deref(),
+            Some(&saved),
+            &environment,
+        )
+        .unwrap();
+        assert!(merged.proxy.is_none());
+        let status = serde_json::to_string(&Status {
+            managed: None,
+            configured: true,
+            proxy: false,
+            message: "Импорт завершён".into(),
+        })
+        .unwrap();
+        assert!(
+            !status.contains("new-id")
+                && !status.contains("new-secret")
+                && !status.contains("clientId")
+        );
+    }
+
+    #[test]
+    fn selected_credential_file_is_bounded_and_left_untouched() {
+        let path = std::env::temp_dir().join(format!(
+            "pulse-sc-credentials-test-{}.json",
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
+        let bytes = br#"{"clientId":"fixture-id","clientSecret":"fixture-private-secret"}"#;
+        std::fs::write(&path, bytes).unwrap();
+        let imported = read_credential_file(&path).unwrap();
+        assert_eq!(imported.client_id, "fixture-id");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_CREDENTIAL_FILE_BYTES as u64 + 1).unwrap();
+        drop(file);
+        assert!(read_credential_file(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(read_credential_file(&path.with_extension("txt")).is_err());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn credential_picker_fixture_requires_an_independent_existing_profile() {
+        let profile = std::env::temp_dir();
+        let file = profile.join("soundcloud-qa-credentials.json");
+        let choice = Some(file.clone().into_os_string());
+        assert!(qa_credential_file_selection(
+            "ru.vkplayer.desktop",
+            Some(&profile),
+            choice.clone()
+        )
+        .is_none());
+        assert!(qa_credential_file_selection(
+            "ru.vkplayer.independentqa",
+            None,
+            choice.clone()
+        )
+        .is_none());
+        assert!(qa_credential_file_selection(
+            "ru.vkplayer.independentqa",
+            Some(Path::new("relative-qa-profile")),
+            choice.clone()
+        )
+        .is_none());
+        assert_eq!(
+            qa_credential_file_selection("ru.vkplayer.independentqa", Some(&profile), None),
+            None
+        );
+        assert_eq!(
+            qa_credential_file_selection(
+                "ru.vkplayer.independentqa",
+                Some(&profile),
+                Some(std::ffi::OsString::new())
+            ),
+            Some(None)
+        );
+        assert_eq!(
+            qa_credential_file_selection("ru.vkplayer.independentqa", Some(&profile), choice),
+            Some(Some(file))
+        );
     }
 
     fn binding(account: i64) -> Binding {
@@ -872,22 +1204,58 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("selection");
         let legacy: Binding = serde_json::from_value(legacy).unwrap();
         assert!(matches!(legacy.selection, SourceSelection::User));
-        let automatic = Binding { selection: SourceSelection::Metadata, ..row };
-        let restored: Binding = serde_json::from_str(&serde_json::to_string(&automatic).unwrap()).unwrap();
+        let automatic = Binding {
+            selection: SourceSelection::Metadata,
+            ..row
+        };
+        let restored: Binding =
+            serde_json::from_str(&serde_json::to_string(&automatic).unwrap()).unwrap();
         assert!(matches!(restored.selection, SourceSelection::Metadata));
-        let public = serde_json::to_value(SelectedCandidate { candidate: restored.candidate, selection: restored.selection }).unwrap();
+        let public = serde_json::to_value(SelectedCandidate {
+            candidate: restored.candidate,
+            selection: restored.selection,
+        })
+        .unwrap();
         assert_eq!(public["selection"], "metadata");
         assert_eq!(public["id"], "123");
     }
     #[test]
     fn automatic_proposals_never_overwrite_a_concurrent_explicit_account_choice() {
         let rows = vec![binding(10)];
-        assert!(manual_binding_conflict(&rows, 10, "vk:10:20", SourceSelection::Metadata));
-        assert!(!manual_binding_conflict(&rows, 10, "vk:10:20", SourceSelection::User));
-        assert!(!manual_binding_conflict(&rows, 20, "vk:10:20", SourceSelection::Metadata));
-        assert!(!manual_binding_conflict(&rows, 10, "vk:10:21", SourceSelection::Metadata));
-        let rows = vec![Binding { selection: SourceSelection::Metadata, ..binding(10) }];
-        assert!(!manual_binding_conflict(&rows, 10, "vk:10:20", SourceSelection::Metadata));
+        assert!(manual_binding_conflict(
+            &rows,
+            10,
+            "vk:10:20",
+            SourceSelection::Metadata
+        ));
+        assert!(!manual_binding_conflict(
+            &rows,
+            10,
+            "vk:10:20",
+            SourceSelection::User
+        ));
+        assert!(!manual_binding_conflict(
+            &rows,
+            20,
+            "vk:10:20",
+            SourceSelection::Metadata
+        ));
+        assert!(!manual_binding_conflict(
+            &rows,
+            10,
+            "vk:10:21",
+            SourceSelection::Metadata
+        ));
+        let rows = vec![Binding {
+            selection: SourceSelection::Metadata,
+            ..binding(10)
+        }];
+        assert!(!manual_binding_conflict(
+            &rows,
+            10,
+            "vk:10:20",
+            SourceSelection::Metadata
+        ));
     }
 
     #[test]

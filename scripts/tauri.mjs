@@ -4,11 +4,13 @@ import { copyFile, mkdir, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadGatewayOrigin } from './pulse-service-config.mjs';
 await import('./prepare-web-audio.mjs');
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const cargoBin = path.join(os.homedir(), '.cargo', 'bin');
 const env = { ...process.env };
+env.PULSE_GATEWAY_URL = await loadGatewayOrigin(root, env);
 if (existsSync(cargoBin)) env.PATH = `${cargoBin}${path.delimiter}${env.PATH || env.Path || ''}`;
 // Keep compiler artifacts outside Documents, where Windows folder protection
 // can reject rename operations performed by Rust's incremental compiler.

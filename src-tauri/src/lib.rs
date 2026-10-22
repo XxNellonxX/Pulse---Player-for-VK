@@ -19,6 +19,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 mod audio_session;
+mod gateway_client;
+mod catalog_watch;
 mod equalizer;
 mod local_audio;
 mod media_prepare;
@@ -1714,6 +1716,8 @@ pub fn run() {
             get_state,
             soundcloud_player::soundcloud_status,
             soundcloud_player::configure_soundcloud,
+            soundcloud_player::import_soundcloud_credentials,
+            soundcloud_player::check_soundcloud_connection,
             soundcloud_player::search_soundcloud,
             soundcloud_player::resolve_soundcloud_candidate,
             soundcloud_player::bind_soundcloud,
@@ -1721,6 +1725,10 @@ pub fn run() {
             soundcloud_player::resolve_soundcloud,
             soundcloud_player::release_soundcloud,
             musicbrainz_catalog::search_catalog_artists,
+            catalog_watch::catalog_watch_status,
+            catalog_watch::catalog_set_followed,
+            catalog_watch::catalog_refresh,
+            catalog_watch::catalog_cancel_refresh,
             musicbrainz_catalog::get_catalog_artist,
             musicbrainz_catalog::status_catalog_route,
             musicbrainz_catalog::configure_catalog_route,

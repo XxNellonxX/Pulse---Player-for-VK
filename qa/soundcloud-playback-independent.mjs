@@ -17,6 +17,8 @@ const mockHls = `export default class Hls {
   stopLoad(){this.stops++;this.loading=false;}
   destroy(){this.destroyed=true;this.loading=false;}
   fatal(){this.handlers.get('error')?.('error',{fatal:true,type:'networkError',details:'fragLoadError'});}
+  expired(){this.handlers.get('error')?.('error',{fatal:false,type:'networkError',details:'fragLoadError',response:{code:410}});}
+  retryable(){this.handlers.get('error')?.('error',{fatal:false,type:'networkError',details:'fragLoadError',response:{code:503}});}
 }`;
 async function run(name, options, action) {
   const page = await browser.newPage(); const errors = []; page.setDefaultTimeout(2500);
@@ -28,6 +30,9 @@ async function run(name, options, action) {
     await page.evaluate(async () => { const runtime = (await import('/@react-refresh')).default; runtime.injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => type => type; window.__vite_plugin_react_preamble_installed__ = true; });
     await page.evaluate(async options => {
       window.__audios=[];window.__engines=[];window.__controls=[];window.__releases=[];window.__resolveCalls=[];window.__listeners=new Set();window.__gates=[];window.__holdMedia=options.holdMedia===true;window.__actions={};
+      // Virtual monotonic time is used only for actual-hook TTL budget tests.
+      // Media decode/network/MSE are synthetic, so these do not prove live HLS.
+      if(options.virtualClock){window.__clock=performance.now();Object.defineProperty(performance,'now',{configurable:true,value:()=>window.__clock});}
       Object.defineProperty(navigator,'mediaSession',{configurable:true,value:{metadata:null,setActionHandler:(name,fn)=>window.__actions[name]=fn}});
       window.Audio=class extends EventTarget {
         constructor(){super();Object.assign(this,{paused:true,error:null,currentTime:0,duration:180,readyState:0,networkState:2,src:'',volume:0,plays:0,buffered:{length:1,start:()=>0,end:()=>180}});window.__audios.push(this);}
@@ -56,6 +61,9 @@ async function run(name, options, action) {
   } finally {await page.close();}
 }
 const start=async page=>{await page.evaluate(()=>window.__playback.playTrack('a'));await page.waitForFunction(()=>window.__engines.length===1);};
+const expire=async page=>page.evaluate(()=>window.__engines.at(-1).expired());
+const renewed=async(page,count=2)=>page.waitForFunction(count=>window.__resolveCalls.length===count&&window.__engines.length===count&&window.__playback.playing,count);
+const healthy=async(page,seconds)=>page.evaluate(seconds=>{for(let n=0;n<seconds;n++){window.__clock+=1000;const audio=window.__audios.at(-1);audio.currentTime+=1;audio.dispatchEvent(new Event('timeupdate'));}},seconds);
 try {
   await run('saved source plays with original VK library identity and visible source label',{},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);
@@ -183,6 +191,73 @@ try {
     await page.evaluate(()=>window.__audios.at(-1).dispatchEvent(new Event('ended')));await page.waitForTimeout(60);
     assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'a');
     assert.equal(await page.evaluate(()=>window.__audios.some(a=>!a.paused)),false);
+  });
+  await run('a nonfatal HLS 410 renews immediately on the exact track and preserves its media offset',{virtualClock:true,autoSkip:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);
+    await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=37;audio.dispatchEvent(new Event('timeupdate'));});
+    await expire(page);await renewed(page);
+    assert.deepEqual(await page.evaluate(()=>({id:window.__state.currentTrackId,position:window.__audios.at(-1).currentTime,resolves:window.__resolveCalls.map(item=>item.id),vk:window.__controls.filter(item=>item.operation==='play').length})),{id:'a',position:37,resolves:['a','a'],vk:0});
+  });
+  await run('30 seconds of renewed actual media-clock progress permit a later separate expiry renewal',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);
+    await healthy(page,30);await expire(page);await renewed(page,3);
+    assert.deepEqual(await page.evaluate(()=>({ids:window.__resolveCalls.map(item=>item.id),position:window.__audios.at(-1).currentTime,playing:window.__audios.filter(item=>!item.paused).length,vk:window.__controls.filter(item=>item.operation==='play').length})),{ids:['a','a','a'],position:30,playing:1,vk:0});
+  });
+  await run('29 seconds of media progress cannot replenish the one-renewal failure budget',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);await healthy(page,29);await expire(page);
+    await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:29}]);
+  });
+  await run('seeking with a large playhead jump cannot manufacture 30 seconds of healthy audio',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);await healthy(page,20);
+    await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.seeking=true;audio.dispatchEvent(new Event('seeking'));window.__clock+=31000;window.__playback.seek(120);audio.dispatchEvent(new Event('timeupdate'));audio.seeking=false;audio.dispatchEvent(new Event('seeked'));});
+    await healthy(page,5);await expire(page);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);assert.equal(await page.evaluate(()=>window.__controls.find(item=>item.operation==='play').position),125);
+  });
+  await run('an unannounced media-clock jump cannot refill the renewal budget',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);
+    await page.evaluate(()=>{window.__clock+=1000;const audio=window.__audios.at(-1);audio.currentTime=100;audio.dispatchEvent(new Event('timeupdate'));});
+    await expire(page);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
+  });
+  await run('repeated retryable HLS errors do not themselves refill the budget',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);
+    await page.evaluate(()=>{for(let n=0;n<40;n++){window.__clock+=1000;window.__engines.at(-1).retryable();}});
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);await expire(page);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
+  });
+  await run('buffering interruption resets partial healthy progress instead of joining two short streaks',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);await healthy(page,29);
+    await page.evaluate(()=>{window.__audios.at(-1).dispatchEvent(new Event('waiting'));window.__clock+=60000;window.__audios.at(-1).dispatchEvent(new Event('playing'));});
+    await healthy(page,2);await expire(page);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
+  });
+  await run('paused wall time cannot refill the renewal budget or cause a paused 410 to restart',{virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);await healthy(page,29);await page.evaluate(()=>window.__playback.toggle());
+    await page.evaluate(()=>{window.__clock+=60000;window.__engines.at(-1).expired();});await page.waitForTimeout(30);
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);
+    await page.evaluate(()=>window.__playback.toggle());await page.waitForFunction(()=>window.__playback.playing);await healthy(page,2);await expire(page);
+    await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
+  });
+  await run('410 from a disposed engine cannot spend or replenish the current source budget',{virtualClock:true,autoSkip:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await renewed(page);
+    await page.evaluate(()=>window.__engines[0].expired());await page.waitForTimeout(30);
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);assert.equal(await page.evaluate(()=>window.__playback.playing),true);
+    await page.evaluate(()=>window.__playback.playTrack('b'));await page.waitForFunction(()=>window.__state.currentTrackId==='b'&&window.__playback.playing);
+    await page.evaluate(()=>{window.__engines[0].expired();window.__engines[1].expired();});await page.waitForTimeout(30);
+    assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'b');assert.equal(await page.evaluate(()=>window.__resolveCalls.length),3);
+  });
+  await run('pause during nonfatal 410 renewal invalidates its late grant and releases only that source',{holdSecondResolve:true,virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await page.waitForFunction(()=>window.__gates.length===1);
+    await page.evaluate(()=>window.__playback.toggle());await page.evaluate(()=>window.__gates.shift()());await page.waitForTimeout(30);
+    assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'a');
+    assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-2/0'))),true);
+  });
+  await run('track switch during nonfatal 410 renewal keeps the new source when the old grant completes',{holdSecondResolve:true,virtualClock:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await expire(page);await page.waitForFunction(()=>window.__gates.length===1);
+    await page.evaluate(()=>window.__playback.playTrack('b'));await page.waitForFunction(()=>window.__state.currentTrackId==='b'&&window.__playback.playing);
+    await page.evaluate(()=>window.__gates.shift()());await page.waitForTimeout(30);
+    assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'b');assert.equal(await page.evaluate(()=>window.__audios.filter(item=>!item.paused).length),1);
+    assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-2/0'))),true);assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-3/0'))),false);
   });
   console.log(JSON.stringify({summary:results}));if(results.some(r=>!r.ok))process.exitCode=1;
 } finally {await browser.close();}

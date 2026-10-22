@@ -69,23 +69,23 @@
 .catalog-error { display: flex; align-items: center; gap: 16px; }
 .catalog-error > span { flex: 1; overflow-wrap: anywhere; }
 .catalog-error button { font-size: 12px; flex: none; }
-.catalog-route-settings { margin: -6px 0 24px; color: var(--muted); border-bottom: 1px solid var(--line); font-size: 11px; }
-.catalog-route-settings > summary { display: flex; align-items: center; gap: 8px; padding: 10px 0 13px; cursor: pointer; list-style: none; }
-.catalog-route-settings > summary::-webkit-details-marker { display: none; }
-.catalog-route-settings > summary > small { margin-left: auto; color: var(--subtle); font-size: 10px; }
-.catalog-route-settings > summary > svg { flex: none; }
-.catalog-route-settings[open] > summary > svg:last-child { transform: rotate(180deg); }
-.catalog-route-settings > div { padding: 0 0 16px; }
-.catalog-route-settings p { font-size: 11px; line-height: 1.65; margin: 0 0 11px; }
-.catalog-route-settings form { display: flex; align-items: end; gap: 9px; flex-wrap: wrap; margin-bottom: 10px; }
-.catalog-route-settings label { display: grid; gap: 6px; flex: 1; min-width: 190px; }
-.catalog-route-settings input { min-width: 0; width: 100%; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; color: var(--text); font-size: 12px; }
-.catalog-route-settings input:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
-.catalog-route-settings form > button { font-size: 11px; padding: 10px 12px; }
-.catalog-route-settings > div > small { color: var(--subtle); font-size: 10px; line-height: 1.7; display: block; }
-.catalog-route-settings .catalog-route-status { margin: 10px 0 0; color: var(--muted); }
-.catalog-route-error { color: var(--danger, var(--text)); margin: 10px 0 0 !important; }
-.catalog-direct-button { border: 0; background: none; color: var(--accent-fg, var(--accent)); cursor: pointer; }
+.catalog-tabs { display: inline-flex; align-items: center; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); margin-bottom: 22px; }
+.catalog-tabs > button { display: inline-flex; align-items: center; gap: 7px; padding: 9px 13px; background: transparent; color: var(--muted); border: none; border-radius: 7px; cursor: pointer; font-size: 12px; }
+.catalog-tabs > button.active { color: var(--text); background: var(--panel-3); }
+.catalog-tabs > button > span { font-size: 10px; background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); color: var(--accent-fg, var(--accent)); border-radius: 12px; padding: 2px 5px; }
+.catalog-follow-button { display: flex; align-items: center; gap: 7px; font-size: 12px !important; margin-top: 16px; }
+.catalog-updates .catalog-section-title { margin-top: 0; align-items: center; }
+.catalog-updates .catalog-release-note { border-top: none; padding-top: 0; margin-bottom: 20px; }
+.catalog-followed-list { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 24px; }
+.catalog-followed-list > button { display: inline-flex; align-items: center; gap: 7px; max-width: 210px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 20px; background: var(--panel); color: var(--text); cursor: pointer; font-size: 11px; }
+.catalog-followed-list > button > svg { flex: none; color: var(--accent-fg, var(--accent)); }
+.catalog-followed-list > button > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.catalog-update-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin: 24px 0 15px; }
+.catalog-update-heading h3 { margin: 0; font-size: 18px; letter-spacing: -.02em; }
+.catalog-update-heading label { display: inline-flex; align-items: center; gap: 8px; font-size: 11px; color: var(--muted); max-width: 100%; }
+.catalog-update-heading select { color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; max-width: 190px; font: inherit; }
+.catalog-update-artist { text-align: left; border: 0; padding: 0; color: var(--accent-fg, var(--accent)); background: none; cursor: pointer; font-size: 11px !important; }
+.catalog-update-artist:hover { text-decoration: underline; }
 @media (max-width: 1100px) {
   .catalog-artists { grid-template-columns: 1fr; }
   .catalog-artist-hero { gap: 20px; }

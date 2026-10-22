@@ -6,12 +6,23 @@ import type { DesktopAPI, DesktopCommand, Track, PersistedState, VkSnapshot, VkW
 if (isTauri()) {
   const track = (value: Track): Track => value.source === 'local' && !/^(asset:|https?:)/.test(value.url) ? { ...value, url: convertFileSrc(value.url) } : value
   const api: DesktopAPI = {
+    catalogWatchStatus: () => invoke('catalog_watch_status'),
+    setCatalogFollowed: (id, followed) => invoke('catalog_set_followed', { id, followed }),
+    refreshCatalog: () => invoke('catalog_refresh'),
+    cancelCatalogRefresh: () => invoke('catalog_cancel_refresh'),
+    onCatalogUpdate(callback) {
+      let disposed = false;
+      const pending = listen<import('./shared/catalog').CatalogWatchState>('catalog:updates', event => { if (!disposed) callback(event.payload) });
+      return () => { disposed = true; void pending.then(unlisten => unlisten()).catch(() => {}) };
+    },
     searchCatalogArtists: (query, offset = 0) => invoke('search_catalog_artists', { query, offset }),
     getCatalogArtist: (id, offset = 0) => invoke('get_catalog_artist', { id, offset }),
     statusCatalogRoute: () => invoke('status_catalog_route'),
     configureCatalogRoute: proxy => invoke('configure_catalog_route', { proxy }),
     soundCloudStatus: () => invoke('soundcloud_status'),
     configureSoundCloud: input => invoke('configure_soundcloud', { proxy: null, ...input }),
+    importSoundCloudCredentials: () => invoke('import_soundcloud_credentials'),
+    checkSoundCloudConnection: () => invoke('check_soundcloud_connection'),
     searchSoundCloud: async query => {
       const page = await invoke<{ items: import('./shared/sourceMatching').SoundCloudCandidate[]; nextHref?: string }>('search_soundcloud', { query })
       return { collection: page.items, hasMore: Boolean(page.nextHref) }

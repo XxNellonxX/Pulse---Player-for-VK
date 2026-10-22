@@ -21,6 +21,7 @@ jobs:
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
       PULSE_IMPORT_ARCH: ${{ matrix.arch }}
+      PULSE_GATEWAY_URL: ${{ vars.PULSE_GATEWAY_URL }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,6 +34,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run test:gateway
       - run: node --test qa/*.node.mjs
       - run: npm run prepare:imports
       - run: npm run tauri -- build --target ${{ matrix.target }} --bundles app,dmg --config src-tauri/tauri.macos.conf.json

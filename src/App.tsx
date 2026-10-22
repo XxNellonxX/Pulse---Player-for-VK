@@ -98,6 +98,18 @@ function App() {
   })
   const restrictedNotices = useRef(new Set<string>())
   useEffect(() => {
+    if (!ready || !window.desktop?.refreshCatalog) return;
+    let disposed = false;
+    const refresh = () => { if (!disposed && navigator.onLine !== false) void window.desktop?.refreshCatalog?.().catch(() => {}); };
+    const offline = () => { void window.desktop?.cancelCatalogRefresh?.().catch(() => {}); };
+    const start = setTimeout(refresh, 5000);
+    // The native scheduler decides when a provider request is due, including
+    // its backoff. This cheap wakeup also resumes a batch larger than 20 artists.
+    const timer = setInterval(refresh, 60 * 1000);
+    window.addEventListener('online', refresh); window.addEventListener('offline', offline);
+    return () => { disposed = true; clearTimeout(start); clearInterval(timer); window.removeEventListener('online', refresh); window.removeEventListener('offline', offline); offline(); };
+  }, [ready])
+  useEffect(() => {
     if (!ready || !vkStatus?.user?.id) return
     const restricted = state.playlists.filter(playlist => playlist.contentUnavailable)
     const key = `${vkStatus.user.id}:${restricted.map(item => item.id).sort().join(',')}`

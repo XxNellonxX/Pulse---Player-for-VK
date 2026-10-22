@@ -38,3 +38,27 @@ export type CatalogArtistPage = {
   stale: boolean;
   fetchedAt: number;
 };
+
+export type CatalogWatchedArtist = {
+  artist: CatalogArtistSummary;
+  followed: boolean;
+  openedAt: number;
+  lastCheckedAt?: number;
+};
+
+export type CatalogReleaseUpdate = {
+  artist: CatalogArtistSummary;
+  release: CatalogRelease;
+  discoveredAt: number;
+};
+
+/** Local metadata subscriptions; discoveries are not verified release announcements. */
+export type CatalogWatchState = {
+  artists: CatalogWatchedArtist[];
+  updates: CatalogReleaseUpdate[];
+  refreshing: boolean;
+  revision?: number;
+  lastRefreshAt?: number;
+  nextRefreshAt?: number;
+  error?: string;
+};

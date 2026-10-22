@@ -115,8 +115,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     if (!id || !externalUrl.current || !playIntent.current || externalRecovery.current.id !== id || externalRecovery.current.bypass) return false
     const element = audio.current
     const position = element && element.readyState >= HTMLMediaElement.HAVE_METADATA && Number.isFinite(element.currentTime) ? element.currentTime : stateRef.current.position
-    // Refresh an expired grant once for this exact recording, then try the
-    // original VK item once. Neither transition changes the library identity.
+    // Allow one renewal per failure streak for this exact recording. Healthy
+    // media-clock progress replenishes the budget for a later grant expiry.
     if (externalRecovery.current.renewals === 0) externalRecovery.current.renewals = 1
     else {
       externalRecovery.current.bypass = true
@@ -297,6 +297,9 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
     let lastSaved = 0
     let lastProgress = 0
+    let lastClockAt = performance.now()
+    let healthyExternalSeconds = 0
+    const resetExternalClock = () => { healthyExternalSeconds = 0; lastClockAt = performance.now(); lastProgress = element.currentTime }
     const updateBuffer = () => {
       if (isWebTrack()) return
       const ranges = readMediaBuffered(element)
@@ -308,6 +311,14 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const update = () => {
       if (isWebTrack()) return
       if (snippetReady.current && snippetRef.current?.id === stateRef.current.currentTrackId && element.currentTime >= snippetRef.current.to - .05) { finishSnippet(); return }
+      const elapsed = Math.max(0, (performance.now() - lastClockAt) / 1000)
+      const advanced = element.currentTime - lastProgress
+      if (externalUrl.current && playIntent.current && !element.paused && !element.seeking && advanced > .01 && advanced <= elapsed * 1.5 + .5) {
+        // A seek or a long paused clock must not manufacture successful audio.
+        healthyExternalSeconds += Math.min(advanced, elapsed)
+        if (healthyExternalSeconds >= 30 && externalRecovery.current.id === stateRef.current.currentTrackId) externalRecovery.current.renewals = 0
+      } else healthyExternalSeconds = 0
+      lastClockAt = performance.now()
       if (!element.paused && !element.seeking && element.currentTime > lastProgress + .01) {
         if (stallTimer.current) clearTimeout(stallTimer.current)
         stallTimer.current = null; setBuffering(false)
@@ -351,24 +362,27 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     on('timeupdate', update)
     on('progress', updateBuffer)
     on('durationchange', updateBuffer)
-    on('seeking', updateBuffer)
-    on('seeked', updateBuffer)
+    on('seeking', () => { resetExternalClock(); updateBuffer() })
+    on('seeked', () => { resetExternalClock(); updateBuffer() })
     on('loadedmetadata', () => {
       setDuration(Number.isFinite(element.duration) ? element.duration : 0)
       const savedPosition = stateRef.current.position
       if (savedPosition > 0 && savedPosition < element.duration) element.currentTime = savedPosition
       lastProgress = element.currentTime
+      resetExternalClock()
       updateBuffer()
     })
     const recovered = () => { if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null; pendingStart.current = false; setBuffering(false); updateBuffer() }
     const waiting = () => {
       if (!playIntent.current) return
+      resetExternalClock()
       setBuffering(true)
       if (!isWebTrack()) setNetwork(ownedSourceId.current !== stateRef.current.currentTrackId && navigator.onLine === false ? 'offline' : 'stalled')
       if (!stallTimer.current) stallTimer.current = setTimeout(() => { stallTimer.current = null; if (playIntent.current && !element.ended) failed() }, 15000)
     }
-    on('playing', () => { if (!playIntent.current) { element.pause(); return }; recovered(); setPlaying(true); setError('') })
+    on('playing', () => { if (!playIntent.current) { element.pause(); return }; resetExternalClock(); recovered(); setPlaying(true); setError('') })
     on('pause', () => {
+      resetExternalClock()
       setPlaying(false)
       if (loadedId.current === stateRef.current.currentTrackId && !isWebTrack() && Number.isFinite(element.currentTime)) {
         setState(previous => previous.position === element.currentTime ? previous : { ...previous, position: element.currentTime })
@@ -495,7 +509,11 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         if (HlsEngine?.isSupported()) {
           const engine = new HlsEngine({ enableWorker: false, autoStartLoad: playIntent.current, maxBufferLength: 90, maxMaxBufferLength: 120, backBufferLength: 20, maxBufferSize: 8 * 1024 * 1024 })
           externalHls.current = engine
-          engine.on(HlsEngine.Events.ERROR, (_, detail) => { if (detail.fatal && audio.current === element && sourceVersion.current === version && playIntent.current) element.dispatchEvent(new Event('error')) })
+          engine.on(HlsEngine.Events.ERROR, (_, detail) => {
+            // An expired service capability cannot succeed by retrying its old
+            // URL. Obtain a fresh grant immediately and keep the saved offset.
+            if ((detail.fatal || detail.response?.code === 410) && externalHls.current === engine && audio.current === element && sourceVersion.current === version && playIntent.current) element.dispatchEvent(new Event('error'))
+          })
           engine.attachMedia(element); engine.loadSource(resolved.url)
         } else { element.src = resolved.url; element.load() }
         const shouldStart = playIntent.current

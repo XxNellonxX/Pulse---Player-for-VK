@@ -1,0 +1,43 @@
+services:
+  gateway:
+    build: .
+    image: pulse-gateway:local
+    restart: unless-stopped
+    # Linux VPS only: app and Caddy share loopback; no app port is published.
+    network_mode: host
+    env_file: .env
+    environment:
+      HOST: 127.0.0.1
+      PORT: 8080
+      TRUST_LOOPBACK_PROXY: "true"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    mem_limit: 384m
+    cpus: 1.0
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PULSE_DOMAIN: ${PULSE_DOMAIN:?Set PULSE_DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options: {max-size: "5m", max-file: "2"}
+volumes:
+  caddy_data:
+  caddy_config:

@@ -12,7 +12,8 @@ await page.addInitScript(() => {
   const summary = (id, name, country) => ({ id, name, sortName: name, disambiguation: country === 'RU' ? 'Советская рок-группа' : 'Одноимённый исполнитель', kind: country === 'RU' ? 'Group' : 'Person', country });
   const first = summary('artist-a', 'Кино', 'RU'), second = summary('artist-b', 'Кино', 'US');
   const mock = window.__catalogUi = {
-    searches: [], artists: [], links: [], routes: [], proxy: false, holdSearch: false, holdArtist: false,
+    searches: [], artists: [], links: [], routeReads: 0, holdSearch: false, holdArtist: false, listeners: new Set(), follows: [],
+    watch: { artists: [{ artist: first, followed: false, openedAt: 1 }, { artist: second, followed: false, openedAt: 1 }], updates: [], refreshing: false, revision: 0 },
     state: { version: 1, tracks: [], playlists: [], history: [], queue: [], currentTrackId: null, position: 0, settings: {} },
     searchResult: (offset = 0) => ({ artists: offset ? [summary('artist-c', 'Kino', 'DE')] : [first, second], offset, hasMore: !offset, stale: false, fetchedAt: Date.UTC(2026, 9, 22) }),
     artistResult: (id, offset = 0) => ({
@@ -43,8 +44,12 @@ await page.addInitScript(() => {
       return mock.artistResult(id, offset);
     },
     openExternal: async url => { mock.links.push(url); },
-    statusCatalogRoute: async () => ({ proxy: mock.proxy, available: true, message: mock.proxy ? 'Прокси каталога настроен.' : 'Каталог подключается напрямую.' }),
-    configureCatalogRoute: async proxy => { mock.routes.push(proxy); mock.proxy = Boolean(proxy); },
+    statusCatalogRoute: async () => { mock.routeReads++; throw new Error('Public catalog must never read proxy configuration'); },
+    catalogWatchStatus: async () => mock.watch,
+    onCatalogUpdate: callback => { mock.listeners.add(callback); return () => mock.listeners.delete(callback); },
+    setCatalogFollowed: async (id, followed) => { mock.follows.push({ id, followed }); mock.watch = { ...mock.watch, revision: mock.watch.revision + 1, artists: mock.watch.artists.map(item => item.artist.id === id ? { ...item, followed } : item), updates: followed ? mock.watch.updates : mock.watch.updates.filter(item => item.artist.id !== id) }; for (const callback of mock.listeners) callback(mock.watch); return mock.watch; },
+    refreshCatalog: async () => mock.watch,
+    cancelCatalogRefresh: async () => mock.watch,
   };
 });
 
@@ -131,25 +136,28 @@ try {
   await view.getByRole('heading', { name: 'Группа крови', exact: true }).waitFor();
   await view.getByRole('button', { name: 'К результатам поиска', exact: true }).click();
   await view.getByText('Запрос: Новый запрос', { exact: true }).waitFor();
-  await page.evaluate(() => { window.__catalogUi.holdSearch = true; window.__catalogUi.finishSearch = null; });
-  await search('Запрос до смены маршрута');
-  await page.waitForFunction(() => Boolean(window.__catalogUi.finishSearch));
-  await view.locator('.catalog-route-settings > summary').click();
-  await view.getByText('Ключи SoundCloud не нужны.', { exact: false }).waitFor();
-  const proxyInput = view.getByLabel('Прокси для MusicBrainz', { exact: true });
-  await proxyInput.fill('http://fixture-user:fixture-secret@proxy.example:8080');
-  assert.equal(await proxyInput.getAttribute('type'), 'password');
-  await view.getByRole('button', { name: 'Сохранить', exact: true }).click();
-  await view.getByText('Подключение сохранено. Повторите поиск, чтобы проверить выбранный маршрут.', { exact: true }).waitFor();
-  assert.equal(await proxyInput.inputValue(), '', 'Proxy credentials must clear after submission');
-  assert.equal((await page.locator('body').innerText()).includes('fixture-secret'), false, 'Saved secret must not be displayed');
-  assert.deepEqual(await page.evaluate(() => window.__catalogUi.routes), ['http://fixture-user:fixture-secret@proxy.example:8080']);
-  await page.evaluate(() => window.__catalogUi.finishSearch(window.__catalogUi.searchResult()));
-  assert.equal(await view.locator('.catalog-artist-card').count(), 0, 'Changing the route must discard a pending old-route response');
-  await view.getByRole('button', { name: 'Подключаться напрямую', exact: true }).click();
-  await view.getByText('Каталог подключается напрямую.', { exact: true }).waitFor();
-  assert.deepEqual(await page.evaluate(() => window.__catalogUi.routes), ['http://fixture-user:fixture-secret@proxy.example:8080', '']);
-  assert.equal(await page.getByText('VK не подключён', { exact: true }).count(), 1, 'Catalog route must work without VK or SoundCloud API credentials');
+  assert.equal(await view.locator('.catalog-route-settings').count(), 0, 'Public catalog must not expose technical proxy settings');
+  assert.equal(await page.evaluate(() => window.__catalogUi.routeReads), 0, 'Catalog searches must not depend on a route configuration IPC');
+  await view.locator('.catalog-artist-card').first().click();
+  await view.getByRole('button', { name: 'Следить за релизами', exact: true }).click();
+  await view.getByRole('button', { name: 'Вы следите', exact: true }).waitFor();
+  await view.getByRole('button', { name: 'Обновления', exact: true }).click();
+  await view.getByRole('heading', { name: 'Пока без обнаруженных записей', exact: true }).waitFor();
+  await page.evaluate(() => { const mock = window.__catalogUi; mock.watch = { ...mock.watch, revision: mock.watch.revision + 1, updates: [{ artist: mock.watch.artists[0].artist, release: { id: 'discovery-1', title: 'Новая запись в каталоге', firstReleaseDate: '2099', primaryType: 'Single', secondaryTypes: [] }, discoveredAt: Date.now() }] }; for (const callback of mock.listeners) callback(mock.watch); });
+  await view.getByRole('heading', { name: 'Новая запись в каталоге', exact: true }).waitFor();
+  await view.getByText('Будущая дата в каталоге', { exact: true }).waitFor();
+  await page.setViewportSize({ width: 960, height: 800 });
+  await view.locator('.catalog-updates').scrollIntoViewIfNeeded();
+  await page.screenshot({ path: 'tmp/catalog-updates-960.png' });
+  assert.equal(await page.evaluate(() => document.querySelector('.content-scroll').scrollWidth > document.querySelector('.content-scroll').clientWidth + 1), false);
+  await page.setViewportSize({ width: 1360, height: 940 });
+  await view.getByRole('button', { name: 'Кино', exact: true }).first().click();
+  await view.getByRole('button', { name: 'Вы следите', exact: true }).click();
+  await view.getByRole('button', { name: 'Следить за релизами', exact: true }).waitFor();
+  await view.getByRole('button', { name: 'Обновления', exact: true }).click();
+  await view.getByRole('heading', { name: 'Выберите своих артистов', exact: true }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.__catalogUi.follows), [{ id: 'artist-a', followed: true }, { id: 'artist-a', followed: false }]);
+  assert.equal(await view.locator('.catalog-release').count(), 0, 'Unfollow removes that artist from metadata discovery notifications');
   assert.deepEqual(errors, []);
-  console.log('PASS: full App MusicBrainz nav, guest Unicode search, artist identity, pagination, stale/future labels, safe links, 960px layout, late results, VK search integration, back/forward route restoration, masked catalog-only proxy settings and old-route cancellation without provider API keys.');
+  console.log('PASS: full App MusicBrainz nav, guest Unicode search, artist identity, pagination, stale/future labels, safe links, 960px layout, late results, VK search integration, back/forward route restoration, public UI without proxy configuration, local follow/unfollow, live metadata discoveries and 960px updates layout.');
 } finally { await browser.close(); }

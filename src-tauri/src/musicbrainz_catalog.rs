@@ -179,6 +179,7 @@ struct ProfileCache {
 }
 
 struct MusicBrainzCatalog {
+    gateway: Option<crate::gateway_client::Gateway>,
     client: Client,
     cache: Arc<Mutex<Option<ProfileCache>>>,
 }
@@ -203,7 +204,7 @@ impl MusicBrainzCatalog {
                 .proxy(reqwest::Proxy::all(proxy).map_err(|_| CatalogError::InvalidRequest)?);
         }
         let client = builder.build().map_err(|_| CatalogError::Network)?;
-        Ok(Self { client, cache })
+        Ok(Self { client, cache, gateway: crate::gateway_client::Gateway::configured().map_err(|_|CatalogError::InvalidRequest)? })
     }
 
     fn cached(&self, path: &Path, key: &str, now: i64) -> Option<CachedPage> {
@@ -291,6 +292,14 @@ impl MusicBrainzCatalog {
 
     async fn request(&self, url: Url) -> Result<Value, CatalogError> {
         validate_api_url(&url)?;
+        if let Some(gateway) = &self.gateway {
+            let target = gateway.musicbrainz_url(&url).map_err(|_|CatalogError::InvalidRequest)?;
+            wait_for_slot(&RATE_GATE, REQUEST_INTERVAL).await;
+            return gateway.json(target).await.map_err(|status| match status {
+                404 => CatalogError::NotFound, 429 => CatalogError::RateLimited,
+                503 => CatalogError::Upstream, _ => CatalogError::Network,
+            });
+        }
         timeout(Duration::from_secs(20), async {
             wait_for_slot(&RATE_GATE, REQUEST_INTERVAL).await;
             let response = self
@@ -359,12 +368,16 @@ impl MusicBrainzCatalog {
     }
 
     async fn artist(&self, path: &Path, id: &str, offset: u32) -> Result<ArtistPage, CatalogError> {
+        self.artist_with_refresh(path, id, offset, false).await
+    }
+
+    async fn artist_with_refresh(&self, path: &Path, id: &str, offset: u32, force: bool) -> Result<ArtistPage, CatalogError> {
         let id = uuid(id)?;
         validate_offset(offset)?;
         let key = format!("artist:{id}:{offset}");
         let cached = self.cached(path, &key, crate::now());
         if let Some(CachedPage::Artist(page)) = cached.as_ref().filter(|page| {
-            fresh(page.fetched_at(), crate::now()) && self.releases_fresh(path, &key, crate::now())
+            !force && fresh(page.fetched_at(), crate::now()) && self.releases_fresh(path, &key, crate::now())
         }) {
             return Ok(page.clone());
         }
@@ -463,7 +476,7 @@ fn provider(app: &AppHandle) -> Result<Arc<MusicBrainzCatalog>, String> {
         .lock()
         .map_err(|_| "Не удалось прочитать настройки маршрута каталога.")?;
     let profile = crate::data_dir(app);
-    let route = read_route(app)?;
+    let route = if crate::gateway_client::Gateway::configured()?.is_some() { RouteConfiguration { proxy: None } } else { read_route(app)? };
     let mut slot = PROVIDER
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -568,12 +581,21 @@ pub async fn get_catalog_artist(
     id: String,
     offset: Option<u32>,
 ) -> Result<ArtistPage, String> {
-    provider(&app)?
+    let page = provider(&app)?
         .artist(
             &crate::data_dir(&app).join("musicbrainz-catalog.json"),
             &id,
             offset.unwrap_or(0),
         )
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::catalog_watch::record_open(&app, &page);
+    Ok(page)
+}
+
+pub(crate) async fn refresh_catalog_artist(app: &AppHandle, id: &str, offset: u32) -> Result<ArtistPage, String> {
+    provider(app)?
+        .artist_with_refresh(&crate::data_dir(app).join("musicbrainz-catalog.json"), id, offset, true)
         .await
         .map_err(|error| error.to_string())
 }

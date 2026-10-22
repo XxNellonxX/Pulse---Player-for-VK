@@ -1,0 +1,39 @@
+{
+  email {$ACME_EMAIL}
+  admin off
+  auto_https disable_redirects
+  # Reverse-proxy error records can include the request URI.  Media
+  # capability paths are bearer-like temporary values, so keep them out of
+  # Caddy's default logger while retaining TLS and startup diagnostics.
+  log default {
+    exclude http.log.error
+  }
+}
+
+{$PULSE_DOMAIN} {
+  tls {
+    issuer acme {
+      disable_http_challenge
+    }
+  }
+  # No access log: request paths can contain temporary media capabilities.
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "no-referrer"
+    -Server
+  }
+  request_body {
+    max_size 0
+  }
+  reverse_proxy 127.0.0.1:8080 {
+    # Overwrite the forwarding chain instead of trusting a client header.
+    header_up X-Forwarded-For {remote_host}
+    header_up -Authorization
+    header_up -Cookie
+    transport http {
+      dial_timeout 3s
+      response_header_timeout 45s
+    }
+  }
+}
