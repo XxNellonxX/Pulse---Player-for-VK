@@ -23,43 +23,57 @@ try {
   await exec(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', join(work, 'track.m4a'), '-c:a', 'copy', '-f', 'hls', '-hls_time', '1', '-hls_playlist_type', 'vod', '-hls_segment_filename', join(work, 'part%02d.ts'), join(work, 'good.m3u8')]);
   const files = new Map(await Promise.all((await readdir(work)).map(async name => [name, await readFile(join(work, name))])));
 
-  async function run(name, { delayFirst = 0, fallback = 'same' }) {
+  async function run(name, { delayFirst = 0, fallback = 'same', deadAlternate = false, failedAlternate = false }) {
     const page = await browser.newPage(); const requested = []; let firstPart = true;
     await page.route('**/*', async route => {
       const url = new URL(route.request().url());
       if (url.href === 'https://vk.com/audio') return route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>slow QA</title>' });
       if (!url.href.startsWith(origin)) return route.abort();
-      let base = url.pathname.split('/').at(-1); requested.push(base);
+      let base = url.pathname.split('/').at(-1); requested.push(url.pathname.slice(new URL(origin).pathname.length));
+      // Serve the alternate manifest but hold every alternate audio segment.
+      // Merely granting a distinct URL must not discard the original decoder.
+      if (deadAlternate && url.pathname.includes('/alternate/') && /^part\d+\.ts$/.test(base)) { await new Promise(resolve => page.once('close', resolve)); return; }
+      if (failedAlternate && url.pathname.includes('/alternate/')) return route.fulfill({ status: 503, body: 'synthetic unavailable delivery' });
       if (base === 'primary.m3u8' || base === 'alternate.m3u8') base = 'good.m3u8';
       const body = files.get(base);
       if (!body) return route.fulfill({ status: 404, body: 'missing fixture' });
-      if (delayFirst && /^part\d+\.ts$/.test(base) && firstPart) { firstPart = false; await new Promise(resolve => setTimeout(resolve, delayFirst)); }
+      if (delayFirst && url.pathname.includes('/primary/') && /^part\d+\.ts$/.test(base) && firstPart) { firstPart = false; await new Promise(resolve => setTimeout(resolve, delayFirst)); }
       return route.fulfill({ status: 200, contentType: base.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : base.endsWith('.ts') ? 'video/mp2t' : 'audio/mp4', body });
     });
     await page.goto('https://vk.com/audio'); await page.addScriptTag({ content: hlsScript }); await page.evaluate(() => {
-      window.vk = { id: 101 }; window.__slowBrowserMetrics = { engines: 0, media: 0, started: performance.now(), firstPlayingMs: null };
+      window.vk = { id: 101 }; window.__slowBrowserMetrics = { engines: 0, liveEngines: 0, peakEngines: 0, media: 0, started: performance.now(), firstPlayingMs: null };
       const HlsBase = window.__PULSE_HLS__;
-      window.__PULSE_HLS__ = class extends HlsBase { constructor(config) { super(config); window.__slowBrowserMetrics.engines++; } };
+      window.__PULSE_HLS__ = class extends HlsBase {
+        constructor(config) { super(config); const metrics = window.__slowBrowserMetrics; metrics.engines++; metrics.liveEngines++; metrics.peakEngines = Math.max(metrics.peakEngines, metrics.liveEngines); this.__qaDestroyed = false; }
+        destroy() { if (!this.__qaDestroyed) { this.__qaDestroyed = true; window.__slowBrowserMetrics.liveEngines--; } super.destroy(); }
+      };
       const NativeAudio = window.Audio;
       window.Audio = function (...args) { const audio = new NativeAudio(...args); window.__slowBrowserMetrics.media++; audio.addEventListener('playing', () => { window.__slowBrowserMetrics.firstPlayingMs ??= performance.now() - window.__slowBrowserMetrics.started; }); return audio; };
     }); await page.addScriptTag({ content: transportScript });
     await page.evaluate(({ origin, fallback }) => {
-      const raw = { ownerId: 101, id: 7, __pulseResolveSource: async () => ({ ownerId: 101, id: 7, url: `${origin}primary.m3u8` }), __pulseFallbackSource: async () => fallback === 'same' ? ({ ownerId: 101, id: 7, url: `${origin}primary.m3u8` }) : ({ ownerId: 101, id: 7, url: `${origin}alternate.m3u8` }) };
+      const raw = { ownerId: 101, id: 7, __pulseResolveSource: async () => ({ ownerId: 101, id: 7, url: `${origin}primary/primary.m3u8` }), __pulseFallbackSource: async () => fallback === 'same' ? ({ ownerId: 101, id: 7, url: `${origin}primary/primary.m3u8` }) : ({ ownerId: 101, id: 7, url: `${origin}alternate/alternate.m3u8` }) };
       window.__slowTransport = window.__PULSE_CREATE_DIRECT_AUDIO__(); window.__slowTransport.volume(0); window.__slowResult = window.__slowTransport.load(raw, {}).then(() => window.__slowTransport.play()).then(() => ({ ok: true }), error => ({ ok: false, error: error.message }));
     }, { origin, fallback });
     await page.waitForFunction(() => window.__slowTransport.read().position > .3 || window.__slowTransport.read().error, null, { timeout: 30000 });
     const result = await page.evaluate(async () => ({ result: await window.__slowResult, state: window.__slowTransport.read(), metrics: window.__slowBrowserMetrics }));
-    results.push({ name, requested, result: { ok: result.result.ok, error: result.result.error || null }, metrics: { engines: result.metrics.engines, media: result.metrics.media, firstPlayingMs: Math.round(result.metrics.firstPlayingMs) }, state: { playing: result.state.playing, position: result.state.position, bufferedAhead: result.state.bufferedAhead, error: Boolean(result.state.error) } });
+    results.push({ name, requested, result: { ok: result.result.ok, error: result.result.error || null }, metrics: { engines: result.metrics.engines, liveEngines: result.metrics.liveEngines, peakEngines: result.metrics.peakEngines, media: result.metrics.media, firstPlayingMs: Math.round(result.metrics.firstPlayingMs) }, state: { playing: result.state.playing, position: result.state.position, bufferedAhead: result.state.bufferedAhead, error: Boolean(result.state.error) } });
     await page.evaluate(() => window.__slowTransport.destroy()); await page.close();
   }
   await run('same-source-delayed-first-segment', { delayFirst: 6800, fallback: 'same' });
   await run('distinct-source-hedge', { delayFirst: 22000, fallback: 'distinct' });
+  await run('dead-distinct-alternate-keeps-original', { delayFirst: 6800, fallback: 'distinct', deadAlternate: true });
+  await run('failed-distinct-alternate-keeps-original', { delayFirst: 6800, fallback: 'distinct', failedAlternate: true });
   for (const result of results) console.log(JSON.stringify(result));
-  assert.equal(results.length, 2);
+  assert.equal(results.length, 4);
   assert.ok(results.every(result => result.result.ok && result.state.playing), JSON.stringify(results));
   assert.equal(results[0].metrics.engines, 1, 'the same slow HLS delivery was restarted');
   assert.equal(results[0].metrics.media, 1, 'a slow but usable delivery created unnecessary media elements');
   assert.ok(results[0].metrics.firstPlayingMs >= 6500 && results[0].metrics.firstPlayingMs < 10000);
-  assert.ok(results[1].requested.includes('alternate.m3u8'), JSON.stringify(results[1]));
+  assert.ok(results[1].requested.includes('alternate/alternate.m3u8'), JSON.stringify(results[1]));
   assert.ok(results[1].metrics.firstPlayingMs < 6000, 'a distinct responsive fallback was delayed behind the slow original');
+  for (const result of results.slice(1)) { assert.equal(result.metrics.peakEngines, 2); assert.equal(result.metrics.liveEngines, 1, 'the losing preparation retained an HLS engine'); }
+  for (const result of results.slice(2)) {
+    assert.ok(result.requested.includes('alternate/alternate.m3u8'), JSON.stringify(result));
+    assert.ok(result.metrics.firstPlayingMs >= 6500 && result.metrics.firstPlayingMs < 10000, 'an unusable alternate discarded the original decoder');
+  }
 } finally { await browser.close(); await rm(work, { recursive: true, force: true }); }

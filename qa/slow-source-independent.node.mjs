@@ -13,15 +13,15 @@ const alternate = 'https://cdn.example.test/session-alternate.m3u8';
 const identity = { ownerId: 101, id: 7 };
 const flush = async () => { for (let turn = 0; turn < 40; turn++) await Promise.resolve(); };
 
-function fixture({ readyMs = 6800, fallback = 'same', fallbackDelay = 0, retry = false } = {}) {
-  let now = 0, sequence = 0, liveDocument = true, fallbackCalls = 0, secondStageCalls = 0;
+function fixture({ readyMs = 6800, fallback = 'same', fallbackDelay = 0, alternateReadyMs = 20, alternateFatalMs = null, retry = false } = {}) {
+  let now = 0, sequence = 0, liveDocument = true, fallbackCalls = 0, secondStageCalls = 0, peakEngines = 0;
   const timers = new Map(), media = [], engines = [];
   const later = (callback, delay) => { const id = ++sequence; timers.set(id, { callback, at: now + delay }); return id; };
   class Audio extends EventTarget {
-    constructor() { super(); Object.assign(this, { src: '', readyState: 0, currentTime: 0, duration: 120, paused: true, ended: false, seeking: false, networkState: 2, ranges: [] }); media.push(this); }
+    constructor() { super(); Object.assign(this, { src: '', readyState: 0, currentTime: 0, duration: 120, paused: true, ended: false, seeking: false, networkState: 2, ranges: [], playCalls: 0 }); media.push(this); }
     get buffered() { const ranges = this.ranges; return { length: ranges.length, start: index => ranges[index][0], end: index => ranges[index][1] }; }
     load() {}
-    play() { this.paused = false; this.currentTime = .1; this.dispatchEvent(new Event('playing')); return Promise.resolve(); }
+    play() { this.playCalls++; this.paused = false; this.currentTime = .1; this.dispatchEvent(new Event('playing')); return Promise.resolve(); }
     pause() { this.paused = true; }
     removeAttribute(name) { if (name === 'src') this.src = ''; }
     canPlayType() { return ''; }
@@ -30,16 +30,17 @@ function fixture({ readyMs = 6800, fallback = 'same', fallbackDelay = 0, retry =
     static Events = { ERROR: 'error' };
     static ErrorTypes = { NETWORK_ERROR: 'networkError' };
     static isSupported() { return true; }
-    constructor(config) { this.config = config; this.handlers = new Map(); this.destroyed = false; this.retries = 0; engines.push(this); }
+    constructor(config) { this.config = config; this.handlers = new Map(); this.destroyed = false; this.retries = 0; engines.push(this); peakEngines = Math.max(peakEngines, engines.filter(engine => !engine.destroyed).length); }
     on(type, callback) { this.handlers.set(type, callback); }
     loadSource(url) { this.url = url; }
     attachMedia(audio) {
       this.media = audio;
-      const delay = this.url === alternate ? 20 : readyMs;
+      const delay = this.url === alternate ? alternateReadyMs : readyMs;
       if (retry && this.url === primary) later(() => { this.retries++; this.handlers.get('error')?.('error', { fatal: false, type: 'networkError', details: 'fragLoadTimeOut' }); }, 10000);
+      if (alternateFatalMs != null && this.url === alternate) later(() => this.handlers.get('error')?.('error', { fatal: true, type: 'networkError', details: 'manifestLoadError' }), alternateFatalMs);
       // Deliver late readiness even to an obsolete element: cancellation must
       // protect against callbacks queued before an engine was destroyed.
-      later(() => { audio.ranges = [[0, 70]]; audio.readyState = 4; audio.dispatchEvent(new Event('loadeddata')); audio.dispatchEvent(new Event('canplay')); }, delay);
+      if (delay != null) later(() => { audio.ranges = [[0, 70]]; audio.readyState = 4; audio.dispatchEvent(new Event('loadeddata')); audio.dispatchEvent(new Event('canplay')); }, delay);
     }
     destroy() { this.destroyed = true; }
   }
@@ -62,7 +63,7 @@ function fixture({ readyMs = 6800, fallback = 'same', fallbackDelay = 0, retry =
   let outcome;
   const play = () => transport.load(raw, {}).then(() => transport.play()).then(() => { outcome = { ok: true }; }, error => { outcome = { ok: false, error }; });
   return {
-    sandbox, transport, media, engines, play, now: () => now, outcome: () => outcome, fallbackCalls: () => fallbackCalls, secondStageCalls: () => secondStageCalls,
+    sandbox, transport, media, engines, play, now: () => now, outcome: () => outcome, fallbackCalls: () => fallbackCalls, secondStageCalls: () => secondStageCalls, peakEngines: () => peakEngines,
     leaveDocument() { liveDocument = false; transport.read(); },
     async advanceUntil(predicate, limit = 60000) {
       for (let count = 0; count < 2000; count++) {
@@ -117,6 +118,15 @@ test('a distinct responsive alternative still starts near 4s while the original 
     assert.equal(f.outcome().ok, true); assert.equal(f.transport.read().playing, true);
     assert.equal(f.engines.at(-1).url, alternate); assert.ok(f.now() >= 3500 && f.now() < 6000, `responsive alternate was delayed until ${f.now()}ms`);
     assert.equal(f.media.filter(audio => !audio.paused).length, 1);
+    assert.equal(f.peakEngines(), 2, 'a pending original should remain available until the alternate is ready');
+    assert.equal(f.engines.filter(engine => !engine.destroyed).length, 1, 'only the selected delivery should survive preparation');
+    const winner = f.engines.find(engine => !engine.destroyed);
+    assert.equal(winner.url, alternate);
+    winner.media.currentTime = 1.5; winner.media.dispatchEvent(new Event('timeupdate'));
+    await f.advanceTo(23000);
+    assert.equal(f.engines.find(engine => !engine.destroyed), winner, 'late readiness from the losing original must not replace the selected source');
+    assert.equal(f.engines.find(engine => engine.url === primary).media.playCalls, 0, 'the losing source must never produce sound, including after late canplay');
+    assert.equal(winner.media.playCalls, 1); assert.equal(winner.media.currentTime, 1.5);
   } finally { f.close(); }
 });
 
@@ -141,6 +151,23 @@ test('same-URL metadata can expose a second private route whose distinct respons
   } finally { f.close(); }
 });
 
+for (const readyMs of [6800, 22000]) {
+  test(`an unresponsive distinct alternate must not erase the working original first-fragment opportunity at ${readyMs}ms`, async () => {
+    const f = fixture({ readyMs, fallback: 'distinct', alternateReadyMs: null, retry: readyMs > 10000 });
+    try {
+      const playback = f.play(); await f.advanceUntil(() => Boolean(f.outcome())); await playback;
+      assert.equal(f.outcome().ok, true, `unverified alternate replaced a valid original and failed at ${f.now()}ms`);
+      assert.equal(f.transport.read().playing, true); assert.ok(f.now() <= readyMs + 500, `original data was ready at ${readyMs}ms but user waited until ${f.now()}ms`);
+      assert.equal(f.media.filter(audio => !audio.paused).length, 1, 'a successful hedge must not leave two audible elements');
+      assert.equal(f.peakEngines(), 2, 'concurrent preparation must be bounded to two deliveries');
+      assert.equal(f.engines.filter(engine => !engine.destroyed).length, 1, 'the unresponsive alternate must be released once the original wins');
+      assert.equal(f.engines.find(engine => !engine.destroyed).url, primary);
+      assert.equal(f.engines.find(engine => engine.url === alternate).media.playCalls, 0, 'unready alternate must not play speculatively');
+      if (readyMs > 10000) assert.equal(f.engines.find(engine => engine.url === primary).retries, 1);
+    } finally { f.close(); }
+  });
+}
+
 for (const action of ['pause', 'stop', 'account-change', 'document-navigation']) {
   test(`${action} while a slow first fragment is pending prevents late readiness from starting sound`, async () => {
     const f = fixture({ fallback: 'distinct', fallbackDelay: 3000 });
@@ -159,6 +186,53 @@ for (const action of ['pause', 'stop', 'account-change', 'document-navigation'])
     } finally { f.close(); }
   });
 }
+
+for (const action of ['pause', 'stop', 'account-change', 'document-navigation']) {
+  test(`${action} cancels both in-flight deliveries before either can produce sound`, async () => {
+    const f = fixture({ fallback: 'distinct', alternateReadyMs: 10000 });
+    try {
+      const playback = f.play(); await f.advanceTo(4500);
+      assert.equal(f.outcome(), undefined); assert.equal(f.engines.length, 2);
+      assert.equal(f.engines.filter(engine => !engine.destroyed).length, 2, 'the hedge must not discard the viable original before cancellation');
+      if (action === 'pause') f.transport.pause();
+      else if (action === 'stop') f.transport.stop();
+      else if (action === 'account-change') { f.sandbox.vk.id = 202; f.transport.read(); }
+      else f.leaveDocument();
+      await playback; await f.advanceTo(23000);
+      assert.equal(f.outcome().ok, false); assert.equal(f.outcome().error?.code, 'PULSE_DIRECT_CANCELLED');
+      assert.equal(f.transport.read().playing, false); assert.equal(f.media.some(audio => !audio.paused), false);
+      assert.equal(f.media.reduce((sum, audio) => sum + audio.playCalls, 0), 0);
+      assert.equal(f.engines.filter(engine => !engine.destroyed).length, 0, 'a cancelled preparation leaked an engine');
+    } finally { f.close(); }
+  });
+}
+
+test('the original can win while a slower alternate later reports playable data', async () => {
+  const f = fixture({ fallback: 'distinct', alternateReadyMs: 6000 });
+  try {
+    const playback = f.play(); await f.advanceUntil(() => Boolean(f.outcome())); await playback;
+    assert.equal(f.outcome().ok, true); assert.ok(f.now() <= 7300);
+    const winner = f.engines.find(engine => !engine.destroyed);
+    assert.equal(winner.url, primary); assert.equal(f.peakEngines(), 2);
+    winner.media.currentTime = 1.25; winner.media.dispatchEvent(new Event('timeupdate'));
+    await f.advanceTo(10500);
+    assert.equal(f.engines.find(engine => !engine.destroyed), winner);
+    assert.equal(winner.media.currentTime, 1.25); assert.equal(winner.media.playCalls, 1);
+    assert.equal(f.engines.find(engine => engine.url === alternate).media.playCalls, 0, 'late alternate readiness produced unrequested sound');
+  } finally { f.close(); }
+});
+
+test('a fatal error from a distinct alternate cannot end the still-viable original delivery', async () => {
+  const f = fixture({ fallback: 'distinct', alternateReadyMs: null, alternateFatalMs: 100 });
+  try {
+    const playback = f.play(); await f.advanceUntil(() => Boolean(f.outcome())); await playback;
+    assert.equal(f.outcome().ok, true, `an alternate-only network failure ended the original at ${f.now()}ms`);
+    assert.equal(f.transport.read().playing, true); assert.ok(f.now() <= 7300);
+    assert.equal(f.engines.filter(engine => !engine.destroyed).length, 1);
+    assert.equal(f.engines.find(engine => !engine.destroyed).url, primary);
+    assert.equal(f.engines.find(engine => engine.url === alternate).media.playCalls, 0);
+  } finally { f.close(); }
+});
 
 for (const fallback of ['wrong-identity', 'restricted']) {
   test(`a concurrent metadata reply with ${fallback} cannot replace the pending account-authorized source`, async () => {
@@ -183,5 +257,22 @@ test('a metadata hedge that finishes after the original starts cannot replace it
     await f.advanceTo(10500);
     assert.equal(f.engines.length, 1, 'a late optional reply replaced the already playing engine');
     assert.equal(f.transport.read().playing, true); assert.equal(f.media[0].currentTime, 1.25);
+  } finally { f.close(); }
+});
+
+test('a restriction confirmed while the winning source awaits EQ preparation remains final', async () => {
+  const f = fixture({ readyMs: 6800, fallback: 'restricted', fallbackDelay: 3000 });
+  try {
+    f.sandbox.__PULSE_CREATE_EQUALIZER__ = () => ({
+      connected: true, active: false,
+      prepare: () => new Promise(resolve => f.sandbox.setTimeout(resolve, 1000)),
+      apply() { this.active = true; }, resume: async () => {}, destroy() {},
+    });
+    await f.transport.equalizer({ enabled: true, bands: Array(10).fill(0), preamp: 0 });
+    const playback = f.play(); await f.advanceUntil(() => Boolean(f.outcome())); await playback;
+    assert.equal(f.outcome().ok, false, 'a late metadata restriction was forgotten during winner commit');
+    assert.equal(f.transport.read().playing, false); assert.equal(f.media.some(audio => !audio.paused), false);
+    await f.advanceTo(23000);
+    assert.equal(f.media.reduce((sum, audio) => sum + audio.playCalls, 0), 0, 'EQ completion started a source after access was denied');
   } finally { f.close(); }
 });

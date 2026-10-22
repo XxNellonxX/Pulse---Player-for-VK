@@ -262,7 +262,7 @@
         if (media === target) equalizerError = 'Эквалайзер недоступен в этом окне. Трек играет без обработки.';
       }
     }
-    async function define(source, generation, timeout, attempt = null) {
+    async function prepareCandidate(source, generation, timeout, attempt) {
       const deadline = Date.now() + timeout;
       const remaining = () => {
         const value = deadline - Date.now();
@@ -270,38 +270,36 @@
         return value;
       };
       checkScope(attempt, generation);
-      disposeMedia();
-      equalizerError = null;
       const readable = equalizerSettings.enabled ? await allowsEqualizer(source, generation, deadline, attempt) : false;
       checkScope(attempt, generation);
       remaining();
-      const target = new w.Audio(); media = target;
-      equalizerSafe = readable;
+      const target = new w.Audio();
+      let engine = null, promoted = false, disposed = false;
+      const preparationListeners = [];
+      const preparationListen = (type, callback) => {
+        const handler = (...args) => { if (!disposed && isCurrent(generation) && !attempt.closed) callback(...args); };
+        target.addEventListener(type, handler);
+        preparationListeners.push(() => target.removeEventListener(type, handler));
+      };
+      const releaseLoad = () => { for (const off of preparationListeners.splice(0)) off(); };
+      const discard = () => {
+        if (promoted || disposed) return;
+        disposed = true; releaseLoad();
+        try { engine?.destroy(); } catch { /* release best effort */ }
+        try { target.pause(); target.removeAttribute('src'); target.load(); } catch { /* detached candidate */ }
+      };
+      attempt.waiting.add(discard);
       if (readable) target.crossOrigin = 'anonymous';
       target.preload = 'auto'; target.volume = currentVolume;
-      listen(target, 'playing', () => { if (!desired) target.pause(); else { buffering = false; ended = false; hasPlayed = true; lastProgressAt = Date.now(); } }, generation);
-      listen(target, 'waiting', () => { observedPosition = position(); buffering = desired; }, generation);
-      listen(target, 'stalled', () => { observedPosition = position(); buffering = desired && target.readyState < 3; }, generation);
-      listen(target, 'timeupdate', observeProgress, generation);
-      listen(target, 'seeking', () => { observedPosition = position(); }, generation);
-      listen(target, 'seeked', () => { observedPosition = position(); }, generation);
-      listen(target, 'canplay', () => { buffering = false; }, generation);
-      listen(target, 'ended', () => { resumePosition = mediaPosition(); ended = true; desired = false; buffering = false; }, generation);
-      listen(target, 'error', () => {
-        if (ready && desired && !recovering) recoverSource();
-        else if (ready && !recovering) error = 'Не удалось воспроизвести доступный источник VK. Повторите запуск трека.';
-      }, generation);
-      let releaseLoad = () => {};
       const loaded = new Promise((resolve, reject) => {
         // Duration and headers do not establish that the decoder has audio.
         // Some dead CDN responses publish metadata and then never provide a
         // frame. Keep trying the other granted sources in that case.
         const playable = () => { if (target.readyState >= 3) resolve(); };
-        const offReady = listen(target, 'loadedmetadata', playable, generation);
-        const offData = listen(target, 'loadeddata', playable, generation);
-        const offCanPlay = listen(target, 'canplay', playable, generation);
-        const offError = listen(target, 'error', () => reject(failure('Источник VK не загрузился.')), generation);
-        releaseLoad = () => { offReady(); offData(); offCanPlay(); offError(); };
+        preparationListen('loadedmetadata', playable);
+        preparationListen('loadeddata', playable);
+        preparationListen('canplay', playable);
+        preparationListen('error', () => reject(failure('Источник VK не загрузился.')));
       });
       // A synchronous engine error can reject before the deadline check below.
       // Keep that promise observed even if the candidate has already expired.
@@ -316,12 +314,13 @@
           // Keep TS/AAC transmuxing off the VK document's main thread. The
           // bundled HLS build can inject its worker from a blob and falls back
           // to inline transmuxing if the WebView CSP blocks worker creation.
-          hls = new Hls({ enableWorker: true, emeEnabled: false, backBufferLength: 30, maxBufferLength: 120, maxMaxBufferLength: 180, maxBufferSize: 8 * 1024 * 1024, manifestLoadingMaxRetry: 1, levelLoadingMaxRetry: 1, fragLoadingMaxRetry: 3 });
-          const engine = hls;
+          engine = new Hls({ enableWorker: true, emeEnabled: false, backBufferLength: 30, maxBufferLength: 120, maxMaxBufferLength: 180, maxBufferSize: 8 * 1024 * 1024, manifestLoadingMaxRetry: 1, levelLoadingMaxRetry: 1, fragLoadingMaxRetry: 3 });
           let networkRepairs = 0;
           let repairPosition = -1;
           engine.on(Hls.Events.ERROR, (_event, data) => {
-            if (!isCurrent(generation) || hls !== engine || !data?.fatal) return;
+            if (disposed || !isCurrent(generation) || (!promoted && attempt.closed) || !data?.fatal) return;
+            if (!promoted) { target.dispatchEvent(new w.Event('error')); return; }
+            if (hls !== engine) return;
             // A failed future fragment is not a failure of already buffered
             // audio. Retain those bytes while HLS retries the network in the
             // same engine; the media-clock watchdog still renews a genuinely
@@ -352,11 +351,35 @@
           target.src = source.url; target.load();
         }
         await bounded(loaded, remaining(), generation, 'Источник VK не ответил. Проверьте соединение и повторите запуск.', attempt);
-      } finally { releaseLoad(); }
-      checkScope(attempt, generation); ready = true; buffering = false; error = null;
-      await applyEqualizer(Math.min(deadline, Date.now() + 1500), attempt);
+      } catch (failureValue) { discard(); throw failureValue; }
+      finally { releaseLoad(); }
       checkScope(attempt, generation);
-      remaining();
+      return {
+        async commit() {
+          checkScope(attempt, generation);
+          remaining();
+          disposeMedia();
+          promoted = true; attempt.waiting.delete(discard);
+          media = target; hls = engine; equalizerSafe = readable; equalizerError = null;
+          target.volume = currentVolume;
+          listen(target, 'playing', () => { if (!desired) target.pause(); else { buffering = false; ended = false; hasPlayed = true; lastProgressAt = Date.now(); } }, generation);
+          listen(target, 'waiting', () => { observedPosition = position(); buffering = desired; }, generation);
+          listen(target, 'stalled', () => { observedPosition = position(); buffering = desired && target.readyState < 3; }, generation);
+          listen(target, 'timeupdate', observeProgress, generation);
+          listen(target, 'seeking', () => { observedPosition = position(); }, generation);
+          listen(target, 'seeked', () => { observedPosition = position(); }, generation);
+          listen(target, 'canplay', () => { buffering = false; }, generation);
+          listen(target, 'ended', () => { resumePosition = mediaPosition(); ended = true; desired = false; buffering = false; }, generation);
+          listen(target, 'error', () => {
+            if (ready && desired && !recovering) recoverSource();
+            else if (ready && !recovering) error = 'Не удалось воспроизвести доступный источник VK. Повторите запуск трека.';
+          }, generation);
+          ready = true; buffering = false; error = null;
+          await applyEqualizer(Math.min(deadline, Date.now() + 1500), attempt);
+          checkScope(attempt, generation);
+          remaining();
+        },
+      };
     }
     async function resolveSource(raw, player, generation, fallback = false, renewal = false, hardDeadline = Infinity) {
       const input = normalize(raw);
@@ -421,16 +444,18 @@
         }
         return null;
       }
-      // Keep one delivery alive while metadata is refreshed. A private closure
+      // Keep the original delivery alive while metadata is refreshed. A closure
       // can return the same URL, no usable alternative, or no response at all;
       // none of those justify destroying an HLS engine and its ongoing retry.
-      // Only an explicit distinct validated grant authorizes an early handoff.
+      // A distinct grant can still be dead. Prepare at most one extra delivery
+      // in parallel and promote only a candidate that has actual playable data.
       async function loadSources(initial, hedgeDelay) {
         const pending = initial.filter(source => !attempted.has(source.url));
         if (fallback && pending.length > 1) pending.push(pending.shift());
         const metadata = scope();
         let metadataTask = null, startMetadata = null, metadataDone = false;
-        let hedgeTimer = null, attempt = null, loadTask = null;
+        let hedgeTimer = null, candidateTimer = null, hedgeAllowed = false;
+        const candidates = new Set();
         const unique = sources => sources.filter(source => !attempted.has(source.url) && !pending.some(item => item.url === source.url));
         const prepare = async () => {
           while (Date.now() < deadline) {
@@ -456,49 +481,59 @@
           });
         };
         let nextMetadata = scheduleMetadata(hedgeDelay);
+        const candidateHedge = pending.length > 1 ? new Promise(resolve => {
+          candidateTimer = setTimeout(() => { candidateTimer = null; hedgeAllowed = true; resolve({ type: 'candidateHedge' }); }, 4000);
+        }) : null;
         try {
           while (Date.now() < deadline) {
             check(generation);
-            if (!loadTask && pending.length) {
+            while (pending.length && (candidates.size === 0 || (hedgeAllowed && candidates.size < 2))) {
               const source = pending.shift();
               if (attempted.has(source.url)) continue;
-              attempted.add(source.url); attempt = scope();
-              const timeout = Math.min(deadline - Date.now(), pending.length ? 4000 : LOAD_TIMEOUT);
-              loadTask = define(source, generation, timeout, attempt).then(() => ({ type: 'loaded' }), failureValue => ({ type: 'loadError', failureValue }));
+              attempted.add(source.url);
+              const candidate = { scope: scope(), task: null };
+              const timeout = Math.min(deadline - Date.now(), LOAD_TIMEOUT);
+              candidate.task = prepareCandidate(source, generation, timeout, candidate.scope).then(value => ({ type: 'loaded', candidate, value }), failureValue => ({ type: 'loadError', candidate, failureValue }));
+              candidates.add(candidate);
             }
-            if (!loadTask) {
+            if (!candidates.size) {
               if (metadataDone) return false;
               startMetadata();
             }
-            const event = await Promise.race([...(loadTask ? [loadTask] : []), ...(!metadataDone ? [nextMetadata] : [])]);
+            const event = await Promise.race([...Array.from(candidates, candidate => candidate.task), ...(!metadataDone ? [nextMetadata] : []), ...(!hedgeAllowed && candidateHedge ? [candidateHedge] : [])]);
             check(generation);
             if (event.type === 'loaded') {
+              if (metadata.terminal) throw metadata.terminal;
+              // Readiness, not a different URL, chooses the winner. The other
+              // candidate may still have the only viable slow first fragment;
+              // never cancel it just because a metadata request returned.
+              for (const candidate of candidates) if (candidate !== event.candidate) closeScope(candidate.scope);
+              await event.value.commit();
               if (metadata.terminal) throw metadata.terminal;
               return true;
             }
             if (event.type === 'loadError') {
               if (event.failureValue?.code === CANCELLED) throw event.failureValue;
-              lastError = event.failureValue; closeScope(attempt); attempt = null; loadTask = null;
-              if (!pending.length && !metadataDone) startMetadata();
+              lastError = event.failureValue;
+              closeScope(event.candidate.scope); candidates.delete(event.candidate);
+              if (!candidates.size && !pending.length && !metadataDone) startMetadata();
             } else if (event.type === 'grantError') {
               if (event.failureValue?.code === CANCELLED || event.failureValue?.terminalGrant) throw event.failureValue;
               lastError = event.failureValue; metadataDone = true;
-            } else {
+            } else if (event.type === 'grant') {
               const choices = unique(event.sources);
               if (!choices.length) { metadataDone = true; continue; }
+              hedgeAllowed = true;
               pending.push(...choices);
-              // Stop only this candidate's readiness await. The replacement's
-              // define call owns media disposal; late callbacks cannot commit
-              // readiness for the old target after this local scope closes.
-              if (loadTask) { closeScope(attempt); await loadTask; attempt = null; loadTask = null; }
               nextMetadata = scheduleMetadata(4000);
             }
           }
           return false;
         } finally {
           if (hedgeTimer != null) clearTimeout(hedgeTimer);
+          if (candidateTimer != null) clearTimeout(candidateTimer);
           closeScope(metadata);
-          if (attempt) closeScope(attempt);
+          for (const candidate of candidates) closeScope(candidate.scope);
           // Underlying website promises may not expose an abort API. All their
           // results remain observed, and a closed scope cannot start a further
           // metadata stage or install/replace a media element after success.
