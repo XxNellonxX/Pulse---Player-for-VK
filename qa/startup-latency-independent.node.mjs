@@ -127,12 +127,13 @@ test('a refresh returning the identical failed source does not download it twice
   // a method stub: the website refresh grants exactly the same failed URL.
   const transport = f.sandbox.__PULSE_CREATE_DIRECT_AUDIO__();
   try {
-    let settled = false;
-    const result = transport.load({ ownerId: 101, id: 8, url: primary }, { _ensureHasURL: async input => ({ ...input, url: primary }) });
+    let settled = false, reloads = 0;
+    const result = transport.load({ ownerId: 101, id: 8, url: primary }, { _ensureHasURL: async input => { reloads++; return { ...input, url: primary }; } });
     const rejected = assert.rejects(result).then(() => { settled = true; });
     await f.runUntil(() => settled); await rejected;
     assert.equal(f.media.filter(item => item.src === primary || item.src === '').length, 1, 'identical failed URL consumed a second full load budget');
-    assert.ok(f.now() <= 8000, `failed source was retried until ${f.now()}ms`);
+    assert.ok(f.now() >= 8000 && f.now() <= 25000, `one initial source must keep its bounded load opportunity: ${f.now()}ms`);
+    assert.equal(reloads, 1, 'Metadata may be refreshed once without retrying the same media URL');
   } finally { transport.destroy(); f.close(); }
 });
 
