@@ -437,7 +437,7 @@
       // A repeatedly broken primary source may have a valid alternate stream.
       // Every explicit fallback receives a bounded share of the remaining time.
       if (await loadSources(sources, Math.min(deadline, Date.now() + (fallbackSource ? 4000 : LOAD_TIMEOUT)))) return;
-      if (fallbackSource && Date.now() < deadline) {
+      for (let stage = 0; fallbackSource && stage < 2 && Date.now() < deadline; stage++) {
         // The exact API and the website's tuple resolver can grant different
         // working deliveries for the same item. Only the adapter can supply
         // this second private route; artist access-key closures do not opt in.
@@ -446,8 +446,12 @@
         if (result != null) {
           const alternate = normalize(result);
           if (alternate.fullId !== input.fullId) throw failure('VK вернул другой трек. Обновите библиотеку.');
-          if (await loadSources(sourceList(alternate, player), Math.min(deadline, Date.now() + LOAD_TIMEOUT))) return;
-        }
+          // A collection tuple can already hold its full file or a purely
+          // decodable URL. Try it before asking the website to reload hashes.
+          // Only an explicit private closure enables that second stage.
+          fallbackSource = typeof result.__pulseFallbackSource === 'function' ? () => result.__pulseFallbackSource() : null;
+          if (await loadSources(sourceList(alternate, player), Math.min(deadline, Date.now() + (fallbackSource ? 4000 : LOAD_TIMEOUT)))) return;
+        } else fallbackSource = null;
       }
       throw lastError || failure('Источник VK не загрузился.');
     }
@@ -603,5 +607,11 @@
       destroy() { invalidate(); destroyed = true; error = null; },
     };
   }
+  // The adapter must not replace a masked tuple whose session-owned decoder
+  // already provides a usable source. Reuse this exact source selection and
+  // safety validation instead of duplicating its changing website schema.
+  Object.defineProperty(create, 'canResolve', { value: (raw, player) => {
+    try { return sourceList(normalize(raw), player).length > 0; } catch { return false; }
+  } });
   Object.defineProperty(w, '__PULSE_CREATE_DIRECT_AUDIO__', { value: create, configurable: true });
 })();

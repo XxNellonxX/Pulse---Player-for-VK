@@ -588,21 +588,31 @@
       if (restriction || original?.available === false || original?.isRestricted === true) throw new Error('VK ограничил воспроизведение этого трека для аккаунта.');
       const player = getPlayer();
       if (typeof player?._ensureHasURL !== 'function') return original;
-      const hashes = String(tupleValue(original, 'AUDIO_ITEM_INDEX_HASHES', 13, ['hashes']) || '').split('/');
-      const result = await player._ensureHasURL({
-        fullId: identity.fullId, ownerId: identity.owner, id: identity.id,
-        actionHash: typeof original?.actionHash === 'string' ? original.actionHash : hashes[2] || '',
-        urlHash: typeof original?.urlHash === 'string' ? original.urlHash : hashes[5] || '',
-        url: undefined, extra: tupleValue(original, 'AUDIO_ITEM_INDEX_EXTRA', 12, ['extra']),
-      });
-      valid(fallbackRun, owner);
-      const confirmed = trackIdentity(result);
-      if (confirmed.owner !== expected.owner || confirmed.id !== expected.id) throw new Error('invalid_audio_identity');
-      return result;
+      const reload = async () => {
+        valid(fallbackRun, owner);
+        const hashes = String(tupleValue(original, 'AUDIO_ITEM_INDEX_HASHES', 13, ['hashes']) || '').split('/');
+        const result = await player._ensureHasURL({
+          fullId: identity.fullId, ownerId: identity.owner, id: identity.id,
+          actionHash: typeof original?.actionHash === 'string' ? original.actionHash : hashes[2] || '',
+          urlHash: typeof original?.urlHash === 'string' ? original.urlHash : hashes[5] || '',
+          url: undefined, extra: tupleValue(original, 'AUDIO_ITEM_INDEX_EXTRA', 12, ['extra']),
+        });
+        valid(fallbackRun, owner);
+        const confirmed = trackIdentity(result);
+        if (confirmed.owner !== expected.owner || confirmed.id !== expected.id) throw new Error('invalid_audio_identity');
+        return result;
+      };
+      if (!hasTupleSource(original)) return reload();
+      const candidate = Array.isArray(original) ? Object.assign(original.slice(), original) : { ...original };
+      Object.defineProperty(candidate, '__pulseFallbackSource', { value: reload });
+      return candidate;
     } });
     return tuple;
   }
   function hasTupleSource(raw) {
+    if (typeof w.__PULSE_CREATE_DIRECT_AUDIO__?.canResolve === 'function') {
+      try { return w.__PULSE_CREATE_DIRECT_AUDIO__.canResolve(raw, getPlayer()); } catch { return false; }
+    }
     const direct = tupleValue(raw, 'AUDIO_ITEM_INDEX_URL', 2, ['url']);
     const usable = value => typeof value === 'string' && !value.includes('audio_api_unavailable') && Boolean(https(value));
     if (usable(direct)) return true;

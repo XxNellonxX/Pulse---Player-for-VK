@@ -17,3 +17,91 @@ The useful pattern is a separate media transport with explicit forward loading, 
 For HLS/MSE, use an audio-appropriate forward-buffer target and a bounded back buffer, then measure actual buffered seconds, recovery, and memory consumption. Do not blindly copy the Android app's eight-to-ten-minute RAM target into Windows WebView2: engine memory accounting and cache placement differ. A larger forward target does not fix an invalid, expired, unsupported, or blocked media response; those need source validation and a bounded refresh of session-provided source alternatives.
 
 No APK evidence here establishes a universal no-stall guarantee, source-priority order, or recovery on the exact Windows track that failed. Those require independent Windows tests with transient network failures, mid-track source expiry, pause/seek/switch races, and a real track played through its end.
+
+## Follow-up inspection: 2026-10-22
+
+The newly supplied APK ending in `(1).apk` is byte-for-byte identical to the
+previous file. Both have SHA-256
+`56c33336b347d7126227174b34d2cf92f6d9d43d0e70c78638903f305cb64b92`.
+The file was inspected statically, never installed or executed. The additional
+inspection followed the playback service into its datasource factories and
+URI resolver; the presence of an unused library alone is not treated as
+evidence that a feature runs during playback.
+
+### What the actual playback wiring shows
+
+`Lua/itaysonlab/vkxreborn/playback/service/PlaybackService;->yandex()` passes
+the shared HTTP client and cache into the previously identified
+`Lzؚؚ۠;->ads(...)` player factory. The factory constructs an OkHttp datasource
+factory (`Lzَْؗ;`), a context-aware datasource, resolving datasource wrappers
+(`Lzٌۦٜ;`), and the cache datasource (`Lz٘ؒٓ;`). Its final `Lzؙؙُ;` resolver
+can use an existing local `CachedTrack` while preserving the original item.
+
+`Lzَْؗ;->subs()` creates `Lzِ۠ؑ;`, the OkHttp datasource. In
+`Lzِ۠ؑ;->ads(DataSpec)` the datasource builds an HTTP request directly from
+the resolved `DataSpec` URI, merges its request properties and per-item
+headers, adds a `Range` header for offset/length requests, and calls its
+HTTP client. It explicitly handles response length, `Content-Range`, and
+HTTP 416. The response is consumed as an `InputStream`; this observed path
+does not rewrite every media URI to a localhost HTTP URL.
+
+There are resolving wrappers around that datasource, including one that can
+add an `Authorization` value obtained from a runtime callback. A header name
+alone does not establish what credential is used, which origin it belongs
+to, or that desktop session cookies should be sent to every CDN. No
+credential values were copied or incorporated into Pulse.
+
+### Source resolution
+
+The app uses a private `vkx` URI scheme with two path components. The
+`Lzؑٗۡ;->loadAd(DataSpec)` resolving step recognizes that scheme and invokes
+the coroutine represented by `Lzٖؕؗ;`, which calls the URI resolver
+`Lzؔٚٚ;->Signature(Uri, Continuation)` before constructing a replacement
+`DataSpec`. Its original byte offset, length, headers and cache-key field are
+carried into that replacement.
+
+The `vk` provider is registered in `Lzَۦؕ;->Signature(Context)`. Its provider,
+`Lzؕۨۜ;->Signature(String, Continuation)`, requests an exact audio identity
+using `Lzٖۧؕ;-><init>(String[])`. That constructor configures
+`audio.getById` with the `audios` parameter. The provider selects the returned
+`AudioTrack` URL. This establishes on-demand same-item resolution in this
+path, but does **not** by itself prove a special refresh specifically
+triggered by a 403 response, or that its API session returns the same URL as
+the desktop website session.
+
+### Local proxy and User-Agent claims
+
+The APK does include Ktor server code, general `localhost` strings and
+network-proxy settings/models, including `VkConfigNetworkProxyProduct`.
+The inspected localhost references resolve to generic Ktor client/server
+initialization and logging. They do **not** establish that the normal audio
+chain starts a loopback HTTP relay. The directly traced playback chain above
+uses native HTTP/resolving/cache datasources. A loopback relay remains a
+possible desktop implementation technique, not a confirmed requirement
+copied from this APK.
+
+The media factory explicitly supplies `Accept-Encoding: identity`; the
+datasource also enforces it for requests that do not permit compression.
+No explicit official-client User-Agent is set in that factory. The DEX files
+contain generic User-Agent handling elsewhere, but no plaintext
+`VKAndroidApp/...` marker was found. This is not proof that the upstream
+shared HTTP client never adds a computed header. An official-client header
+spoof or a universal bandwidth-throttling explanation is **not established**
+by this inspection and must not be reported as a measured cause.
+
+### Clean-room implications for Pulse
+
+The applicable pattern is a native, byte-range-aware downloader behind a
+stable track identity, with bounded cache and forward loading. It can be
+exposed through a loopback relay or a native asset protocol on desktop if
+live comparisons show an advantage over WebView networking. HLS segment
+formats must remain supported by the decoder/transmuxer; concatenating TS
+bytes and calling the result MP3 is not a valid generic conversion.
+
+No license granting reuse of VK X's application implementation was
+established. Bundled third-party notices do not establish a license for the
+entire application. No decompiled application source, keys, endpoint
+credentials, or vendor proxy configurations were copied into production.
+Any implementation should be written independently and validated against
+actual response statuses, first-byte timing, byte throughput, and full-track
+playback for the failing imported tracks.

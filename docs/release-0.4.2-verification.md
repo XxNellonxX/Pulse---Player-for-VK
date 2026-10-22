@@ -109,11 +109,12 @@ and file-association behavior have no separate per-platform feature copies.
 The application identifier and existing profile/data locations are preserved.
 
 Windows native playback evidence above does not validate WKWebView behavior.
-The 0.4.2 macOS Apple Silicon/Intel builds and physical-Mac login, playback,
-import, persistence and update checks remain pending. Earlier successful macOS
-builds do not establish compatibility or runtime behavior for this revision.
-macOS remains an unsigned preview. Android support is not implemented and has
-not been tested.
+The 0.4.2 macOS Apple Silicon (`aarch64-apple-darwin`) and Intel
+(`x86_64-apple-darwin`) builds succeeded for production revision
+`6ee587e4e4e6b002b28ed7528d68beca5bb9fac7`. Physical-Mac login, playback,
+import, persistence and update checks remain outstanding: successful builds
+do not establish runtime behavior. macOS remains an unsigned preview. Android
+support is not implemented and has not been tested.
 
 The Windows NSIS installer was built successfully. Its embedded executable
 reports version **0.4.2**, product **VK Player**; the application identifier is
@@ -121,14 +122,14 @@ unchanged. The local installer is **107,366,826 bytes**, SHA-256:
 
 `11ef8278ae8c8b92c676bfcf21ef7b9f623330cbb4bc6d7d7f4305ffa1091105`
 
-macOS build verification for the same production revision was dispatched in
+Both macOS target builds for the same production revision completed successfully in
 [GitHub Actions run 39651652274](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39651652274).
-It remains pending until its result is explicitly recorded. Stable Windows and macOS packages
+Stable Windows and macOS packages
 must use the same application version and source revision; experimental
 unsigned previews remain separate prereleases.
 
 ## Remaining acceptance work
 
-- Complete the macOS builds and clearly record unavailable physical-Mac checks.
+- Complete physical-Mac login, playback, import, persistence and update checks.
 
 No uninterrupted-playback or universal-import guarantee is made by this report.

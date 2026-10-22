@@ -309,7 +309,10 @@ test('a lazy exact refresh preserves a separate legacy route if its replacement 
     f.api.acceptSearch([original]); f.api.command({ operation: 'play', id: 'vk-101-9000' }); await settle();
     const exact = await f.direct.loads[0].__pulseRefreshSource();
     assert.equal(typeof exact.__pulseFallbackSource, 'function');
-    assert.equal((await exact.__pulseFallbackSource()).id, 9000);
+    const candidate = await exact.__pulseFallbackSource();
+    assert.equal(candidate[0], 9000); assert.equal(candidate[2], original[2]);
+    assert.equal(received, undefined, 'Preserve the original source before asking for another URL');
+    assert.equal((await candidate.__pulseFallbackSource()).id, 9000);
     assert.equal(received.actionHash, 'warm-action'); assert.equal(received.urlHash, 'warm-url');
   } finally { f.dispose(); }
 });
