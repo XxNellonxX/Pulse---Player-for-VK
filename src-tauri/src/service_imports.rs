@@ -203,13 +203,22 @@ async fn spotify_get(input: &str, epoch: u64) -> Result<Value, String> {
 
 #[tauri::command]
 pub fn service_import_status() -> Result<ImportStatus, String> {
-    let session = load_tokens()?;
-    Ok(ImportStatus { spotify: AccountStatus {
-        configured: session.is_some() || valid_client(&configured_client()), connected: session.is_some(),
-        message: if session.is_some() { "Аккаунт подключён. Доступны любимые треки и ваши плейлисты.".into() }
-            else if valid_client(&configured_client()) { "Войдите в Spotify и разрешите чтение любимых треков и плейлистов.".into() }
-            else { "Вход Spotify ещё не настроен владельцем Pulse. Доступен импорт файла экспорта и публичных плейлистов, если сервис разрешает их чтение.".into() }, user_name: None,
-    }, yandex: serde_json::from_value(crate::yandex_account_import::status())
+    compose_import_status(load_tokens(), &configured_client(), crate::yandex_account_import::status())
+}
+fn compose_import_status(session: Result<Option<Tokens>, String>, client_id: &str, yandex: Value) -> Result<ImportStatus, String> {
+    let configured = valid_client(client_id);
+    let spotify = match session {
+        Ok(session) => AccountStatus {
+            configured: session.is_some() || configured, connected: session.is_some(),
+            message: if session.is_some() { "Аккаунт подключён. Доступны любимые треки и ваши плейлисты.".into() }
+                else if configured { "Войдите в Spotify и разрешите чтение любимых треков и плейлистов.".into() }
+                else { "Вход Spotify ещё не настроен владельцем Pulse. Доступен импорт файла экспорта и публичных плейлистов, если сервис разрешает их чтение.".into() }, user_name: None,
+        },
+        // A failed Spotify keyring lookup must not turn a successful Yandex
+        // login/disconnect into an error or hide its independently stored status.
+        Err(message) => AccountStatus { configured, connected: false, message, user_name: None },
+    };
+    Ok(ImportStatus { spotify, yandex: serde_json::from_value(yandex)
         .map_err(|_| "Не удалось прочитать статус подключения Яндекс Музыки.")? })
 }
 
@@ -593,6 +602,30 @@ pub async fn read_service_playlist(app: AppHandle, url: String) -> Result<Collec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spotify_keyring_failure_cannot_hide_yandex_connect_or_disconnect() {
+        for connected in [true, false] {
+            let yandex = json!({"configured":true,"connected":connected,"message":"Yandex status","userName":if connected {Some("Listener")}else{None}});
+            for client in ["", "0123456789abcdef0123456789abcdef"] {
+                let status = compose_import_status(Err("Spotify keyring denied".into()), client, yandex.clone()).unwrap();
+                assert_eq!(status.yandex.connected, connected);
+                assert!(status.yandex.configured);
+                assert_eq!(status.yandex.user_name.as_deref(), if connected {Some("Listener")}else{None});
+                assert!(!status.spotify.connected);
+                assert_eq!(status.spotify.configured, !client.is_empty());
+                assert_eq!(status.spotify.message, "Spotify keyring denied");
+            }
+        }
+    }
+    #[test]
+    fn independent_status_preserves_saved_spotify_session_without_a_build_client() {
+        let yandex = json!({"configured":true,"connected":false,"message":"Yandex status","userName":null});
+        let empty = compose_import_status(Ok(None), "", yandex.clone()).unwrap();
+        assert!(!empty.spotify.configured); assert!(!empty.spotify.connected);
+        let tokens = Tokens { client_id:"0123456789abcdef0123456789abcdef".into(), access_token:"test-only".into(), refresh_token:"test-only".into(), expires_at:1 };
+        let saved = compose_import_status(Ok(Some(tokens)), "", yandex).unwrap();
+        assert!(saved.spotify.configured); assert!(saved.spotify.connected); assert!(!saved.yandex.connected);
+    }
     #[test]
     fn provider_urls_cannot_escape_or_inject_paths() {
         assert_eq!(public_source("https://open.spotify.com/intl-ru/playlist/37i9dQZF1DXcBWIGoYBM5M?si=abc").unwrap(), PublicSource::Spotify("37i9dQZF1DXcBWIGoYBM5M".into()));

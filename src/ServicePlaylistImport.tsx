@@ -85,7 +85,6 @@ export function ServicePlaylistImport({ busy = false, onImport, onCancel }: Prop
       <div className="service-import-account">
         <h3>Вся личная музыка</h3>
         <p>{status?.[service].message || (service === 'spotify' ? 'Подключите аккаунт, чтобы прочитать любимые треки и все ваши плейлисты.' : 'Подключите аккаунт Яндекса, чтобы прочитать личную коллекцию, если сервис предоставляет доступ. Публичные списки и экспорт доступны отдельно.')}</p>
-        {service === 'spotify' && status?.spotify.configured === false && <p>Вход Spotify ещё не настроен владельцем Pulse. Пока можно перенести коллекцию файлом экспорта или прочитать доступный публичный плейлист.</p>}
         <div className="service-import-actions">
           {status?.[service].connected ? <><button className="secondary-button" disabled={disabled} onClick={() => void run('Получаем ваши плейлисты…', listCollections)}><Library size={16} />Мои коллекции</button><button className="text-button" disabled={disabled} onClick={() => void run('Отключаем аккаунт…', async () => { const status = await window.desktop?.disconnectServiceImport?.(service); if (status) setStatus(status); setCollections([]) })}>Отключить</button></>
             : <button className="secondary-button" disabled={disabled || status?.[service].configured === false} onClick={() => void connect()}><LogIn size={16} />Подключить {labels[service]}</button>}
