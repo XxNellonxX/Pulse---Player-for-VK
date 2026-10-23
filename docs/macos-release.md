@@ -1,16 +1,27 @@
 # macOS сборка Pulse
 
-## 0.5.1 — подготовка общего выпуска
+## 0.5.1 — опубликованные preview-пакеты macOS
 
-Выпуск 0.5.1 готовится из общей ревизии исходников для Windows, Apple Silicon
-и Intel. **Сборки и публикация именно 0.5.1 пока не подтверждены:** итоговые
-source SHA, CI run, размеры и SHA-256 DMG будут записаны после завершения
-проверок в [отчёте 0.5.1](release-0.5.1-verification.md).
+Обе архитектуры macOS 14+ успешно собраны из той же ревизии, что и Windows:
+`656e9652aa22a2722532451491b13d04cac3178b`, версия `0.5.1`. Сборка завершена успешно в
+[Actions 39978170594](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39978170594), перенос обеих архитектур и контрольных сумм — в
+[Actions 39979396032](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39979396032). Пакеты опубликованы в общем
+[GitHub Release v0.5.1](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.5.1); `/releases/latest` подтверждён для этого
+выпуска, ID `422002954`.
 
-Планируемые пакеты одного выпуска:
+- [Apple Silicon (aarch64)](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_aarch64.dmg): 118 397 727 байт  SHA-256
+  `8fe47608f845026732a63242b2f53e0a1ca9355e1e3fe154b69418817a22eda4`.
+- [Intel (x64)](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_x64.dmg): 134 516 598 байт  SHA-256
+  `1e8bd835719e584bae071169029d8708200c4743d13e6b57ed34dbc4a71c7a28`.
 
-- [Apple Silicon (aarch64)](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_aarch64.dmg).
-- [Intel (x64)](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_x64.dmg).
+[Контрольные суммы macOS](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/SHA256SUMS-macos.txt) и
+[всех пакетов](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/SHA256SUMS.txt) приложены к выпуску. Размеры и
+GitHub asset digest сверены с контрольными суммами DMG, созданными CI.
+Повторное полное скачивание публичных DMG для побайтовой проверки не выполнялось.
+Полный отчёт: [0.5.1 verification](release-0.5.1-verification.md).
+Независимая анонимная проверка подтвердила HTTP 200, тип файла и размер обоих
+DMG через HEAD, а также совпадение скачанного файла контрольных сумм с
+публичными GitHub asset digest.
 
 Это **неподписанные и не notarized Apple preview-пакеты для macOS 14+**.
 Их размещение рядом со стабильным Windows-пакетом не означает проверенного
@@ -21,7 +32,7 @@ Keychain и обновление на физическом Mac пока не п�
 Для предыдущей версии preview.7 обе архитектуры успешно собраны из
 `29d8400f2a38d7ea2ab384dbb2ad495f0369d961`:
 [Actions 39972947135](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/39972947135).
-Это подтверждает сборку preview.7, а не нового пакета 0.5.1 и не runtime на Mac.
+Это исторические результаты сборки preview.7; они не подтверждают runtime на Mac.
 
 Для обновления завершите Pulse, откройте DMG и замените приложение в «Программах».
 Не удаляйте папку данных. Идентификатор `ru.vkplayer.desktop` и профиль сохранены;
