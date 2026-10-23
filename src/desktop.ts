@@ -1,6 +1,7 @@
 import { invoke, isTauri, convertFileSrc } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { DesktopAPI, DesktopCommand, Track, PersistedState, VkSnapshot, VkWebPlayback, ImportProgress } from './shared/contracts'
+import { soundCloudMediaUrl, soundCloudSessionId } from './shared/mediaSource'
 
 // Both native shells implement the same narrow contract. Browser preview stays local.
 if (isTauri()) {
@@ -32,9 +33,9 @@ if (isTauri()) {
     soundCloudBinding: trackId => invoke('soundcloud_binding', { trackId }),
     resolveSoundCloud: async trackId => {
       const source = await invoke<{ path: string; title: string; explicit?: boolean; sourceId: string }>('resolve_soundcloud', { trackId })
-      return { ...source, url: convertFileSrc(source.path, 'pulse-media') }
+      return { ...source, url: soundCloudMediaUrl(source.path, convertFileSrc) }
     },
-    releaseSoundCloud: url => invoke('release_soundcloud', { sessionId: url ? new URL(url).pathname.split('/').filter(Boolean)[0] : null }),
+    releaseSoundCloud: url => invoke('release_soundcloud', { sessionId: url === undefined ? null : soundCloudSessionId(url) }),
     getState: async () => {
       const value = await invoke<PersistedState | null>('get_state')
       return value ? { ...value, tracks: value.tracks.map(track) } : null

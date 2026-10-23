@@ -24,6 +24,9 @@ const results = [];
 const live = process.argv.includes('--live');
 const queryIndex = process.argv.indexOf('--query');
 const query = queryIndex < 0 ? 'Капля испуга' : process.argv[queryIndex + 1];
+const trackIndex = process.argv.indexOf('--track');
+const expectedTrackId = trackIndex < 0 ? undefined : process.argv[trackIndex + 1];
+if (expectedTrackId && !/^[1-9]\d{0,19}$/.test(expectedTrackId)) throw Error('Invalid explicit public track identity');
 const gatewayOrigin = 'https://pulse-player.duckdns.org';
 const liveResources = new Map();
 const upstreamRequests = [];
@@ -69,7 +72,7 @@ fixture.set('/hls.js', { bytes: script, type: 'application/javascript' });
 fixture.set('/', { bytes: Buffer.from('<!doctype html><html><body><button id="play">Play</button><script src="/hls.js"></script></body></html>'), type: 'text/html' });
 if (live) {
   const search = await publicJson('/v1/soundcloud/tracks?' + new URLSearchParams({ q: query, limit: '10', linked_partitioning: 'true' }));
-  const candidate = search.collection?.find(row => row.access === 'playable' && row.streamable !== false && Number(row.duration) >= 30_000 && /^(?:soundcloud:tracks:)?[1-9]\d*$/.test(String(row.urn || row.id)));
+  const candidate = search.collection?.find(row => row.access === 'playable' && row.streamable !== false && Number(row.duration) >= 30_000 && /^(?:soundcloud:tracks:)?[1-9]\d*$/.test(String(row.urn || row.id)) && (!expectedTrackId || String(row.urn || row.id).replace(/^soundcloud:tracks:/, '') === expectedTrackId));
   if (!candidate) throw Error('No playable public search result with sufficient duration was returned');
   const id = String(candidate.urn || candidate.id).replace(/^soundcloud:tracks:/, '');
   liveTrack = { id, title: candidate.title, artist: candidate.metadata_artist || candidate.user?.username || '', duration: Number(candidate.duration) / 1000 };
@@ -247,9 +250,11 @@ try {
   const officialBinary = process.env.PULSE_QA_OFFICIAL_FIREFOX_EXE;
   const geckoBinary = process.env.PULSE_QA_GECKODRIVER_EXE;
   const firefoxPath = process.env.PULSE_QA_FIREFOX_EXE || firefox.executablePath();
-  if (officialBinary && geckoBinary) await run('Mozilla Firefox (official, WebDriver)', officialFirefoxType(path.resolve(officialBinary), path.resolve(geckoBinary)), {});
-  else if (existsSync(firefoxPath)) await run('Playwright Firefox', firefox, { executablePath: firefoxPath });
-  else results.push({ name: 'Playwright Firefox', status: 'unavailable', reason: 'Run npx playwright install firefox to install the isolated QA browser' });
+  if (!process.argv.includes('--edge-only')) {
+    if (officialBinary && geckoBinary) await run('Mozilla Firefox (official, WebDriver)', officialFirefoxType(path.resolve(officialBinary), path.resolve(geckoBinary)), {});
+    else if (existsSync(firefoxPath)) await run('Playwright Firefox', firefox, { executablePath: firefoxPath });
+    else results.push({ name: 'Playwright Firefox', status: 'unavailable', reason: 'Run npx playwright install firefox to install the isolated QA browser' });
+  }
 } finally {
   server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   const report = { generatedAt: new Date().toISOString(), mode: live ? 'live-managed-gateway' : 'synthetic-loopback', liveTrack, fixture: { directory: fixtureDirectory, description: live ? 'One fresh public gateway HLS grant relayed in memory with an exact gateway-origin allowlist; no account, key or persistent audio cache' : '32-second 440 Hz AAC 128k HLS, two-second segments; exact same bytes and shipping hls.js in both browsers', ...(live ? {} : { hashes }), hlsJsSha256: createHash('sha256').update(script).digest('hex') }, excluded: ['Google Chrome and bundled Chromium: excluded by explicit user instruction'], results, requests, upstreamRequests, limits: ['Fresh isolated browser contexts, no existing browser cookies/cache/extensions', 'Media clock and decoder events measure playback progress; physical speaker output and sub-millisecond audible glitches are not measured', live ? 'Browsers receive the same live grant sequentially through a Node relay; the second run may benefit from the gateway session cache, so this is not a cold-network speed benchmark' : 'Synthetic loopback transport isolates browser/MSE compatibility; it does not prove live VK or SoundCloud network behavior', 'Host VPN and system routing were not changed or independently verified', 'No WebAudio/equalizer path: equalizer disabled as requested; no native application transport is exercised'] };

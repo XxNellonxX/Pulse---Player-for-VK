@@ -269,26 +269,30 @@ try {
     assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'b');assert.equal(await page.evaluate(()=>window.__audios.filter(item=>!item.paused).length),1);
     assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-2/0'))),true);assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-3/0'))),false);
   });
-  await run('managed VPS startup that never receives media switches the exact track to VK within six seconds',{managed:true,holdMedia:true,fastTimers:true},async page=>{
+  await run('managed VPS startup renews after six seconds then falls back once after the second bounded attempt',{managed:true,holdMedia:true,fastTimers:true},async page=>{
     await start(page);await advance(page,5900);
     assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false,'The route changed before the allowed startup budget');
-    await advance(page,250);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    await advance(page,250);await page.waitForFunction(()=>window.__resolveCalls.length===2&&window.__engines.length===2);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false,'The first no-progress streak must get one same-recording renewal');
+    await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
     assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:0}]);
-    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1,'Slow startup must not spend another VPS grant before trying the same VK track');
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2,'Slow startup must spend only one renewed source before trying the same VK track');
     assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'VK');
     await page.evaluate(()=>window.__engines[0].ready());await advance(page,30000);
     assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false,'Late VPS media started over the direct VK route');
     assert.equal(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').length),1,'Fallback started repeated VK commands');
     assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'a');
   });
-  await run('a managed VPS audio stall switches once to the same VK item at its real media position',{managed:true,fastTimers:true},async page=>{
+  await run('a managed VPS audio stall renews once then switches to the same VK item at its real media position',{managed:true,fastTimers:true},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);
     await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=37;audio.dispatchEvent(new Event('timeupdate'));audio.dispatchEvent(new Event('waiting'));});
+    await advance(page,6200);await renewed(page);assert.equal(await page.evaluate(()=>window.__audios.at(-1).currentTime),37);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);
     await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
     assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:37}]);
-    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1);assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);
     await page.evaluate(()=>window.__emit({network:'error',error:'synthetic VK also failed'}));await advance(page,30000);
-    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1,'Failed VK fallback looped back into the exhausted VPS source');
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2,'Failed VK fallback looped back into the exhausted VPS source');
   });
   await run('a managed route recovered by genuine media-clock progress stays on VPS',{managed:true,fastTimers:true},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);
@@ -301,16 +305,17 @@ try {
     await page.evaluate(()=>window.__playback.toggle());await advance(page,30000);
     assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'a');
   });
-  await run('late slow VPS resolution cannot replace its VK fallback or start a second sound',{managed:true,fastTimers:true,holdFirstResolve:true},async page=>{
+  await run('late slow VPS resolution cannot replace the one renewed source or start a second sound',{managed:true,fastTimers:true,holdFirstResolve:true},async page=>{
     await page.evaluate(()=>window.__playback.playTrack('a'));await page.waitForFunction(()=>window.__gates.length===1);await advance(page,6200);
-    await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));await page.evaluate(()=>window.__gates.shift()());await page.waitForTimeout(40);
-    assert.equal(await page.evaluate(()=>window.__engines.length),0);assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-1/0'))),true);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'VK');
-    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>item.id)),['a']);
+    await page.waitForFunction(()=>window.__resolveCalls.length===2&&window.__playback.playing);await page.evaluate(()=>window.__gates.shift()());await page.waitForTimeout(40);
+    assert.equal(await page.evaluate(()=>window.__engines.length),1);assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-1/0'))),true);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'SoundCloud');
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>item.id)),[]);
+    assert.equal(await page.evaluate(()=>window.__audios.filter(item=>!item.paused).length),1);assert.match(await page.evaluate(()=>window.__engines.at(-1).url),/session-2\/0$/);
   });
   await run('the next selection retries VPS after a track-specific direct fallback',{managed:true,holdMedia:true,fastTimers:true},async page=>{
-    await start(page);await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    await start(page);await advance(page,6200);await page.waitForFunction(()=>window.__engines.length===2);await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
     await page.evaluate(()=>{window.__holdMedia=false;window.__playback.playTrack('b');});await page.waitForFunction(()=>window.__state.currentTrackId==='b'&&window.__playback.playing);
-    assert.deepEqual(await page.evaluate(()=>window.__resolveCalls.map(item=>item.id)),['a','b']);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'SoundCloud');
+    assert.deepEqual(await page.evaluate(()=>window.__resolveCalls.map(item=>item.id)),['a','a','b']);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'SoundCloud');
     assert.equal(await page.evaluate(()=>window.__audios.filter(item=>!item.paused).length),1);
   });
   await run('switching tracks cancels the old VPS fallback timer without sending a play command for the old item',{managed:true,fastTimers:true},async page=>{
@@ -321,19 +326,22 @@ try {
   await run('a user seek during managed buffering is preserved when direct fallback becomes necessary',{managed:true,fastTimers:true},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>window.__audios.at(-1).dispatchEvent(new Event('waiting')));await advance(page,3000);
     await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.seeking=true;audio.dispatchEvent(new Event('seeking'));window.__playback.seek(61);audio.seeking=false;audio.dispatchEvent(new Event('seeked'));audio.dispatchEvent(new Event('waiting'));});
-    await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    await advance(page,6200);await renewed(page);assert.equal(await page.evaluate(()=>window.__audios.at(-1).currentTime),61);await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
     assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:61}]);
   });
   await run('playing and canplay events cannot hide a frozen managed audio clock',{managed:true,fastTimers:true},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);
     for(let index=0;index<6;index++){await advance(page,1000);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.dispatchEvent(new Event('canplay'));audio.dispatchEvent(new Event('playing'));});}
+    await renewed(page);assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);
+    for(let index=0;index<6;index++){await advance(page,1000);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.dispatchEvent(new Event('canplay'));audio.dispatchEvent(new Event('playing'));});}
     await advance(page,250);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
     assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:0}]);
   });
-  await run('a fatal managed source error tries direct VK immediately without another slow VPS grant',{managed:true,fastTimers:true},async page=>{
+  await run('a fatal managed source error renews the same recording once before trying direct VK',{managed:true,fastTimers:true},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=17;audio.dispatchEvent(new Event('timeupdate'));window.__engines.at(-1).fatal();});
-    await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
-    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:17}]);assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1);
+    await renewed(page);assert.equal(await page.evaluate(()=>window.__audios.at(-1).currentTime),17);assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);
+    await page.evaluate(()=>window.__engines.at(-1).fatal());await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:17}]);assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
   });
   await run('managed capability expiry keeps one exact-recording renewal before the bounded no-progress fallback',{managed:true,fastTimers:true},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=25;audio.dispatchEvent(new Event('timeupdate'));});await expire(page);await renewed(page);

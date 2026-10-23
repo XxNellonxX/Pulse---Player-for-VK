@@ -324,9 +324,11 @@ fn checked_track(app: &AppHandle, id: &str) -> Result<vk_web::UploadGuard, Strin
         .unwrap()
         .tracks
         .iter()
-        .any(|t| t.id == id && t.source == "vk" && t.available)
+        // A VK restriction does not determine SoundCloud's access. The known
+        // registry identity, active account and provider grant remain required.
+        .any(|t| t.id == id && t.source == "vk")
     {
-        return Err("Трек недоступен или удалён из библиотеки.".into());
+        return Err("Трек удалён из библиотеки или не принадлежит источнику VK.".into());
     }
     Ok(guard)
 }
@@ -698,14 +700,12 @@ fn session_current(created_at: i64, generation: u64, active_generation: u64, now
 fn register_media_url(
     urls: &mut Vec<String>,
     upstream: &Url,
-    origin: &str,
-    token: &str,
 ) -> Result<String, String> {
     let upstream = validate_media_url(upstream.as_str())
         .map_err(|_| "Источник вернул неподдерживаемую ссылку HLS.")?;
-    register_checked_media_url(urls, upstream, origin, token)
+    register_checked_media_url(urls, upstream)
 }
-fn register_checked_media_url(urls: &mut Vec<String>, upstream: String, origin: &str, token: &str) -> Result<String,String> {
+fn register_checked_media_url(urls: &mut Vec<String>, upstream: String) -> Result<String,String> {
     let position = match urls.iter().position(|url| url == &upstream) {
         Some(index) => index,
         None => {
@@ -716,7 +716,12 @@ fn register_checked_media_url(urls: &mut Vec<String>, upstream: String, origin: 
             urls.len() - 1
         }
     };
-    Ok(format!("{origin}/{token}/{position}"))
+    // Wry translates Windows' http(s)://pulse-media.localhost into an internal
+    // pulse-media://localhost request before invoking us. A URI reconstructed
+    // from that internal origin cannot be loaded by the browser's HLS XHR.
+    // Every manifest is already at /<session>/<index>; a relative index keeps
+    // the browser's real platform origin and the exact same session path.
+    Ok(position.to_string())
 }
 
 fn resource_response(
@@ -873,15 +878,6 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
         let Ok(base) = Url::parse(&resource.final_url) else {
             return media_response(502, "text/plain", vec![], None);
         };
-        let origin = format!(
-            "{}://{}",
-            request.uri().scheme_str().unwrap_or("pulse-media"),
-            request
-                .uri()
-                .authority()
-                .map(|a| a.as_str())
-                .unwrap_or("localhost")
-        );
         let result = rewrite_manifest(text, &base, |upstream| {
             let mut sessions = shared.sessions.lock().unwrap();
             let session = sessions.get_mut(token).ok_or("Сеанс завершён.")?;
@@ -889,7 +885,7 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
                 return Err("Сеанс завершён.".into());
             }
             let checked = client.validate_source(upstream.as_str()).map_err(|_|"Неподдерживаемый медиаканал.")?;
-            register_checked_media_url(&mut session.urls, checked, &origin, token)
+            register_checked_media_url(&mut session.urls, checked)
         });
         match result {
             Ok(text) => text.into_bytes(),
@@ -1335,12 +1331,9 @@ mod tests {
     #[test]
     fn redirected_manifest_variants_keys_maps_and_byte_ranges_stay_local() {
         let base = Url::parse("https://cf-hls-media.sndcdn.com/redirected/path/master.m3u8?token=private-test-capability").unwrap();
-        let token = "a".repeat(48);
         let fixture = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=160000,AUDIO=\"a\"\naudio/index.m3u8\n#EXT-X-KEY:METHOD=AES-128,URI=\"../key\"\n#EXT-X-MAP:URI=\"https://cf-hls-media.sndcdn.com/init.mp4?token=fixture\"\n#EXT-X-BYTERANGE:100@10\n#EXTINF:6.0,\nsegment.m4a\n#EXT-X-ENDLIST";
         let mut urls = vec![];
-        let output = rewrite_manifest(fixture, &base, |url| {
-            register_media_url(&mut urls, &url, "http://pulse-media.localhost", &token)
-        })
+        let output = rewrite_manifest(fixture, &base, |url| register_media_url(&mut urls, &url))
         .unwrap();
         assert_eq!(urls.len(), 4);
         assert_eq!(
@@ -1349,28 +1342,57 @@ mod tests {
         );
         assert_eq!(urls[1], "https://cf-hls-media.sndcdn.com/redirected/key");
         assert!(output.contains("#EXT-X-BYTERANGE:100@10"));
-        assert!(output.contains(&format!("URI=\"http://pulse-media.localhost/{token}/0\"")));
-        assert!(output.contains(&format!("\nhttp://pulse-media.localhost/{token}/0\n")));
+        assert!(output.contains("URI=\"0\""));
+        assert!(output.contains("\n0\n"));
         assert!(!output.contains("sndcdn.com") && !output.contains("private-test-capability"));
         assert!(output.ends_with("#EXT-X-ENDLIST"));
     }
 
     #[test]
+    fn relative_hls_children_keep_the_renderers_platform_origin_and_private_session() {
+        let token = "b".repeat(48);
+        let upstream = Url::parse("https://cf-hls-media.sndcdn.com/master/index.m3u8?private=fixture").unwrap();
+        let mut urls = vec![upstream.to_string()];
+        let master = "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=160000,AUDIO=\"a\"\naudio/index.m3u8";
+        let rewritten_master = rewrite_manifest(master, &upstream, |url| register_media_url(&mut urls, &url)).unwrap();
+        assert!(rewritten_master.contains("URI=\"1\""));
+        assert!(rewritten_master.ends_with("\n1"));
+        let nested_upstream = Url::parse(&urls[1]).unwrap();
+        let nested = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"../key?private=fixture\"\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-BYTERANGE:200@100\n#EXTINF:4,\nfirst.ts\n#EXTINF:4,\nsecond.ts\n#EXT-X-ENDLIST";
+        let rewritten_nested = rewrite_manifest(nested, &nested_upstream, |url| register_media_url(&mut urls, &url)).unwrap();
+        assert!(rewritten_nested.contains("URI=\"2\""));
+        assert!(rewritten_nested.contains("URI=\"3\""));
+        assert!(rewritten_nested.contains("#EXT-X-BYTERANGE:200@100"));
+        assert!(rewritten_nested.contains("\n4\n") && rewritten_nested.contains("\n5\n"));
+        assert_eq!(urls.len(), 6);
+        assert!(!rewritten_master.contains("private") && !rewritten_nested.contains("sndcdn"));
+        // Wry passes pulse-media://localhost to the Rust callback on Windows,
+        // but hls.js must resolve child resources against its http(s) URL.
+        // Relative indices also retain the native scheme on macOS.
+        for origin in ["http://pulse-media.localhost", "https://pulse-media.localhost", "pulse-media://localhost"] {
+            let parent = Url::parse(&format!("{origin}/{token}/0")).unwrap();
+            let variant = parent.join("1").unwrap();
+            for index in 1..urls.len() {
+                let child = variant.join(&index.to_string()).unwrap();
+                assert_eq!(child.scheme(), parent.scheme());
+                assert_eq!(child.host_str(), parent.host_str());
+                assert_eq!(child.query(), None);
+                assert_eq!(child.path(), format!("/{token}/{index}"));
+                assert_eq!(media_path(child.path()), Some((token.as_str(), index)));
+            }
+        }
+    }
+
+    #[test]
     fn manifests_reject_external_targets_and_respect_registered_url_budget() {
         let base = Url::parse("https://cf-hls-media.sndcdn.com/index.m3u8").unwrap();
-        let token = "a".repeat(48);
         for fixture in [
             "#EXTM3U\nhttps://evil.example/segment.ts",
             "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1/key\"",
             "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"unterminated",
         ] {
             let mut urls = vec![];
-            assert!(rewrite_manifest(fixture, &base, |url| register_media_url(
-                &mut urls,
-                &url,
-                "pulse-media://localhost",
-                &token
-            ))
+            assert!(rewrite_manifest(fixture, &base, |url| register_media_url(&mut urls, &url))
             .is_err());
         }
         let full = (0..MAX_SESSION_URLS)
@@ -1380,15 +1402,11 @@ mod tests {
         assert!(register_media_url(
             &mut urls,
             &Url::parse("https://cf-hls-media.sndcdn.com/0.ts").unwrap(),
-            "pulse-media://localhost",
-            &token
         )
         .is_ok());
         assert!(register_media_url(
             &mut urls,
             &Url::parse("https://cf-hls-media.sndcdn.com/new.ts").unwrap(),
-            "pulse-media://localhost",
-            &token
         )
         .is_err());
         assert_eq!(urls.len(), MAX_SESSION_URLS);
@@ -1449,3 +1467,7 @@ mod tests {
         assert!(!output.contains("secret="));
     }
 }
+
+#[cfg(test)]
+#[path = "soundcloud_manifest_independent_tests.rs"]
+mod independent_manifest_tests;

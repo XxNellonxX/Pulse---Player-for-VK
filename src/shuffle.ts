@@ -1,4 +1,9 @@
-import type { Track } from './shared/contracts'
+import type { AppSettings, Track } from './shared/contracts'
+
+/** VK availability describes VK only; another provider still validates its own access. */
+export function canAttemptPlayback(track: Track, settings: Pick<AppSettings, 'preferSoundCloud'> = { preferSoundCloud: false }): boolean {
+  return track.available || track.source === 'vk' && settings.preferSoundCloud
+}
 
 /** One permutation of the complete input, independent of pagination or dates. */
 export function shuffleIds(ids: readonly string[], random: () => number = Math.random): string[] {
@@ -11,8 +16,8 @@ export function shuffleIds(ids: readonly string[], random: () => number = Math.r
   return result
 }
 
-export function ownMusicIds(tracks: readonly Track[]): string[] {
-  return [...new Set(tracks.filter(track => track.available && (track.source === 'local' || track.remote?.inLibrary !== false)).map(track => track.id))]
+export function ownMusicIds(tracks: readonly Track[], settings?: Pick<AppSettings, 'preferSoundCloud'>): string[] {
+  return [...new Set(tracks.filter(track => canAttemptPlayback(track, settings) && (track.source === 'local' || track.remote?.inLibrary !== false)).map(track => track.id))]
 }
 
 /** Keep the playing source untouched; the stored order is the remaining deck. */

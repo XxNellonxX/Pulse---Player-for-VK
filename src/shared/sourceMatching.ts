@@ -47,10 +47,15 @@ export type RankedSourceResult<T extends SoundCloudCandidate = SoundCloudCandida
 };
 
 const variantMarker = /\b(?:live|remix|remaster(?:ed)?|cover|instrumental|acapella|a\s+cappella|karaoke|acoustic|demo|edit|extended|nightcore|sped[\s-]*up|slowed(?:[\s-]*down)?|reverb|original\s+mix)\b|(?:ремикс|ремастер|концерт|кавер|замедлен|ускорен)/iu;
-const ornament = /^(?:official\s+(?:(?:music|lyric)\s+)?(?:audio|video)|lyric(?:s|\s+video)?|audio|visuali[sz]er|официальн(?:ое|ый)\s+(?:аудио|видео))$/iu;
+const ornament = /^(?:official\s+(?:(?:music|lyric)\s+)?(?:audio|video)|lyric(?:s|\s+video)?|audio|visuali[sz]er|официальн(?:ое|ый)\s+(?:аудио|видео)|все\s+площадки)$/iu;
 const explicitLabel = /^(?:explicit|uncensored|un[ -]?censored|dirty(?:\s+version)?|без\s+цензуры)$/iu;
 const cleanLabel = /^(?:clean(?:\s+version)?|censored|цензурн(?:ая|ый|ое)(?:\s+версия)?)$/iu;
 const featureLabel = /^(?:feat\.?|ft\.?|featuring)\s+(.+)$/iu;
+const producerLabel = /^(?:prod\.?|p\.|produced\s+by|прод\.?|продюсер)\s*[:.]?\s+\S.+$/iu;
+const decorativeFace = /^[\s„“”"'•·.<>^~_\-\\/;:ᵔᴗω♡♥☆★✧✦＊*°˃˂̵๑و]+$/u;
+const creditEditionWord = /live|remix|remaster|cover|instrumental|acapella|karaoke|acoustic|demo|edit|extended|nightcore|sped|slowed|reverb|mix|alternate|take|version|clean|explicit|censor|dirty|ремикс|ремастер|концерт|кавер|замедлен|ускорен|верси|цензур/iu;
+const editionTerms = new Set(['mono', 'stereo', 'radio', 'chopped', 'chop', 'pitched', 'pitch', 'part', 'pt', 'vip', 'dub', 'vol', 'volume', 'side', 'reprise', 'rework', 'revision', 'alt', 'album', 'studio', 'bootleg', 'mashup', '8d', '3d', 'spatial', 'digital', 'original', 'instrumental', 'vocals', 'vocal', 'rehearsal', 'session', 'alternate', 'remaster', 'remastered', 'remix', 'mix', 'take', 'bass', 'boost', 'boosted', 'earrape', 'muffled', 'distorted', 'distortion', 'binaural', 'surround']);
+const editionPhrase = /без\s+(?:мата|ругательств|(?:нецензурной|ненормативной)\s+лексики)|no\s+(?:swearing|profanity)|family\s+friendly/iu;
 const validId = (value: string) => typeof value === 'string' && value.trim().length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(value);
 const durationKnown = (value: number) => Number.isFinite(value) && value > 0;
 
@@ -58,6 +63,42 @@ const durationKnown = (value: number) => Number.isFinite(value) && value > 0;
 export function normalizeRecordingText(value: string): string {
   return value.normalize('NFKC').toLowerCase().replace(/ё/gu, 'е')
     .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/gu, ' ');
+}
+
+function editionIntent(value: string): boolean {
+  // Only the edition classifier folds accents. Artist/title identities retain
+  // their stricter normalizer. Unicode compatibility letters, punctuation and
+  // accents must not disguise a known edition or a numbered/roman take.
+  const folded = value.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase();
+  const words = normalizeRecordingText(folded).split(' ').filter(Boolean);
+  return creditEditionWord.test(folded) || editionPhrase.test(normalizeRecordingText(folded)) || words.some(word => editionTerms.has(word) ||
+    /^(?:\d+|[ivxlcdm]+)$/u.test(word) || /^(?:part|pt|vol|volume|side|take|version|v)\d+$/u.test(word));
+}
+
+function normalizeRecordingTitle(value: string): string {
+  const text = normalizeRecordingText(value);
+  if (text) return text;
+  const normalized = value.normalize('NFKC');
+  // Some recordings have emoji-only names. Keep their exact sequence and
+  // composition instead of treating every such title as empty or equivalent.
+  // Variation selectors and punctuation only affect presentation; ZWJ, skin
+  // modifiers, regional flags and subdivision tags remain identity evidence.
+  if (!/[\p{Extended_Pictographic}\p{Regional_Indicator}]/u.test(normalized)) return '';
+  return [...normalized].filter(character => /[\p{Extended_Pictographic}\p{Regional_Indicator}\p{Emoji_Modifier}\u200d\u{e0020}-\u{e007f}]/u.test(character)).join('');
+}
+
+/** Delimiters must be explicit: never split substrings of names such as Xzibit. */
+function artistNames(value: string): string[] {
+  return value.split(/\s*,\s*|\s+[x×&]\s+|\s+(?:feat\.?|ft\.?|featuring)\s+|\s+(?=#[\p{L}\p{N}])/iu)
+    .map(normalizeRecordingText).filter(Boolean);
+}
+
+function mixedScriptTitle(value: string): string | undefined {
+  // This only suggests review for visually similar mixed-script words. It is
+  // never used as recording identity, for artist names, or for automatic binds.
+  if (!/\p{Script=Cyrillic}/u.test(value) || !/[a-z]/iu.test(value)) return undefined;
+  const lookalikes: Record<string, string> = { a: 'а', c: 'с', e: 'е', o: 'о', p: 'р', x: 'х', y: 'у' };
+  return value.replace(/[aceopxy]/gu, letter => lookalikes[letter]);
 }
 
 function isrc(value?: string): string | undefined {
@@ -74,30 +115,83 @@ function metadataIdentity(metadata: RecordingMetadata) {
   const classify = (value: string): boolean => {
     const text = value.trim();
     const feature = text.match(featureLabel);
-    if (feature) { features.push(normalizeRecordingText(feature[1])); return true; }
+    if (feature) { features.push(feature[1]); return true; }
     if (explicitLabel.test(text)) { labels.add('explicit'); return true; }
     if (cleanLabel.test(text)) { labels.add('clean'); return true; }
     if (ornament.test(text)) return true;
     if (variantMarker.test(text)) { variants.push(normalizeRecordingText(text)); return true; }
+    if (producerLabel.test(text) && !editionIntent(text)) return true;
+    if (text.length >= 3 && decorativeFace.test(text)) return true;
     return false;
   };
   let title = metadata.title.replace(/\(([^()]*)\)|\[([^\[\]]*)\]/gu, (whole, round: string | undefined, square: string | undefined) => classify(round ?? square ?? '') ? ' ' : whole);
   // A spaced separator identifies a descriptor without splitting names such as AC/DC.
   title = title.replace(/\s+[-–—|]\s+([^|]+)$/u, (whole, suffix: string) => classify(suffix) ? ' ' : whole);
+  // A narrowly recognized uploader instruction is presentation, not a take or
+  // a contributor. Require an explicit boundary; never trim an arbitrary tail.
+  title = title.replace(/(?:^|[\s\\/|#])не\s*форс(?:ить|ите)?\s*$/iu, ' ');
   if (metadata.version?.trim()) classify(metadata.version) || variants.push(normalizeRecordingText(metadata.version));
-  const artistParts = metadata.artist.split(/\s+(?:feat\.?|ft\.?|featuring)\s+/iu);
-  const primaryArtist = normalizeRecordingText(artistParts.shift() ?? '');
-  features.push(...artistParts.map(normalizeRecordingText));
+  const names = artistNames(metadata.artist);
+  const primaryArtist = names[0] ?? '';
+  const contributors = [...new Set([...names, ...features.flatMap(artistNames)].filter(Boolean))].sort();
   const censorship: Censorship = labels.size === 1 ? [...labels][0] : 'unknown';
   return {
-    title: normalizeRecordingText(title),
-    artist: [primaryArtist, ...[...new Set(features.filter(Boolean))].sort()].join('|'),
+    title: normalizeRecordingTitle(title),
+    artist: contributors.join('|'),
     primaryArtist,
     version: [...new Set(variants.filter(Boolean))].sort().join('|'),
     censorship,
     conflict: labels.size > 1,
     isrc: isrc(metadata.isrc),
+    titleReview: false,
   };
+}
+
+function titleContributorIdentity(metadata: RecordingMetadata, corroboratedArtists: string) {
+  // A trailing "+alias" is a contributor only when a provider's explicit
+  // artist list independently contains the complete aggregate. It cannot turn
+  // an arbitrary plus-sign subtitle or a different collaborator into a match.
+  const match = metadata.title.match(/^(.+?)\s+\+\s*([^+]+)$/u);
+  if (!match || !match[1].trim() || match[2].trim().length > 80 || editionIntent(match[2])) return undefined;
+  const aliases = artistNames(match[2]);
+  if (!aliases.length || aliases.length > 3) return undefined;
+  const base = metadataIdentity({ ...metadata, title: match[1].trim() });
+  const aggregate = [...new Set([...base.artist.split('|'), ...aliases].filter(Boolean))].sort().join('|');
+  return aggregate === corroboratedArtists ? { ...base, artist: aggregate } : undefined;
+}
+
+function candidateIdentity(candidate: RecordingMetadata, wanted: ReturnType<typeof metadataIdentity>) {
+  const direct = metadataIdentity(candidate);
+  if (direct.artist === wanted.artist && direct.title === wanted.title) return direct;
+  const contributed = titleContributorIdentity(candidate, wanted.artist);
+  if (contributed?.artist === wanted.artist && contributed.title === wanted.title) return contributed;
+  // SoundCloud premiere channels often put the performers in the title. Keep
+  // the provider's original title/artist on the candidate; only use the rigid
+  // structure as additional matching evidence when BOTH requested fields agree.
+  const title = candidate.title.replace(/^\s*TRACK\s+PREMIERE\s*:\s*/iu, '');
+  const parts = title.split(/\s+[-–—]\s+/u);
+  if (parts.length === 2 && parts[0].trim() && parts[1].trim()) {
+    const embedded = metadataIdentity({ ...candidate, artist: parts[0], title: parts[1] });
+    if (embedded.artist === wanted.artist && embedded.title === wanted.title) return embedded;
+  }
+  // An unlabelled parenthesized suffix may be a producer credit OR a named
+  // edition. Surface the exact base title for explicit review, never auto-bind.
+  const baseTitle = candidate.title.replace(/\s*\([^()]+\)\s*$/u, '').trim();
+  if (baseTitle !== candidate.title.trim() && direct.artist === wanted.artist) {
+    const base = metadataIdentity({ ...candidate, title: baseTitle });
+    if (base.title === wanted.title && !direct.version && base.version === wanted.version) {
+      const suffix = candidate.title.match(/\(([^()]+)\)\s*$/u)?.[1] ?? '';
+      const aliases = suffix.split(',').map(alias => alias.trim());
+      // A compact comma-separated producer list is a recognizable credit
+      // convention. Known edition semantics and numbered takes stay distinct;
+      // this bounded metadata heuristic is still not fingerprint proof. Artist,
+      // title, duration, version, censorship and ISRC checks remain independent.
+      const producerList = aliases.length >= 2 && aliases.length <= 4 && aliases.every(alias =>
+        /^\p{L}[\p{L}\p{N}_.@$-]{0,31}$/u.test(alias) && !editionIntent(alias));
+      return { ...base, titleReview: !producerList };
+    }
+  }
+  return direct;
 }
 
 export function recordingCensorship(metadata: RecordingMetadata): Censorship {
@@ -124,10 +218,14 @@ export function rankSoundCloudCandidates<T extends SoundCloudCandidate>(
   candidates: readonly T[],
   options: SourceMatchingOptions = {},
 ): RankedSourceResult<T> {
-  const wanted = metadataIdentity(track);
+  const originalWanted = metadataIdentity(track);
   const confirmedId = options.confirmed?.trackId === track.id ? options.confirmed.sourceId : undefined;
   const ranked = candidates.map((candidate): RankedSourceCandidate<T> => {
-    const identity = metadataIdentity(candidate), reasons: SourceMatchReason[] = [];
+    // The wanted record may itself put a contributor in the title. Only the
+    // other provider's explicit artist field may corroborate this expansion.
+    const candidateArtists = [...new Set(artistNames(candidate.artist))].sort().join('|');
+    const wanted = titleContributorIdentity(track, candidateArtists) ?? originalWanted;
+    const identity = candidateIdentity(candidate, wanted), reasons: SourceMatchReason[] = [];
     let quality: SourceMatchQuality = 'exact', score = 0;
     const review = (reason: SourceMatchReason) => { reasons.push(reason); if (quality === 'exact') quality = 'review'; };
     const mismatch = (reason: SourceMatchReason) => { reasons.push(reason); quality = 'mismatch'; };
@@ -138,8 +236,9 @@ export function rankSoundCloudCandidates<T extends SoundCloudCandidate>(
     if (identity.artist === wanted.artist) score += 30;
     else if (identity.primaryArtist === wanted.primaryArtist) { score += 10; review('artist'); }
     else mismatch('artist');
-    if (identity.title === wanted.title) score += 35;
-    else if (tokenSimilarity(identity.title, wanted.title) >= .75) { score += 12; review('title'); }
+    if (identity.title === wanted.title) { score += 35; if (identity.titleReview) review('title'); }
+    else if (tokenSimilarity(identity.title, wanted.title) >= .75 ||
+      mixedScriptTitle(identity.title) === wanted.title || mixedScriptTitle(wanted.title) === identity.title) { score += 12; review('title'); }
     else mismatch('title');
     if (identity.version === wanted.version) score += 15;
     else mismatch('version');

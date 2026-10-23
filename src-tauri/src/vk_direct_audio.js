@@ -12,6 +12,8 @@
   const RESOLVE_TIMEOUT = 20000;
   const LOAD_TIMEOUT = 25000;
   const START_TIMEOUT = 60000;
+  const MAX_SOURCE_LOADS = 3;
+  const SOURCE_HEDGE_DELAY = 1500;
   const failure = message => new Error(message);
   const cancelled = () => Object.assign(new Error('Команда воспроизведения отменена.'), { code: CANCELLED });
   const int = value => Number.isSafeInteger(Number(value)) ? Number(value) : 0;
@@ -46,6 +48,21 @@
       return url.href;
     } catch { return null; }
   }
+  function sourceFactory(impl) {
+    // Website builds can emit ordinary class methods or Babel private
+    // methods. Inspect data descriptors only: discovery must not run getters
+    // or mistake a shared audio-node provider for this pure URL factory.
+    try {
+      for (let level = impl, depth = 0; level && level !== Object.prototype && depth < 4; level = Object.getPrototypeOf(level), depth++) {
+        for (const key of Object.getOwnPropertyNames(level).slice(0, 256)) {
+          if (!/(?:^|_)createAudio$/.test(key)) continue;
+          const descriptor = Object.getOwnPropertyDescriptor(level, key);
+          if (typeof descriptor?.value === 'function') return descriptor.value;
+        }
+      }
+    } catch { /* A changed optional website implementation is not required. */ }
+    return null;
+  }
   function sourceList(audio, player) {
     const sources = [];
     const fallbacks = [];
@@ -66,13 +83,13 @@
     // VK's pure source factory invokes its own session-aware URL decoder.
     // Never share its AudioNodeProvider: that provider owns the site's player.
     const impl = player?._impl;
-    const createKey = impl && Object.getOwnPropertyNames(impl).find(key => /(?:^|_)_createAudio$/.test(key) && typeof impl[key] === 'function');
+    const factory = sourceFactory(impl);
     let decoded = sources;
-    if (createKey && sources.length) {
+    if (factory && sources.length) {
       try {
         // The optional factory belongs to the changing website. Do not let
         // its in-place filtering/rewrite erase the original granted choices.
-        const value = impl[createKey]({ id: audio.fullId, sources: sources.map(source => ({ ...source })) });
+        const value = factory.call(impl, { id: audio.fullId, sources: sources.map(source => ({ ...source })) });
         if (Array.isArray(value?.sources)) decoded = value.sources;
       } catch {
         // This optional decoder can change independently of the audio API.
@@ -447,14 +464,14 @@
       // Keep the original delivery alive while metadata is refreshed. A closure
       // can return the same URL, no usable alternative, or no response at all;
       // none of those justify destroying an HLS engine and its ongoing retry.
-      // A distinct grant can still be dead. Prepare at most one extra delivery
+      // A distinct grant can still be dead. Prepare at most two extra deliveries
       // in parallel and promote only a candidate that has actual playable data.
       async function loadSources(initial, hedgeDelay) {
         const pending = initial.filter(source => !attempted.has(source.url));
         if (fallback && pending.length > 1) pending.push(pending.shift());
         const metadata = scope();
         let metadataTask = null, startMetadata = null, metadataDone = false;
-        let hedgeTimer = null, candidateTimer = null, hedgeAllowed = false;
+        let hedgeTimer = null, candidateTimer = null, candidateHedge = null, hedgeAllowed = false;
         const candidates = new Set();
         const unique = sources => sources.filter(source => !attempted.has(source.url) && !pending.some(item => item.url === source.url));
         const prepare = async () => {
@@ -481,26 +498,38 @@
           });
         };
         let nextMetadata = scheduleMetadata(hedgeDelay);
-        const candidateHedge = pending.length > 1 ? new Promise(resolve => {
-          candidateTimer = setTimeout(() => { candidateTimer = null; hedgeAllowed = true; resolve({ type: 'candidateHedge' }); }, 4000);
-        }) : null;
+        const scheduleCandidate = () => {
+          if (!pending.length || !candidates.size || candidates.size >= MAX_SOURCE_LOADS) {
+            if (candidateTimer != null) clearTimeout(candidateTimer);
+            candidateTimer = candidateHedge = null;
+          } else if (!candidateHedge) {
+            candidateHedge = new Promise(resolve => {
+              candidateTimer = setTimeout(() => { candidateTimer = candidateHedge = null; hedgeAllowed = true; resolve({ type: 'candidateHedge' }); }, SOURCE_HEDGE_DELAY);
+            });
+          }
+        };
         try {
           while (Date.now() < deadline) {
             check(generation);
-            while (pending.length && (candidates.size === 0 || (hedgeAllowed && candidates.size < 2))) {
+            while (pending.length && (candidates.size === 0 || (hedgeAllowed && candidates.size < MAX_SOURCE_LOADS))) {
               const source = pending.shift();
               if (attempted.has(source.url)) continue;
               attempted.add(source.url);
               const candidate = { scope: scope(), task: null };
+              // Keep each delivery's full load opportunity. A source taking
+              // longer than a stagger interval can still be the only viable
+              // file, so loading another source must not cancel this one.
               const timeout = Math.min(deadline - Date.now(), LOAD_TIMEOUT);
               candidate.task = prepareCandidate(source, generation, timeout, candidate.scope).then(value => ({ type: 'loaded', candidate, value }), failureValue => ({ type: 'loadError', candidate, failureValue }));
               candidates.add(candidate);
+              hedgeAllowed = false;
             }
+            scheduleCandidate();
             if (!candidates.size) {
               if (metadataDone) return false;
               startMetadata();
             }
-            const event = await Promise.race([...Array.from(candidates, candidate => candidate.task), ...(!metadataDone ? [nextMetadata] : []), ...(!hedgeAllowed && candidateHedge ? [candidateHedge] : [])]);
+            const event = await Promise.race([...Array.from(candidates, candidate => candidate.task), ...(!metadataDone ? [nextMetadata] : []), ...(candidateHedge ? [candidateHedge] : [])]);
             check(generation);
             if (event.type === 'loaded') {
               if (metadata.terminal) throw metadata.terminal;
@@ -516,6 +545,7 @@
               if (event.failureValue?.code === CANCELLED) throw event.failureValue;
               lastError = event.failureValue;
               closeScope(event.candidate.scope); candidates.delete(event.candidate);
+              hedgeAllowed = true;
               if (!candidates.size && !pending.length && !metadataDone) startMetadata();
             } else if (event.type === 'grantError') {
               if (event.failureValue?.code === CANCELLED || event.failureValue?.terminalGrant) throw event.failureValue;

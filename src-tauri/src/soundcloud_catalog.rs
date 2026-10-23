@@ -939,6 +939,8 @@ fn parse_candidate(value: &Value) -> Result<Candidate, CatalogError> {
             .get("metadata_artist")
             .and_then(Value::as_str)
             .filter(|artist| !artist.trim().is_empty())
+            .or_else(|| value.pointer("/publisher_metadata/artist").and_then(Value::as_str)
+                .filter(|artist| !artist.trim().is_empty()))
             .or_else(|| value.pointer("/user/username").and_then(Value::as_str))
             .unwrap_or("SoundCloud"),
         200,
@@ -1743,6 +1745,20 @@ mod tests {
         assert_eq!(candidate.isrc.as_deref(), Some("USABC2412345"));
         assert_eq!(candidate.explicit, Some(true));
         assert!(candidate.streamable);
+    }
+
+    #[test]
+    fn publisher_artist_precedes_uploader_without_rewriting_the_provider_title() {
+        let value = json!({"kind":"track","id":42,"title":"TRACK PREMIERE: Artist - Song",
+            "metadata_artist":" ","publisher_metadata":{"artist":"Actual Performer"},
+            "user":{"username":"Premiere Channel"},"duration":94000,"access":"playable"});
+        let candidate = parse_candidate(&value).unwrap();
+        assert_eq!(candidate.artist, "Actual Performer");
+        assert_eq!(candidate.title, "TRACK PREMIERE: Artist - Song");
+        let mut metadata = value.clone(); metadata["metadata_artist"] = json!("Metadata Performer");
+        assert_eq!(parse_candidate(&metadata).unwrap().artist, "Metadata Performer");
+        let mut empty = value; empty["publisher_metadata"]["artist"] = json!(" ");
+        assert_eq!(parse_candidate(&empty).unwrap().artist, "Premiere Channel");
     }
 
     #[test]

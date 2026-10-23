@@ -7,7 +7,7 @@ async function loadTs(file) {
   const source = await readFile(new URL(file, import.meta.url), 'utf8');
   return import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText).toString('base64')}`);
 }
-const { shuffleIds, ownMusicIds, shuffledQueue, nextShuffledCycle } = await loadTs('../src/shuffle.ts');
+const { canAttemptPlayback, shuffleIds, ownMusicIds, shuffledQueue, nextShuffledCycle } = await loadTs('../src/shuffle.ts');
 const { musicSearchResults } = await loadTs('../src/musicSearch.ts');
 const track = (id, extra = {}) => ({ id, title: `Title ${id}`, artist: 'Singer', album: '', duration: 90, source: 'vk', available: true, remote: { inLibrary: true }, ...extra });
 
@@ -41,6 +41,18 @@ test('cycle restarts include every track and avoid repeating the previous last t
   assert.deepEqual(shuffleIds(['a', 'a', 'b'], () => 0), ['b', 'a']);
   assert.deepEqual(nextShuffledCycle(['a'], 'a'), ['a']);
   assert.deepEqual(nextShuffledCycle([], null), []);
+});
+
+test('VK restrictions keep an independent-source opportunity in the entire queue without enabling missing local files', () => {
+  const restricted = track('vk-restricted', { available: false });
+  const missing = track('local-missing', { source: 'local', available: false });
+  const tracks = [track('normal'), restricted, missing, track('discovery', { available: false, remote: { inLibrary: false } })];
+  assert.equal(canAttemptPlayback(restricted, { preferSoundCloud: true }), true);
+  assert.equal(canAttemptPlayback(restricted, { preferSoundCloud: false }), false);
+  assert.equal(canAttemptPlayback(missing, { preferSoundCloud: true }), false);
+  assert.deepEqual(ownMusicIds(tracks, { preferSoundCloud: true }), ['normal', 'vk-restricted']);
+  assert.deepEqual(ownMusicIds(tracks, { preferSoundCloud: false }), ['normal']);
+  assert.equal(restricted.available, false);
 });
 
 test('global search retains VK related matches and provider ordering', () => {

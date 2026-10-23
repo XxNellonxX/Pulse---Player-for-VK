@@ -23,9 +23,35 @@ describe('independent SoundCloud source coordinator boundaries', () => {
     expect(await soundCloudSource(track, { ...settings, preferSoundCloud: false }, new AbortController().signal, true)).toBeNull()
     expect(api.soundCloudBinding).not.toHaveBeenCalled()
   })
-  it('never initiates discovery for local, unavailable, unknown-card, or linked records without a playback failure', () => {
-    for (const changed of [{ source: 'local' as const }, { available: false }, { artistCard: 'unknown' as const }, { artistCard: 'present' as const }]) expect(shouldSearchSoundCloud({ ...track, ...changed }, settings)).toBe(false)
+  it('prioritizes discovery for missing card evidence under the user preference while preserving known linked records', () => {
+    for (const artistCard of ['absent', 'unknown', undefined] as const) expect(shouldSearchSoundCloud({ ...track, artistCard }, settings)).toBe(true)
+    for (const changed of [{ source: 'local' as const }, { artistCard: 'present' as const }, { artistCard: 'unknown' as const, artistRefs: [{ id: '7', name: 'Artist' }] }, { artistRefs: [{ id: '7', name: 'Artist' }] }]) expect(shouldSearchSoundCloud({ ...track, ...changed }, settings)).toBe(false)
     expect(shouldSearchSoundCloud({ ...track, artistCard: 'present' }, settings, true)).toBe(true)
+    expect(shouldSearchSoundCloud({ ...track, artistCard: undefined }, { ...settings, preferSoundCloud: false })).toBe(false)
+  })
+  it('a VK-only restriction does not block discovery or a saved independent source', async () => {
+    const wanted = { ...track, available: false, artistCard: 'present' as const }
+    expect(shouldSearchSoundCloud(wanted, settings)).toBe(true)
+    const { api, source } = fixture()
+    expect(await soundCloudSource(wanted, settings, new AbortController().signal)).toEqual(source)
+    expect(api.bindSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id, '123', 'metadata')
+    expect(wanted.available).toBe(false)
+    const saved = fixture({ soundCloudBinding: vi.fn(async () => ({ ...candidate(), selection: 'user' as const })) })
+    expect(await soundCloudSource(wanted, settings, new AbortController().signal)).toEqual(saved.source)
+    expect(saved.api.searchSoundCloud).not.toHaveBeenCalled()
+  })
+  it('a VK-only restriction reports a missing independent source without retrying VK', async () => {
+    const { api } = fixture({ searchSoundCloud: vi.fn(async () => ({ collection: [] })) })
+    await expect(soundCloudSource({ ...track, available: false }, settings, new AbortController().signal)).rejects.toThrow(/выберите/)
+    expect(api.resolveSoundCloud).not.toHaveBeenCalled()
+  })
+  it('discovers an old saved record before a VK failure without weakening metadata matching', async () => {
+    const { api, source } = fixture()
+    expect(await soundCloudSource({ ...track, artistCard: undefined }, settings, new AbortController().signal)).toEqual(source)
+    expect(api.searchSoundCloud).toHaveBeenCalledOnce()
+    const wrong = fixture({ searchSoundCloud: vi.fn(async () => ({ collection: [candidate({ artist: 'Different Artist' })], hasMore: true })) })
+    expect(await soundCloudSource({ ...track, artistCard: undefined }, settings, new AbortController().signal)).toBeNull()
+    expect(wrong.api.bindSoundCloud).not.toHaveBeenCalled()
   })
   it('missing credentials leave playback on VK without querying or binding SoundCloud', async () => {
     const { api } = fixture({ soundCloudStatus: vi.fn(async () => ({ configured: false, proxy: false, message: 'not configured' })) })
@@ -39,10 +65,45 @@ describe('independent SoundCloud source coordinator boundaries', () => {
     expect(api.resolveSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id)
     expect(api.searchSoundCloud).not.toHaveBeenCalled(); expect(api.bindSoundCloud).not.toHaveBeenCalled()
   })
-  it('autobinds only a complete-page unique strict metadata match', async () => {
+  it('autobinds one strict metadata proposal without making a catalog-wide identity claim', async () => {
     const { api, source } = fixture()
     expect(await soundCloudSource(track, settings, new AbortController().signal)).toEqual(source)
     expect(api.bindSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id, '123', 'metadata')
+    expect(api.searchSoundCloud).toHaveBeenCalledOnce()
+  })
+  it('starts breath from the first exact result even when the provider cursor remains', async () => {
+    const wanted = { ...track, title: 'breath', artist: 't1de', duration: 94 }
+    const { api, source } = fixture({ searchSoundCloud: vi.fn(async () => ({ collection: [candidate({ id: '2408295021', title: 'breath', artist: 't1de', duration: 93.978 }), candidate({ id: 'other', title: 'regret ft t1de', artist: 'kerosene', duration: 99.944 })], hasMore: true })) })
+    expect(await soundCloudSource(wanted, settings, new AbortController().signal)).toEqual(source)
+    expect(api.bindSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id, '2408295021', 'metadata')
+    expect(api.searchSoundCloud).toHaveBeenCalledOnce()
+  })
+  it('rejects competing exact results while allowing a unique exact proposal alongside weaker reviews', async () => {
+    const { api, source } = fixture({ searchSoundCloud: vi.fn(async () => ({ collection: [candidate(), candidate({ id: 'review', duration: 186 })], hasMore: true })) })
+    expect(await soundCloudSource(track, settings, new AbortController().signal)).toEqual(source)
+    expect(api.searchSoundCloud).toHaveBeenCalledOnce()
+    fixture({ searchSoundCloud: vi.fn(async () => ({ collection: [candidate(), candidate({ id: 'another-exact', duration: 181 })], hasMore: true })) })
+    expect(await soundCloudSource(track, settings, new AbortController().signal)).toBeNull()
+  })
+  it('uses bounded normalized follow-up queries without treating title-only results as performer evidence', async () => {
+    let reads = 0
+    const { api, source } = fixture({ searchSoundCloud: vi.fn(async () => ++reads === 1 ? { collection: [], hasMore: true } : { collection: [candidate()], hasMore: false }) })
+    expect(await soundCloudSource(track, settings, new AbortController().signal)).toEqual(source)
+    expect(api.searchSoundCloud).toHaveBeenCalledTimes(2)
+    const failed = fixture({ searchSoundCloud: vi.fn(async () => ({ collection: [candidate({ artist: 'Unrelated Uploader' })], hasMore: true })) })
+    expect(await soundCloudSource(track, settings, new AbortController().signal)).toBeNull()
+    expect(failed.api.searchSoundCloud).toHaveBeenCalledTimes(3)
+    expect(failed.api.bindSoundCloud).not.toHaveBeenCalled()
+  })
+  it('does not start the managed audio watchdog until metadata selection has finished', async () => {
+    const pending = deferred<{ collection: SoundCloudCandidate[]; hasMore: boolean }>(), managed = vi.fn()
+    const { api, source } = fixture({ soundCloudStatus: vi.fn(async () => ({ configured: true, proxy: false, managed: true, message: '' })), searchSoundCloud: vi.fn(() => pending.promise) })
+    const run = soundCloudSource(track, settings, new AbortController().signal, false, managed)
+    await flush(); expect(managed).not.toHaveBeenCalled()
+    pending.resolve({ collection: [candidate()], hasMore: true })
+    expect(await run).toEqual(source)
+    expect(managed).toHaveBeenCalledExactlyOnceWith(true)
+    expect(api.bindSoundCloud).toHaveBeenCalledOnce()
   })
   it('legacy bindings without provenance retain the user-selected recording even after a VK version correction', async () => {
     const { api, source } = fixture({ soundCloudBinding: vi.fn(async () => candidate({ title: 'Song (Acoustic)' })) })
@@ -83,11 +144,12 @@ describe('independent SoundCloud source coordinator boundaries', () => {
     expect(api.bindSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id, '124', 'metadata')
     expect(api.resolveSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id)
   })
-  it('pagination cannot silently replace a stale automatic binding', async () => {
+  it('a strict refreshed metadata proposal is usable even when unrelated search pages remain', async () => {
     const chosen = { ...candidate(), selection: 'metadata' as const }
-    const { api } = fixture({ soundCloudBinding: vi.fn(async () => chosen), searchSoundCloud: vi.fn(async () => ({ collection: [candidate({ id: '124', version: 'Live' })], hasMore: true })) })
-    expect(await soundCloudSource({ ...track, version: 'Live' }, settings, new AbortController().signal)).toBeNull()
-    expect(api.resolveSoundCloud).not.toHaveBeenCalled(); expect(api.bindSoundCloud).not.toHaveBeenCalled()
+    const { api, source } = fixture({ soundCloudBinding: vi.fn(async () => chosen), searchSoundCloud: vi.fn(async () => ({ collection: [candidate({ id: '124', version: 'Live' })], hasMore: true })) })
+    expect(await soundCloudSource({ ...track, version: 'Live' }, settings, new AbortController().signal)).toEqual(source)
+    expect(api.bindSoundCloud).toHaveBeenCalledExactlyOnceWith(track.id, '124', 'metadata')
+    expect(api.searchSoundCloud).toHaveBeenCalledOnce()
   })
   it('an ambiguous refreshed search never falls back to the stale automatically selected edition', async () => {
     const chosen = { ...candidate(), selection: 'metadata' as const }
@@ -121,7 +183,6 @@ describe('independent SoundCloud source coordinator boundaries', () => {
     expect(api.bindSoundCloud).not.toHaveBeenCalled(); expect(api.resolveSoundCloud).not.toHaveBeenCalled()
   })
   it.each([
-    ['paginated result', { collection: [candidate()], hasMore: true }],
     ['two uploads', { collection: [candidate(), candidate({ id: '124' })] }],
     ['wrong live version', { collection: [candidate({ title: 'Song (Live)' })] }],
     ['wrong remixer', { collection: [candidate({ version: 'DJ Two Remix' })] }],

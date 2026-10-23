@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const root = new URL('../', import.meta.url);
 const work = await mkdtemp(join(tmpdir(), 'pulse-source-selection-'));
 const ffmpeg = fileURLToPath(new URL('src-tauri/resources/import-tools/ffmpeg.exe', root));
-const browser = await chromium.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
+const browser = await chromium.launch({ channel: 'msedge', headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
 const hlsScript = await readFile(new URL('src-tauri/resources/vk_hls.js', root), 'utf8');
 const transportScript = await readFile(new URL('src-tauri/src/vk_direct_audio.js', root), 'utf8');
 const origin = 'https://vk.com/__qa_selection/';

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import type { PersistedState, VkWebCommand } from './shared/contracts'
-import { nextShuffledCycle, ownMusicIds, shuffledQueue } from './shuffle'
+import { canAttemptPlayback, nextShuffledCycle, ownMusicIds, shuffledQueue } from './shuffle'
 import { normalizeBufferedRanges, readMediaBuffered, sameBufferedRanges, secondsBufferedAhead, type BufferedRange, type PlaybackNetwork } from './buffering'
 import './shared/audioEqualizer.js'
 import type { EqualizerGraph } from './shared/audioEqualizer'
@@ -130,14 +130,16 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       managedFallback.current()
     }, MANAGED_AUDIO_PROGRESS_TIMEOUT)
   }, [clearExternalProgress])
-  const recoverExternal = useCallback((reason: 'failure' | 'expiry' = 'failure') => {
+  const recoverExternal = useCallback((_reason: 'failure' | 'expiry' = 'failure') => {
     const id = stateRef.current.currentTrackId
     if (!id || (!externalUrl.current && !externalManaged.current) || !playIntent.current || externalRecovery.current.id !== id || externalRecovery.current.bypass) return false
     const element = audio.current
     const position = element && element.readyState >= HTMLMediaElement.HAVE_METADATA && Number.isFinite(element.currentTime) ? element.currentTime : stateRef.current.position
-    // Allow one renewal per failure streak for this exact recording. Healthy
-    // media-clock progress replenishes the budget for a later grant expiry.
-    if ((!externalManaged.current || reason === 'expiry') && externalRecovery.current.renewals === 0) externalRecovery.current.renewals = 1
+    // One transient startup/stream failure must not discard a working provider:
+    // retry this exact recording once, as a manual Retry already does. The
+    // progress deadline stays bounded; a second failure bypasses only this
+    // recording. Thirty seconds of healthy progress replenishes the budget.
+    if (externalRecovery.current.renewals === 0) externalRecovery.current.renewals = 1
     else {
       externalRecovery.current.bypass = true
       forcedExternalId.current = null
@@ -209,6 +211,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       webLoaded.current = id; webPending.current = null
     }).catch(error => {
       if (stateRef.current.currentTrackId !== id || sourceVersion.current !== version) return
+      if (externalFallback.current(id)) return
       clearWebStall(); playIntent.current = false; pendingStart.current = false
       setBuffering(false); setPlaying(false); setNetwork('error'); setError(error.message)
     })
@@ -217,7 +220,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const next = useCallback((direction = 1, auto = false, failedSource = false) => {
     clearSnippet()
     const s = stateRef.current
-    const availableIds = new Set(s.tracks.filter(track => track.available).map(track => track.id))
+    const availableIds = new Set(s.tracks.filter(track => canAttemptPlayback(track, s.settings)).map(track => track.id))
     const available = s.queue.filter(id => availableIds.has(id))
     if (!available.length) { playIntent.current = false; setPlaying(false); return }
     const index = available.indexOf(s.currentTrackId || '')
@@ -231,7 +234,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     if (s.settings.shuffle && direction > 0 && nextIndex >= available.length && s.settings.repeat === 'all') {
       // Each complete permutation is stored, so the queue, Previous and restart
       // follow the same order without random re-picks during a cycle.
-      const completeLibrary = ownMusicIds(s.tracks)
+      const completeLibrary = ownMusicIds(s.tracks, s.settings)
       nextQueue = nextShuffledCycle(completeLibrary.length ? completeLibrary : available, s.currentTrackId)
       nextIndex = 0
     }
@@ -466,6 +469,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     pendingStart.current = playIntent.current || stateRef.current.settings.autoplay
     if (pendingStart.current) { playIntent.current = true; setBuffering(true); setNetwork('loading') }
     const load = async () => {
+      let vkUnavailable = current.source === 'vk' && !current.available
       try {
         let resolved = current
         if (current.source === 'vk' && window.desktop?.resolveVkTrack && ownedFailedId.current !== current.id) {
@@ -473,10 +477,11 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           catch (error) { if (!current.url.startsWith('vk-web://')) throw error }
         }
         if (sourceVersion.current !== version || controller.signal.aborted) return
+        vkUnavailable = resolved.source === 'vk' && !resolved.available
         if (resolved.source === 'vk' && playIntent.current && window.desktop?.resolveSoundCloud && !externalRecovery.current.bypass) {
           const forced = forcedExternalId.current === current.id
           try {
-            const source = await soundCloudSource(current, stateRef.current.settings, controller.signal, forced, managed => {
+            const source = await soundCloudSource(resolved, stateRef.current.settings, controller.signal, forced, managed => {
               if (sourceVersion.current !== version || controller.signal.aborted) return
               externalManaged.current = managed
               if (managed) watchExternalProgress(current.id, version)
@@ -486,10 +491,10 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
               externalUrl.current = source.url
               resolved = { ...current, url: source.url }
               setSourceLabel(source.explicit === true ? 'SoundCloud · explicit' : 'SoundCloud')
-            } else if (forced) throw new Error('VK не запустил трек. SoundCloud ещё не подключён или соответствие не найдено — откройте информацию о треке.')
+            } else if (forced || vkUnavailable) throw new Error('VK не запустил трек. SoundCloud ещё не подключён или соответствие не найдено — откройте информацию о треке.')
           } catch (cause) {
             if (controller.signal.aborted) throw cause
-            if (forced && externalRecovery.current.renewals === 0) throw cause
+            if (vkUnavailable || forced && externalRecovery.current.renewals === 0) throw cause
             externalRecovery.current.bypass = true
             externalAttempted.current.add(current.id)
             forcedExternalId.current = null
@@ -498,6 +503,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         }
         if (sourceVersion.current !== version || controller.signal.aborted) return
         if (!externalUrl.current) { externalManaged.current = false; clearExternalProgress() }
+        if (vkUnavailable && !externalUrl.current) throw new Error('VK ограничил эту запись. Выберите доступный источник SoundCloud в информации о треке.')
         if (resolved.url.startsWith('vk-web://')) {
           setSourceLabel('VK')
           transport.current = { id: current.id, kind: 'web' }
@@ -520,7 +526,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           return
         }
         if (webLoaded.current || webPending.current) { void controlWeb({ operation: 'stop' }).catch(() => {}); webLoaded.current = null; webPending.current = null; webPlaying.current = false }
-        if (!resolved.available || !resolved.url) throw new Error('unavailable')
+        if ((!resolved.available && !externalUrl.current) || !resolved.url) throw new Error('unavailable')
         transport.current = { id: current.id, kind: 'local' }
         ownedSourceId.current = current.source === 'vk' && resolved.source === 'local' ? current.id : null
         if (!externalUrl.current) setSourceLabel(ownedSourceId.current ? 'Сохранённый оригинал' : 'Локальный файл')
@@ -570,7 +576,15 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           if (sourceVersion.current === version && playIntent.current && !controller.signal.aborted) { acceptSnippetStart(current.id, stateRef.current.position || 0); await playLocal(element) }
         }
       } catch (cause) {
-        if (sourceVersion.current === version && !controller.signal.aborted && !recoverExternal()) { clearWebStall(); pendingStart.current = false; playIntent.current = false; setPlaying(false); setBuffering(false); setNetwork('error'); setError(cause instanceof Error && forcedExternalId.current === current.id ? cause.message : 'Этот трек сейчас недоступен. Можно попробовать ещё раз.') }
+        if (sourceVersion.current !== version || controller.signal.aborted) return
+        if (isWebTrack() && externalFallback.current(current.id)) return
+        // Failed catalog matching is not a failed audio stream. Keep the
+        // actionable source error instead of silently restarting rejected VK.
+        const failedDiscovery = (forcedExternalId.current === current.id || vkUnavailable) && !externalUrl.current
+        if (!failedDiscovery && recoverExternal()) return
+        clearWebStall(); clearExternalProgress(); pendingStart.current = false; playIntent.current = false
+        setPlaying(false); setBuffering(false); setNetwork('error')
+        setError(cause instanceof Error && (forcedExternalId.current === current.id || vkUnavailable) ? cause.message : 'Этот трек сейчас недоступен. Можно попробовать ещё раз.')
       }
     }
     void load()
@@ -581,10 +595,15 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   externalFallback.current = id => {
     if (!playIntent.current || !stateRef.current.settings.preferSoundCloud || !window.desktop?.resolveSoundCloud || externalRecovery.current.bypass || externalAttempted.current.has(id)) return false
     externalAttempted.current.add(id); forcedExternalId.current = id
+    // Invalidate VK synchronously. A duplicate status or a late command
+    // rejection can arrive before React commits the replacement source.
+    sourceVersion.current++
+    transport.current = { id, kind: 'pending' }
+    sourceAbort.current?.abort()
     clearWebStall(); webPlaying.current = false; webPending.current = null
     void controlWeb({ operation: 'pause' }).catch(() => {})
-    playIntent.current = true; loadedId.current = null
-    setError(''); setBuffering(true); setReloadNonce(value => value + 1)
+    playIntent.current = true; pendingStart.current = true; loadedId.current = null
+    setError(''); setPlaying(false); setBuffering(true); setNetwork('recovering'); setReloadNonce(value => value + 1)
     return true
   }
 
@@ -598,11 +617,17 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const playTrack = useCallback((id: string, queue?: string[], startPosition = 0) => {
     clearSnippet()
     const start = Number.isFinite(startPosition) ? Math.max(0, startPosition) : 0
+    const retryFailed = stateRef.current.currentTrackId === id && !playIntent.current && !webPlaying.current && (!audio.current || audio.current.paused)
+    if (retryFailed) {
+      externalRecovery.current = { id, renewals: 0, bypass: false }
+      externalAttempted.current.clear(); forcedExternalId.current = null; ownedFailedId.current = null
+      loadedId.current = null; setReloadNonce(value => value + 1)
+    }
     playIntent.current = true
     setError('')
     setState(prev => {
       const requested = queue ? [...new Set([...queue, id])] : [...new Set([...prev.queue, id])]
-      const nextQueue = prev.settings.shuffle && queue ? shuffledQueue(ownMusicIds(prev.tracks), id) : requested
+      const nextQueue = prev.settings.shuffle && queue ? shuffledQueue(ownMusicIds(prev.tracks, prev.settings), id) : requested
       return { ...prev, currentTrackId: id, position: start, queue: nextQueue, history: [id, ...prev.history.filter(item => item !== id)].slice(0, 300) }
     })
     if (loadedId.current === id && audio.current) {
@@ -620,7 +645,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const toggleShuffle = useCallback(() => {
     setState(previous => {
       const shuffle = !previous.settings.shuffle
-      const pool = ownMusicIds(previous.tracks)
+      const pool = ownMusicIds(previous.tracks, previous.settings)
       const queue = shuffle ? shuffledQueue(pool, previous.currentTrackId) : [...new Set([...pool, ...(previous.currentTrackId && !pool.includes(previous.currentTrackId) ? [previous.currentTrackId] : [])])]
       return { ...previous, queue, settings: { ...previous.settings, shuffle } }
     })
@@ -655,7 +680,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           if (sourceVersion.current !== version || !playIntent.current) return
           await controlWeb(command)
           if (sourceVersion.current === version) { if (snippetRef.current?.id === id) acceptSnippetStart(id, snippetRef.current.from); webLoaded.current = id; webPending.current = null }
-        }).catch(error => { if (stateRef.current.currentTrackId !== id || sourceVersion.current !== version) return; clearWebStall(); playIntent.current = false; pendingStart.current = false; setPlaying(false); setBuffering(false); setNetwork('error'); setError(error.message) })
+        }).catch(error => { if (stateRef.current.currentTrackId !== id || sourceVersion.current !== version) return; if (externalFallback.current(id)) return; clearWebStall(); playIntent.current = false; pendingStart.current = false; setPlaying(false); setBuffering(false); setNetwork('error'); setError(error.message) })
       }
       return
     }

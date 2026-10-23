@@ -8,6 +8,7 @@ import {
 import type { AppSettings, PersistedState, Playlist, Track, VkStatus, VkSnapshot, UploadBatchResult, ImportProgress } from './shared/contracts'
 import { applyVkSnapshot, mergeTracks, stripVkState, useLibraryState } from './state'
 import { usePlayback } from './usePlayback'
+import { canAttemptPlayback } from './shuffle'
 import appIcon from '../src-tauri/icons/app-icon.svg'
 import { MusicUploadView } from './MusicUploadView'
 import { QueuePanel } from './QueuePanel'
@@ -365,9 +366,9 @@ function App() {
   const playArtistTrack = (track: Track, context: Track[], fullVersion = false) => {
     if (state.currentTrackId === track.id && !fullVersion) { playback.toggle(); return }
     setState(previous => ({ ...previous, tracks: mergeTracks(previous.tracks, context) }))
-    playback.playTrack(track.id, context.filter(item => item.available).map(item => item.id))
+    playback.playTrack(track.id, context.filter(item => canAttemptPlayback(item, state.settings)).map(item => item.id))
   }
-  const togglePlay = (track: Track) => { if (state.currentTrackId === track.id) playback.toggle(); else { setState(prev => ({ ...prev, tracks: mergeTracks(prev.tracks, [track]) })); playback.playTrack(track.id, pageTracks.filter(item => item.available).map(item => item.id)) } }
+  const togglePlay = (track: Track) => { if (state.currentTrackId === track.id) playback.toggle(); else { setState(prev => ({ ...prev, tracks: mergeTracks(prev.tracks, [track]) })); playback.playTrack(track.id, pageTracks.filter(item => canAttemptPlayback(item, state.settings)).map(item => item.id)) } }
 
   if (!ready) return <div className="boot-screen"><img className="app-logo" src={appIcon} alt="Pulse" /><span>Загружаем библиотеку…</span></div>
   return <div className="app-shell">
@@ -395,7 +396,7 @@ function App() {
         {page === 'catalog' && <CatalogView route={catalogRoute} onNavigate={setCatalogRoute} onSearchVk={value => { setPage('search'); setSelectedPlaylist(null); setSearchScope('all'); setQuery(value); setInfoTrack(null) }} />}
         {page === 'settings' && <SettingsView settings={state.settings} tab={settingsTab} onTab={setSettingsTab} equalizerError={playback.equalizerError} update={updateSettings} vkStatus={vkStatus} onConnect={connectVk} onOpenVk={openVkMusic} onDisconnect={disconnectVk} busy={isConnecting || isSyncing} onSync={() => void syncVk()} />}
       </div></div>
-      <PlayerBar current={playback.current} playing={playback.playing} buffering={playback.buffering} advertising={playback.advertising} position={playback.position} duration={playback.duration} buffered={playback.buffered} bufferedAhead={playback.bufferedAhead} network={playback.network} volume={state.settings.volume} queueCount={queueTracks.length} onToggle={playback.toggle} onPrevious={playback.previous} onNext={playback.next} onSeek={playback.seek} onVolume={volume => updateSettings({ volume })} onQueue={() => setQueueOpen(true)} canShuffle={state.tracks.some(track => track.available && (track.source === 'local' || track.remote?.inLibrary !== false))} shuffle={state.settings.shuffle} repeat={state.settings.repeat} onShuffle={playback.toggleShuffle} onRepeat={() => updateSettings({ repeat: state.settings.repeat === 'off' ? 'all' : state.settings.repeat === 'all' ? 'one' : 'off' })} onArtist={() => playback.current && openArtist(playback.current.artist, playback.current.artistRefs?.[0])} onInfo={() => playback.current && setInfoTrack(playback.current)} error={playback.error} onRetry={playback.retry} onDismissError={playback.clearError} />
+      <PlayerBar current={playback.current} playing={playback.playing} buffering={playback.buffering} advertising={playback.advertising} position={playback.position} duration={playback.duration} buffered={playback.buffered} bufferedAhead={playback.bufferedAhead} network={playback.network} volume={state.settings.volume} queueCount={queueTracks.length} onToggle={playback.toggle} onPrevious={playback.previous} onNext={playback.next} onSeek={playback.seek} onVolume={volume => updateSettings({ volume })} onQueue={() => setQueueOpen(true)} canShuffle={state.tracks.some(track => canAttemptPlayback(track, state.settings) && (track.source === 'local' || track.remote?.inLibrary !== false))} shuffle={state.settings.shuffle} repeat={state.settings.repeat} onShuffle={playback.toggleShuffle} onRepeat={() => updateSettings({ repeat: state.settings.repeat === 'off' ? 'all' : state.settings.repeat === 'all' ? 'one' : 'off' })} onArtist={() => playback.current && openArtist(playback.current.artist, playback.current.artistRefs?.[0])} onInfo={() => playback.current && setInfoTrack(playback.current)} error={playback.error} onRetry={playback.retry} onDismissError={playback.clearError} />
     </main>
     <QueuePanel open={queueOpen} tracks={queueTracks} currentIndex={currentInQueue} playing={playback.playing} currentId={state.currentTrackId} onClose={() => setQueueOpen(false)} onPlay={track => playback.playTrack(track.id)} onRemove={removeFromQueue} onMove={moveQueue} onClear={() => setState(prev => ({ ...prev, queue: [], currentTrackId: null }))} />
     {infoTrack && <TrackInfo track={infoTrack} preferExplicit={state.settings.preferExplicit} sourceLabel={playback.current?.id === infoTrack.id ? playback.sourceLabel : undefined} onSourceChanged={() => { if (playback.current?.id === infoTrack.id) playback.reloadSource() }} onClose={() => setInfoTrack(null)} onArtist={() => openArtist(infoTrack.artist, infoTrack.artistRefs?.[0])} />}

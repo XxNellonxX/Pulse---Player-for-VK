@@ -60,6 +60,113 @@ test('masked session input uses its pure decoder before the hanging URL resolver
   finally { f.transport.destroy(); }
 });
 
+for (const method of ['_private__createAudio', '__private_123_createAudio']) {
+  test(`a masked upload uses the website prototype decoder ${method} with its owning instance`, async () => {
+    const f = fixture(); let resolutions = 0, decodes = 0;
+    class WebsiteImplementation { constructor() { this.granted = supplied; } }
+    Object.defineProperty(WebsiteImplementation.prototype, method, { value(input) {
+      decodes++; assert.equal(input.id, '101_7');
+      return { sources: [{ url: this.granted, format: 'mp3' }] };
+    } });
+    const player = { _impl: new WebsiteImplementation(), _ensureHasURL() { resolutions++; return new Promise(() => {}); } };
+    try {
+      assert.equal(f.sandbox.__PULSE_CREATE_DIRECT_AUDIO__.canResolve(raw('https://vk.ru/audio_api_unavailable?extra=private'), player), true);
+      await f.transport.load(raw('https://vk.ru/audio_api_unavailable?extra=private'), player);
+      assert.equal(f.media.at(-1).src, supplied); assert.equal(resolutions, 0); assert.equal(decodes, 2);
+    } finally { f.transport.destroy(); }
+  });
+}
+
+test('decoder discovery never executes website getters or shares the official node provider', async () => {
+  const f = fixture(); let getters = 0;
+  class WebsiteImplementation {
+    __private_123_createAudio() { return { sources: [{ url: supplied, format: 'mp3' }] }; }
+    _private__ensureNodeProvider() { throw new Error('shared official audio must not be touched'); }
+  }
+  const impl = new WebsiteImplementation();
+  Object.defineProperty(impl, '_private__createAudio', { get() { getters++; throw new Error('discovery invoked an accessor'); } });
+  try {
+    await f.transport.load(raw('https://vk.ru/audio_api_unavailable?extra=private'), { _impl: impl });
+    assert.equal(getters, 0); assert.equal(f.media.at(-1).src, supplied);
+  } finally { f.transport.destroy(); }
+});
+
+test('two silent uploaded-file deliveries cannot hide the responsive third source for 25 seconds', async () => {
+  const urls = ['silent-first.aac', 'silent-second.mp3', 'responsive-third.mp3'].map(name => `https://media.example.test/${name}`);
+  const f = fixture({ policy: url => url === urls[2] ? 'ready' : 'hold' });
+  let settled = false;
+  try {
+    const load = f.transport.load(raw('', { audio_streams: urls.map(url => ({ type: 'mp3', url })) }), {}).then(() => { settled = true; });
+    for (let turn = 0; turn < 8 && !settled; turn++) { await flush(); if (!settled) await f.nextTimer(); }
+    await load; await f.transport.play();
+    assert.ok(f.now() <= 3000, `responsive third source waited ${f.now()}ms`);
+    assert.equal(f.media.length, 3); assert.equal(f.media.at(-1).src, urls[2]);
+    assert.ok(f.media.slice(0, 2).every(audio => audio.src === '' && audio.paused));
+    assert.equal(f.transport.read().playing, true);
+  } finally { f.transport.destroy(); }
+});
+
+test('a fourth uploaded source uses a released slot without exceeding three active loads', async () => {
+  const urls = ['silent-first.mp3', 'silent-second.mp3', 'silent-third.mp3', 'responsive-fourth.mp3'].map(name => `https://media.example.test/${name}`);
+  let activePeak = 0;
+  const f = fixture({ policy: url => { activePeak = Math.max(activePeak, f.media.filter(audio => audio.src).length); return url === urls[3] ? 'ready' : 'hold'; } });
+  let settled = false;
+  try {
+    const load = f.transport.load(raw('', { audio_streams: urls.map(url => ({ type: 'mp3', url })) }), {}).then(() => { settled = true; });
+    for (let turn = 0; turn < 12 && !settled; turn++) { await flush(); if (!settled) await f.nextTimer(); }
+    await load;
+    assert.ok(f.now() <= 25000, `responsive fourth source exceeded the first load deadline: ${f.now()}ms`);
+    assert.equal(activePeak, 3); assert.equal(f.media.at(-1).src, urls[3]);
+    assert.ok(f.media.slice(0, 3).every(audio => audio.src === '' && audio.paused));
+  } finally { f.transport.destroy(); }
+});
+
+test('a slow secondary keeps its full load opportunity after the other alternatives are exhausted', async () => {
+  const urls = ['silent-first.mp3', 'slow-second.mp3', 'broken-third.mp3'].map(name => `https://media.example.test/${name}`);
+  const f = fixture({ policy: url => url === urls[2] ? 'error' : 'hold' });
+  let settled = false;
+  try {
+    const load = f.transport.load(raw('', { audio_streams: urls.map(url => ({ type: 'mp3', url })) }), {}).then(() => { settled = true; });
+    f.sandbox.setTimeout(() => { const slow = f.media[1]; slow.readyState = 4; slow.emit('canplay'); }, 9000);
+    for (let turn = 0; turn < 12 && !settled; turn++) { await flush(); if (!settled) await f.nextTimer(); }
+    await load;
+    assert.equal(f.media[1].src, urls[1]); assert.equal(f.now(), 9000);
+    assert.equal(f.media[0].src, ''); assert.equal(f.media[2].src, '');
+  } finally { f.transport.destroy(); }
+});
+
+test('an early responsive secondary is never discarded merely because additional silent sources remain', async () => {
+  const urls = ['silent-first.mp3', 'slow-second.mp3', 'silent-third.mp3', 'silent-fourth.mp3', 'silent-fifth.mp3'].map(name => `https://media.example.test/${name}`);
+  const f = fixture({ policy: () => 'hold' });
+  let settled = false;
+  try {
+    const load = f.transport.load(raw('', { audio_streams: urls.map(url => ({ type: 'mp3', url })) }), {}).then(() => { settled = true; });
+    f.sandbox.setTimeout(() => { const slow = f.media[1]; slow.readyState = 4; slow.emit('canplay'); }, 9000);
+    for (let turn = 0; turn < 16 && !settled; turn++) { await flush(); if (!settled) await f.nextTimer(); }
+    await load;
+    assert.equal(f.media[1].src, urls[1]); assert.equal(f.now(), 9000);
+  } finally { f.transport.destroy(); }
+});
+
+for (const command of ['stop', 'account-change']) {
+  test(`${command} cancels all three pending uploaded sources and prevents late readiness`, async () => {
+    const urls = ['first.mp3', 'second.mp3', 'third.mp3'].map(name => `https://media.example.test/${name}`);
+    const f = fixture({ policy: () => 'hold' });
+    try {
+      const load = f.transport.load(raw('', { audio_streams: urls.map(url => ({ type: 'mp3', url })) }), {});
+      const rejected = assert.rejects(load, error => error.code === 'PULSE_DIRECT_CANCELLED');
+      await f.nextTimer(); await f.nextTimer();
+      assert.equal(f.media.length, 3);
+      if (command === 'stop') f.transport.stop(); else { f.sandbox.vk.id = 202; f.transport.read(); }
+      await rejected;
+      for (const audio of f.media) { audio.readyState = 4; audio.emit('canplay'); }
+      await flush();
+      assert.equal(f.transport.read().playing, false); assert.ok(f.media.every(audio => audio.src === '' && audio.paused));
+      assert.equal(f.timers.size, 0, 'cancelled source probes left timers running');
+    } finally { f.transport.destroy(); }
+  });
+}
+
 test('an optional decoder that mutates then throws cannot erase the granted original source', async () => {
   const f = fixture(); let resolutions = 0;
   const player = {
