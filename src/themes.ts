@@ -28,6 +28,8 @@ export const THEME_PALETTES: readonly ThemePalette[] = [
   palette('midnight', 'Полночь', 'Индиго после заката', 'dark', '#b9b4ff', ['#121323', '#1c1e33', '#282a45', '#343855', '#4d5271', '#f0efff', '#b5b5d2', '#a1a3c0'], 18),
   palette('ember', 'Уголь и медь', 'Глубина с тёплым акцентом', 'dark', '#ffa27e', ['#1b1211', '#291c1a', '#382623', '#4a3330', '#654741', '#fff1eb', '#d2aea4', '#bf9b91'], 14),
   palette('ultraviolet', 'Ультрафиолет', 'Космический фиолетовый', 'dark', '#d0a0ff', ['#170e26', '#251638', '#34224c', '#483162', '#64447e', '#f9f0ff', '#cbb0e3', '#b79bd0'], 22),
+  palette('y2k', 'Y2K / 90-е', 'Хром, лёд и цифровая ностальгия', 'light', '#2455c6', ['#e4eaf3', '#f8fbff', '#e7eef9', '#d5e0f2', '#a8b8d0', '#17253d', '#4d5e78', '#5b6c85'], 20),
+  palette('glass', 'Стекло', 'Полупрозрачные слои и мягкий свет', 'dark', '#9cddff', ['#101b2c', '#192c42', '#223b54', '#2e4c65', '#49647d', '#f0f7ff', '#bdccdd', '#a7bace'], 22),
 ]
 
 export function findPalette(id?: string): ThemePalette | undefined { return THEME_PALETTES.find(theme => theme.id === id) }
@@ -69,7 +71,7 @@ export function applyTheme(settings: AppSettings): () => void {
     root.dataset.style = settings.style
     root.classList.toggle('style-minimal', settings.style === 'minimal')
     root.classList.toggle('style-compact', settings.style === 'compact')
-    root.classList.toggle('style-album', settings.style === 'album')
+    root.classList.remove('style-album')
     root.classList.toggle('style-soft', settings.style === 'soft')
     root.classList.toggle('reduced-motion', settings.reducedMotion)
     root.classList.toggle('density-compact', settings.density === 'compact')

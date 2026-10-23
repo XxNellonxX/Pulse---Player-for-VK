@@ -1,6 +1,6 @@
 {
   "name": "vk-player-desktop",
-  "version": "0.5.0-preview.6",
+  "version": "0.5.0-preview.7",
   "description": "Windows-first VK music player with a local library and a reliable queue.",
   "private": true,
   "type": "module",

@@ -22,6 +22,7 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target
       PULSE_IMPORT_ARCH: ${{ matrix.arch }}
       PULSE_GATEWAY_URL: ${{ vars.PULSE_GATEWAY_URL }}
+      PULSE_SPOTIFY_CLIENT_ID: ${{ vars.PULSE_SPOTIFY_CLIENT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

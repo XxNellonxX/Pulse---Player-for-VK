@@ -19,6 +19,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 mod audio_session;
+mod service_imports;
+mod yandex_account_import;
 mod gateway_client;
 mod catalog_watch;
 mod equalizer;
@@ -175,6 +177,8 @@ pub struct PersistedState {
     pub current_track_id: Option<String>,
     pub position: f64,
     pub settings: Settings,
+    #[serde(rename = "serviceImports", default)]
+    pub service_imports: Vec<serde_json::Value>,
 }
 impl Default for PersistedState {
     fn default() -> Self {
@@ -241,6 +245,7 @@ fn defaults() -> PersistedState {
         queue: vec![],
         current_track_id: None,
         position: 0.,
+        service_imports: vec![],
         settings: Settings {
             theme: "dark".into(),
             palette: None,
@@ -354,11 +359,103 @@ fn sanitized(mut state: PersistedState, media: &HashMap<String, PathBuf>) -> Per
         state.settings.theme = "dark".into();
     }
     state.settings.palette = state.settings.palette.filter(|id| !id.is_empty() && id.len() <= 40 && id.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'));
-    if !["minimal", "compact", "album", "soft"].contains(&state.settings.style.as_str()) {
+    if !["minimal", "compact", "soft"].contains(&state.settings.style.as_str()) {
         state.settings.style = "minimal".into();
     }
     if !["off", "all", "one"].contains(&state.settings.repeat.as_str()) {
         state.settings.repeat = "off".into();
+    }
+    // Imports persist bounded public metadata and native track references only.
+    // Duplicate source entries are intentional; deduplicate collection identities.
+    {
+        use serde_json::{json, Value};
+        fn text(value: Option<&Value>, max: usize) -> String {
+            value.and_then(Value::as_str).unwrap_or("").chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
+        }
+        fn number(value: Option<&Value>, max: u64) -> Option<u64> {
+            value.and_then(Value::as_u64).filter(|n| *n <= max)
+        }
+        fn public_image(value: &str) -> bool {
+            value.len() <= 4096 && url::Url::parse(value).is_ok_and(|url| {
+                url.scheme() == "https" && url.username().is_empty() && url.password().is_none()
+                    && url.port_or_known_default() == Some(443)
+                    && url.host_str().is_some_and(|host| host != "localhost" && !host.ends_with(".localhost") && !host.ends_with(".local") && host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_err())
+            })
+        }
+        fn source_url(raw: &str, service: &str) -> String {
+            if (service == "spotify" && raw == "pulse:spotify:liked") || (service == "yandex" && raw == "pulse:yandex:liked") { return raw.into(); }
+            if service == "yandex" && raw.starts_with("pulse:yandex:playlist:") {
+                let parts: Vec<_> = raw.split(':').collect();
+                if parts.len() == 5 && parts[3..].iter().all(|part| !part.is_empty() && part.len() <= 19 && part.bytes().all(|byte| byte.is_ascii_digit())) { return raw.into(); }
+            }
+            let Ok(mut url) = url::Url::parse(raw) else { return String::new(); };
+            let host = url.host_str().unwrap_or("");
+            if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() || url.port_or_known_default() != Some(443)
+                || !(service == "spotify" && host == "open.spotify.com" || service == "yandex" && ["music.yandex.ru","music.yandex.com","music.yandex.kz","music.yandex.by","music.yandex.uz"].contains(&host)) { return String::new(); }
+            url.set_query(None); url.set_fragment(None); url.to_string()
+        }
+        let mut budget = 50_000usize;
+        let mut seen_collections = HashSet::new();
+        state.service_imports = std::mem::take(&mut state.service_imports).into_iter().take(100).filter_map(|record| {
+            let fields = record.as_object()?;
+            let service = fields.get("service")?.as_str()?;
+            if !["spotify", "yandex"].contains(&service) { return None; }
+            let source_id = text(fields.get("sourceId"), 300);
+            if source_id.is_empty() { return None; }
+            let canonical_id = format!("{service}:{source_id}");
+            if !seen_collections.insert(canonical_id.clone()) { return None; }
+            let source_rows = fields.get("entries")?.as_array()?;
+            let limit = budget.min(20_000);
+            let mut damaged = source_rows.len() > limit
+                || fields.get("sourceId").and_then(Value::as_str).is_some_and(|s|s.chars().count()>300||s.chars().any(char::is_control))
+                || fields.get("title").and_then(Value::as_str).map_or(true,|s|s.trim().is_empty()||s.chars().count()>500||s.chars().any(char::is_control));
+            let mut rows = Vec::new();
+            for raw in source_rows.iter().take(limit) {
+                let Some(row) = raw.as_object() else { damaged = true; continue; };
+                let title = text(row.get("title"), 500);
+                let source_id = text(row.get("sourceId"), 300);
+                let Some(raw_artists) = row.get("artists").and_then(Value::as_array) else { damaged = true; continue; };
+                let artists: Vec<String> = raw_artists.iter().take(20).map(|v|text(Some(v),200)).filter(|v|!v.is_empty()).collect();
+                let Some(position) = number(row.get("position"),100_000) else { damaged = true; continue; };
+                if title.is_empty() || source_id.is_empty() || artists.is_empty() { damaged = true; continue; }
+                if raw_artists.len() != artists.len() || raw_artists.iter().take(20).any(|v|v.as_str().map_or(true,|s|s.chars().count()>200||s.chars().any(char::is_control))) { damaged = true; }
+                if position != rows.len() as u64 { damaged = true; }
+                let duration = row.get("duration").and_then(Value::as_f64).filter(|n|n.is_finite() && (0.0..=864000.0).contains(n)).unwrap_or_else(|| { damaged = true; 0.0 });
+                let mut entry = json!({"sourceId":source_id,"title":title,"artists":artists,"album":text(row.get("album"),500),"duration":duration,"position":position});
+                for (key,max) in [("sourceId",300),("title",500),("album",500)] {
+                    if row.get(key).is_some_and(|v|v.as_str().map_or(true,|value| value.chars().count()>max || value.chars().any(char::is_control))) { damaged = true; }
+                }
+                let isrc = text(row.get("isrc"),30).replace([' ','-'],"").to_ascii_uppercase();
+                if !isrc.is_empty() {
+                    if isrc.is_ascii() && isrc.len()==12 && isrc[..2].bytes().all(|b|b.is_ascii_uppercase()) && isrc[2..5].bytes().all(|b|b.is_ascii_alphanumeric()) && isrc[5..].bytes().all(|b|b.is_ascii_digit()) { entry["isrc"]=json!(isrc); }
+                    else { damaged = true; }
+                }
+                if let Some(explicit) = row.get("explicit") { if explicit.is_boolean() { entry["explicit"]=explicit.clone(); } else { damaged = true; } }
+                let artwork = text(row.get("artwork"),4097);
+                if !artwork.is_empty() { if public_image(&artwork) { entry["artwork"]=json!(artwork); } else { damaged = true; } }
+                let track_id=text(row.get("trackId"),120);
+                if !track_id.is_empty() && ids.contains(&track_id) { entry["trackId"]=json!(track_id); entry["resolution"]=json!("matched"); }
+                else { entry["resolution"]=json!(match row.get("resolution").and_then(Value::as_str) { Some("review") if track_id.is_empty()=>"review",Some("missing") if track_id.is_empty()=>"missing",_=>"pending" }); }
+                let message=text(row.get("message"),300); if !message.is_empty() { entry["message"]=json!(message); }
+                rows.push(entry);
+            }
+            budget-=rows.len();
+            let total=number(fields.get("total"),1_000_000);
+            let raw_url=text(fields.get("sourceUrl"),2049);
+            let clean_url=if raw_url.len()<=2048{source_url(&raw_url,service)}else{String::new()};
+            if !raw_url.is_empty() && clean_url.is_empty(){damaged=true;}
+            let complete=fields.get("complete").and_then(Value::as_bool)==Some(true) && !damaged && total==Some(rows.len() as u64) && rows.len()==source_rows.len();
+            let mut warnings:Vec<String>=fields.get("warnings").and_then(Value::as_array).map(|rows|rows.iter().take(29).map(|v|text(Some(v),500)).filter(|v|!v.is_empty()).collect()).unwrap_or_default();
+            if damaged || fields.get("complete").and_then(Value::as_bool)==Some(true) && !complete {
+                let warning="Сохранена часть метаданных: достигнут предел хранения или обнаружены повреждённые записи. Повторите чтение источника.";
+                if !warnings.iter().any(|saved|saved==warning){warnings.push(warning.into());}
+            }
+            let mut record=json!({"id":canonical_id,"service":service,"sourceId":source_id,"sourceUrl":clean_url,"title":text(fields.get("title"),500),"total":total,"complete":complete,"warnings":warnings,"entries":rows,"importedAt":number(fields.get("importedAt"),9_007_199_254_740_991).unwrap_or(0)});
+            if record["title"]=="" { record["title"]=json!("Импортированная коллекция"); }
+            if let Some(account)=number(fields.get("accountId"),9_007_199_254_740_991).filter(|v|*v>0) { record["accountId"]=json!(account); }
+            let playlist=text(fields.get("remotePlaylistId"),100);if !playlist.is_empty() && state.playlists.iter().any(|p|p.id==playlist) { record["remotePlaylistId"]=json!(playlist); }
+            Some(record)
+        }).collect();
     }
     state
 }
@@ -1428,16 +1525,24 @@ pub(crate) fn merge_web_search_results(state: &mut PersistedState, tracks: &mut 
         .chain(state.playlists.iter().filter(|p| p.remote.is_none()).flat_map(|p| p.track_ids.iter()))
         .cloned().collect();
     let result_ids: HashSet<_> = tracks.iter().map(|track| track.id.clone()).collect();
+    // Artist pages, imports and mixes can remain visible while another query
+    // completes. Retain a bounded recent metadata window so those rows do not
+    // disappear before renderer queue/playlist persistence catches up. Pinned
+    // rows are outside this window and retain their existing lifetime.
+    let recent_incoming = tracks.iter().filter(|track|track.remote.as_ref().is_some_and(|r|r.search_result) && !pinned.contains(&track.id)).map(|track|track.id.clone()).collect::<HashSet<_>>();
+    let mut required: HashSet<_> = state.tracks.iter().filter(|track|!track.remote.as_ref().is_some_and(|r|r.search_result) || pinned.contains(&track.id)).map(|track|track.id.clone()).collect();
+    required.extend(result_ids.iter().cloned());
+    let recent_budget = 5_000usize.saturating_sub(recent_incoming.len()).min(100_000usize.saturating_sub(required.len()));
+    let recent: HashSet<_> = state.tracks.iter().rev().filter(|track|track.remote.as_ref().is_some_and(|r|r.search_result) && !pinned.contains(&track.id) && !result_ids.contains(&track.id)).take(recent_budget).map(|track|track.id.clone()).collect();
     let retain = |track: &Track| !track.remote.as_ref().is_some_and(|r| r.search_result)
-        || pinned.contains(&track.id) || result_ids.contains(&track.id);
+        || pinned.contains(&track.id) || result_ids.contains(&track.id) || recent.contains(&track.id);
     let mut ids: HashSet<_> = state.tracks.iter().filter(|track| retain(track)).map(|track| track.id.clone()).collect();
     let additions = tracks.iter().filter(|track| ids.insert(track.id.clone())).count();
     if state.tracks.iter().filter(|track| retain(track)).count() + additions > 100_000 {
         return Err("Библиотека достигла предела 100 000 треков. Результаты поиска не добавлены.".into());
     }
-    // Keep the latest result set until the next search; background sync also
-    // retains it so rows already on screen cannot lose their native registry.
-    state.tracks.retain(|track| retain(track));
+    // Refresh only transient-query recency; never reorder the VK collection.
+    state.tracks.retain(|track| retain(track) && (!recent_incoming.contains(&track.id) || !track.remote.as_ref().is_some_and(|r|r.search_result)));
     let mut positions: HashMap<_, _> = state.tracks.iter().enumerate().map(|(index, track)| (track.id.clone(), index)).collect();
     for track in tracks {
         if let Some(index) = positions.get(&track.id) {
@@ -1716,6 +1821,12 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            service_imports::read_service_playlist,
+            service_imports::service_import_status,
+            service_imports::connect_service_import,
+            service_imports::disconnect_service_import,
+            service_imports::list_service_playlists,
+            service_imports::cancel_service_import,
             get_state,
             soundcloud_player::soundcloud_status,
             soundcloud_player::configure_soundcloud,
@@ -1768,6 +1879,31 @@ pub fn run() {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    fn imported_fixture(source_id:&str, count:usize)->serde_json::Value {
+        serde_json::json!({"id":"untrusted-renderer-id","service":"spotify","sourceId":source_id,"sourceUrl":"https://open.spotify.com/playlist/test?token=PRIVATE#PRIVATE","title":"Imported","total":count,"complete":true,"warnings":[],"importedAt":1700000000000_i64,"entries":(0..count).map(|position|serde_json::json!({"sourceId":"same-recording","title":"Repeated song","artists":["Artist"],"album":"Album","duration":123.4,"position":position,"trackId":"vk-1-7","resolution":"matched","isrc":"US-ABC-26-12345","explicit":false})).collect::<Vec<_>>()})
+    }
+    #[test]
+    fn imported_collection_roundtrip_preserves_repeats_and_source_positions_but_no_credentials(){
+        let mut state=defaults();state.tracks.push(search_fixture(7,true));
+        let mut record=imported_fixture("liked",3);record["password"]=serde_json::json!("PRIVATE");record["accessToken"]=serde_json::json!("PRIVATE");record["entries"][0]["cookie"]=serde_json::json!("PRIVATE");
+        state.service_imports=vec![record.clone(),record];let saved=sanitized(state,&HashMap::new());let serialized=serde_json::to_string(&saved).unwrap();assert!(!serialized.contains("PRIVATE"));
+        let decoded:PersistedState=serde_json::from_str(&serialized).unwrap();let restored=sanitized(decoded,&HashMap::new());assert_eq!(restored.service_imports,saved.service_imports);
+        let record=&restored.service_imports[0];assert_eq!(restored.service_imports.len(),1);assert_eq!(record["id"],"spotify:liked");assert_eq!(record["complete"],true);assert_eq!(record["entries"].as_array().unwrap().len(),3);
+        for position in 0..3{assert_eq!(record["entries"][position]["sourceId"],"same-recording");assert_eq!(record["entries"][position]["position"],position);assert_eq!(record["entries"][position]["trackId"],"vk-1-7");}assert_eq!(record["entries"][0]["isrc"],"USABC2612345");
+    }
+    #[test]
+    fn imported_metadata_truncation_never_keeps_a_false_complete_receipt(){
+        let mut state=defaults();state.service_imports=vec![imported_fixture("a",20001),imported_fixture("b",20000),imported_fixture("c",20000)];let saved=sanitized(state,&HashMap::new());
+        assert_eq!(saved.service_imports.iter().map(|r|r["entries"].as_array().unwrap().len()).collect::<Vec<_>>(),vec![20000,20000,10000]);
+        assert_eq!(saved.service_imports[0]["complete"],false);assert_eq!(saved.service_imports[1]["complete"],true);assert_eq!(saved.service_imports[2]["complete"],false);
+        assert!(!saved.service_imports[0]["warnings"].as_array().unwrap().is_empty());assert!(!saved.service_imports[2]["warnings"].as_array().unwrap().is_empty());
+    }
+    #[test]
+    fn imported_corrupt_metadata_and_unknown_totals_are_partial_and_missing_links_pending(){
+        let mut state=defaults();let mut record=imported_fixture("damaged",3);record["warnings"]=serde_json::json!(vec!["x".repeat(600);40]);record["entries"][0]["artists"]=serde_json::json!([]);record["entries"][1]["duration"]=serde_json::json!(-1);record["entries"][2]["artwork"]=serde_json::json!("https://user:secret@example.com/art.jpg");record["entries"][2]["isrc"]=serde_json::json!("яяяяяя");
+        let mut unknown=imported_fixture("unknown",1);unknown["total"]=serde_json::Value::Null;state.service_imports=vec![record,unknown];let saved=sanitized(state,&HashMap::new());
+        let record=&saved.service_imports[0];assert_eq!(record["complete"],false);assert_eq!(record["entries"].as_array().unwrap().len(),2);assert_eq!(record["entries"][0]["position"],1);assert_eq!(record["entries"][0]["duration"].as_f64(),Some(0.0));assert_eq!(record["entries"][0]["resolution"],"pending");assert!(record["entries"][0].get("trackId").is_none());assert!(record["entries"][1].get("artwork").is_none());assert!(record["entries"][1].get("isrc").is_none());assert_eq!(record["warnings"].as_array().unwrap().len(),30);assert!(record["warnings"].as_array().unwrap().iter().all(|s|s.as_str().unwrap().chars().count()<=500));assert_eq!(saved.service_imports[1]["complete"],false);
+    }
     #[test]
     fn recording_evidence_survives_storage_without_promoting_unknown_artist_cards() {
         let mut state = defaults();
@@ -1810,7 +1946,7 @@ mod storage_tests {
                 in_library, search_result: !in_library }), ..Default::default() }
     }
     #[test]
-    fn next_search_expires_only_unpinned_old_results_and_registers_playlist_only_results() {
+    fn next_search_keeps_recent_pages_and_registers_playlist_only_results() {
         let mut state = defaults();
         state.tracks = vec![search_fixture(1, false), search_fixture(2, false), search_fixture(3, false)];
         state.tracks[2].remote.as_mut().unwrap().search_result = false;
@@ -1818,8 +1954,26 @@ mod storage_tests {
         let mut results = vec![search_fixture(3, false), search_fixture(4, false)];
         merge_web_search_results(&mut state, &mut results).unwrap();
         assert_eq!(state.tracks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
-            vec!["vk-1-1", "vk-1-3", "vk-1-4"]);
-        assert!(state.tracks[1].remote.as_ref().unwrap().search_result);
+            vec!["vk-1-1", "vk-1-2", "vk-1-3", "vk-1-4"]);
+        assert!(state.tracks[2].remote.as_ref().unwrap().search_result);
+    }
+    #[test]
+    fn transient_registry_is_bounded_refreshes_recency_and_never_evicts_pinned_or_owned_rows() {
+        let mut state = defaults();
+        state.tracks = (1..=5_003).map(|id|search_fixture(id,false)).collect();
+        state.queue = vec!["vk-1-1".into()]; state.history = vec!["vk-1-2".into()]; state.current_track_id = Some("vk-1-3".into());
+        state.tracks.push(search_fixture(6_000,true));
+        let mut refresh = vec![search_fixture(4,false)]; merge_web_search_results(&mut state,&mut refresh).unwrap();
+        let mut next = vec![search_fixture(5_004,false),search_fixture(5_005,false)]; merge_web_search_results(&mut state,&mut next).unwrap();
+        assert_eq!(state.tracks.iter().filter(|track|track.remote.as_ref().is_some_and(|r|r.search_result) && !["vk-1-1","vk-1-2","vk-1-3"].contains(&track.id.as_str())).count(),5_000);
+        assert!(!state.tracks.iter().any(|track|track.id == "vk-1-5" || track.id == "vk-1-6"));
+        for id in [1,2,3,4,6_000,5_004,5_005] { assert!(state.tracks.iter().any(|track|track.id == format!("vk-1-{id}"))); }
+    }
+    #[test]
+    fn near_full_library_evicts_old_transient_metadata_to_register_the_latest_page() {
+        let mut state = defaults(); state.tracks = (1..=99_999).map(|id|search_fixture(id,true)).collect(); state.tracks.push(search_fixture(100_000,false));
+        let mut next = vec![search_fixture(100_001,false)]; merge_web_search_results(&mut state,&mut next).unwrap();
+        assert_eq!(state.tracks.len(),100_000); assert!(!state.tracks.iter().any(|track|track.id == "vk-1-100000")); assert!(state.tracks.iter().any(|track|track.id == "vk-1-100001"));
     }
     #[test]
     fn full_catalog_search_never_returns_an_unregistered_playable_result() {

@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { ListMusic, Music2, Pause, Play, RefreshCw, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Volume2, X } from 'lucide-react'
+import { useEffect, useRef } from 'react'
+import { ListMusic, Music2, Pause, Play, RefreshCw, Repeat, Repeat1, Shuffle, SkipBack, SkipForward, Volume1, Volume2, VolumeX, X } from 'lucide-react'
 import type { AppSettings, Track } from './shared/contracts'
 import { TrackArtwork } from './TrackArtwork'
 import { BufferedSeekbar } from './BufferedSeekbar'
@@ -7,7 +7,14 @@ import type { BufferedRange, PlaybackNetwork } from './buffering'
 
 type Props = { current?: Track | null; playing: boolean; buffering: boolean; advertising: boolean; position: number; duration: number; buffered?: BufferedRange[]; bufferedAhead?: number; network?: PlaybackNetwork; volume: number; queueCount: number; canShuffle: boolean; shuffle: boolean; repeat: AppSettings['repeat']; onToggle: () => void; onPrevious: () => void; onNext: () => void; onSeek: (position: number) => void; onVolume: (volume: number) => void; onQueue: () => void; onShuffle: () => void; onRepeat: () => void; onArtist: () => void; onInfo: () => void; error: string; onRetry: () => void; onDismissError?: () => void }
 export function PlayerBar({ current, playing, buffering, advertising, position, duration, buffered, bufferedAhead, network, volume, queueCount, canShuffle, shuffle, repeat, onToggle, onPrevious, onNext, onSeek, onVolume, onQueue, onShuffle, onRepeat, onArtist, onInfo, error, onRetry, onDismissError }: Props) {
-  const [volumeOpen, setVolumeOpen] = useState(false)
+  const previousVolume = useRef(volume > 0 ? volume : .5)
+  useEffect(() => { if (volume > 0) previousVolume.current = volume }, [volume])
+  const muted = volume === 0
+  const VolumeIcon = muted ? VolumeX : volume < .5 ? Volume1 : Volume2
+  const toggleMute = () => {
+    if (muted) onVolume(previousVolume.current)
+    else { previousVolume.current = volume; onVolume(0) }
+  }
   const repeatLabel = repeat === 'off' ? 'Повтор выключен' : repeat === 'all' ? 'Повтор всей очереди' : 'Повтор одного трека'
   return <div className="player-wrap">
     {advertising && <div className="player-info" role="status">VK воспроизводит рекламную вставку в официальном плеере.</div>}{error && <div className="player-error" role="alert"><span>{error}</span><button onClick={onRetry}>Повторить</button>{current?.source === 'vk' && <button onClick={onInfo}>Выбрать источник</button>}{onDismissError && <button className="player-error-dismiss" onClick={onDismissError} aria-label="Закрыть ошибку воспроизведения"><X size={14} /></button>}</div>}
@@ -19,7 +26,7 @@ export function PlayerBar({ current, playing, buffering, advertising, position, 
         <button className="player-button" onClick={onNext} disabled={!current} aria-label="Следующий трек"><SkipForward size={18} fill="currentColor" /></button>
         <button className={`player-button ${repeat !== 'off' ? 'active' : ''}`} onClick={onRepeat} aria-label={repeatLabel} aria-pressed={repeat !== 'off'} title={`${repeatLabel}. Нажмите, чтобы изменить`}>{repeat === 'one' ? <Repeat1 size={16} /> : <Repeat size={16} />}</button>
       </div><BufferedSeekbar trackId={current?.id} position={position} duration={duration} buffered={buffered} bufferedAhead={bufferedAhead} network={network} buffering={buffering} onSeek={onSeek} /></div>
-      <div className="player-options"><div className={`volume-control ${volumeOpen ? 'expanded' : ''}`}><button className="player-button volume-button" aria-label="Открыть громкость" aria-expanded={volumeOpen} onClick={() => setVolumeOpen(value => !value)} title={`Громкость ${Math.round(volume * 100)}%`}><Volume2 size={17} /></button><input aria-label="Громкость" type="range" min={0} max={1} step="0.01" value={volume} onChange={event => onVolume(Number(event.target.value))} /></div><button className="queue-button" onClick={onQueue} aria-label={`Открыть очередь, ${queueCount} треков`}><ListMusic size={18} /><span>Очередь</span>{queueCount > 0 && <b>{queueCount}</b>}</button></div>
+      <div className="player-options"><div className={`volume-control ${muted ? 'is-muted' : ''}`}><button className="player-button volume-button" aria-label={muted ? 'Включить звук' : 'Выключить звук'} aria-pressed={muted} onClick={toggleMute} title={muted ? `Включить звук — ${Math.round(previousVolume.current * 100)}%` : `Выключить звук — ${Math.round(volume * 100)}%`}><VolumeIcon size={17} /></button><input aria-label="Громкость" type="range" min={0} max={1} step="0.01" value={volume} onChange={event => onVolume(Number(event.target.value))} /></div><button className="queue-button" onClick={onQueue} aria-label={`Открыть очередь, ${queueCount} треков`}><ListMusic size={18} /><span>Очередь</span>{queueCount > 0 && <b>{queueCount}</b>}</button></div>
     </div>
   </div>
 }

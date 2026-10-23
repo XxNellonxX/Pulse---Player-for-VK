@@ -4,8 +4,8 @@
   'use strict';
   const w = window;
   if (w.top !== w || !['https://vk.com', 'https://vk.ru'].includes(location.origin)) return;
-  if (w.__PULSE_VK_ARTISTS__?.version === 2) return;
-  const requests = new Map(), releases = new Map(), hydrated = new Map();
+  if (w.__PULSE_VK_ARTISTS__?.version === 3) return;
+  const requests = new Map(), releases = new Map(), hydrated = new Map(), artistPages = new Map();
   let runtime;
   const current = () => Number(w.vk?.id) || 0;
   const identity = value => typeof value === 'string' && /^\d{1,30}$/.test(value) ? value : Number.isSafeInteger(value) && value > 0 ? String(value) : '';
@@ -121,6 +121,51 @@
       return { tracks: register(unique), checkedAt: Date.now() };
     }
     if (input.action === 'resolve') return { artists: await resolve(input.query), checkedAt: Date.now() };
+    if (input.action === 'recommendations') {
+      if (typeof audio.getRecommendations !== 'function') throw new Error('VK пока не предоставил персональные рекомендации.');
+      const page = await call(() => audio.getRecommendations({ user_id: expected, count: 100, offset: 0 }));
+      if (!Array.isArray(page?.items) || page.items.length > 100) throw new Error('VK не подтвердил персональные рекомендации.');
+      const rows = [...new Map(page.items.map(row => [`${row.owner_id}_${row.id}`, row])).values()];
+      return { tracks: register(rows), checkedAt: Date.now(), message: rows.length ? undefined : 'VK пока не подобрал рекомендации для вашего аккаунта.' };
+    }
+    if (input.action === 'artist-tracks') {
+      if (!identity(input.artistId)) throw new Error('Выберите артиста из каталога VK.');
+      if (typeof audio.getAudiosByArtist !== 'function') throw new Error('VK пока не предоставил полный список треков артиста.');
+      for (const [key, session] of artistPages) if (session.account !== expected || Date.now() - session.updatedAt > 600_000) artistPages.delete(key);
+      const token = () => `at-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+      let session;
+      if (input.cursor != null) {
+        if (typeof input.cursor !== 'string' || !/^at-[a-z0-9-]{10,100}$/.test(input.cursor)) throw new Error('Некорректная страница треков артиста.');
+        session = [...artistPages.values()].find(item => item.artistId === input.artistId && item.account === expected && (item.nextCursor === input.cursor || item.lastCursor === input.cursor));
+        if (!session) throw new Error('VK больше не хранит эту страницу. Откройте все треки заново.');
+        if (session.lastCursor === input.cursor && session.lastResult) return session.lastResult;
+        if (session.pending) return session.pending;
+      } else {
+        const key = token();
+        session = { account: expected, artistId: input.artistId, offset: 0, seen: new Set(), updatedAt: Date.now() };
+        artistPages.set(key, session);
+        while (artistPages.size > 8) artistPages.delete(artistPages.keys().next().value);
+      }
+      const load = async () => {
+        const page = await call(() => audio.getAudiosByArtist({ artist_id: input.artistId, offset: session.offset, count: 100 }));
+        if (!Array.isArray(page?.items) || page.items.length > 100 || page.items.some(row => !Number.isSafeInteger(row?.owner_id) || !row.owner_id || !Number.isSafeInteger(row.id) || row.id < 1)) throw new Error('VK не подтвердил список треков артиста.');
+        const total = count(page.count), rows = [...new Map(page.items.map(row => [`${row.owner_id}_${row.id}`, row])).values()].filter(row => !session.seen.has(`${row.owner_id}_${row.id}`));
+        const offset = session.offset + page.items.length;
+        const providerHasMore = typeof page.has_more === 'boolean' ? page.has_more : total != null ? offset < total : page.items.length === 100;
+        const repeated = rows.length === 0 && (page.items.length > 0 || providerHasMore), limited = offset >= 50_000;
+        // The cursor is page-owned state, never a VK section/access key or URL.
+        // Keep at most one prior receipt for safe double-click/retry replay.
+        const nextCursor = providerHasMore && !repeated && !limited ? token() : undefined;
+        const incomplete = !nextCursor && total != null && session.seen.size + rows.length < total;
+        const result = { artistId: input.artistId, tracks: register(rows), checkedAt: Date.now(), hasMore: Boolean(nextCursor), ...(nextCursor ? { nextCursor } : {}), ...(total != null ? { totalTracks: total } : {}), ...(repeated ? { message: 'VK повторил страницу. Показаны полученные треки; обновите список для повторной проверки.' } : limited ? { message: 'Достигнут предел одного просмотра: 50 000 треков.' } : incomplete ? { message: 'VK вернул не все заявленные треки. Список мог измениться; обновите его для повторной проверки.' } : {}) };
+        valid();
+        for (const row of rows) session.seen.add(`${row.owner_id}_${row.id}`);
+        session.offset = offset; session.lastCursor = input.cursor; session.lastResult = result; session.nextCursor = nextCursor; session.updatedAt = Date.now();
+        return result;
+      };
+      session.pending = load();
+      try { return await session.pending; } finally { session.pending = undefined; }
+    }
     if (input.action === 'artist' || input.action === 'follow') {
       if (!identity(input.artistId)) throw new Error('Выберите артиста из каталога VK.');
       if (input.action === 'follow') {
@@ -204,7 +249,7 @@
     }
     throw new Error('Неизвестный раздел музыки.');
   }
-  Object.defineProperty(w, '__PULSE_VK_ARTISTS__', { configurable: true, value: Object.freeze({ version: 2,
+  Object.defineProperty(w, '__PULSE_VK_ARTISTS__', { configurable: true, value: Object.freeze({ version: 3,
     start(key, input, expected) {
       if (!expected || current() !== expected || typeof key !== 'string' || key.length > 100 || !input || typeof input !== 'object' || !w.__PULSE_VK_WEB__?.acceptSearch) return false;
       if (requests.has(key)) return true;

@@ -15,8 +15,12 @@ export function ArtistView({ request, connected, library, currentId, playing, ad
   const [loading, setLoading] = useState(false), [refreshing, setRefreshing] = useState(false), [error, setError] = useState('')
   const [pending, setPending] = useState<string | null>(null), [snippetPending, setSnippetPending] = useState<string | null>(null), [followPending, setFollowPending] = useState(false)
   const [visible, setVisible] = useState(30)
+  const [catalogTracks, setCatalogTracks] = useState<Track[] | null>(null), [catalogCursor, setCatalogCursor] = useState<string | undefined>(), [catalogTotal, setCatalogTotal] = useState<number | undefined>()
+  const [catalogLoading, setCatalogLoading] = useState(false), [catalogError, setCatalogError] = useState(''), [catalogMessage, setCatalogMessage] = useState('')
+  const [catalogNeedsRestart, setCatalogNeedsRestart] = useState(false)
   const requestKey = JSON.stringify({ action: request.action, artistId: request.artistId, query: request.query, releaseId: request.releaseId, trackId: request.trackId })
   const generation = useRef(0), inFlight = useRef(false)
+  const catalogGeneration = useRef(0), catalogInFlight = useRef(false)
   const fetchLatest = useRef<(quiet?: boolean) => Promise<void>>(async () => {})
   const currentRequest = useRef(request); currentRequest.current = request
   const members = useMemo(() => new Set(library.filter(t => t.source === 'vk' && t.remote?.inLibrary === true).map(t => t.id)), [library])
@@ -24,6 +28,8 @@ export function ArtistView({ request, connected, library, currentId, playing, ad
   useEffect(() => {
     const ticket = ++generation.current
     setResult(null); setError(''); setVisible(30); setPending(null); setSnippetPending(null); setFollowPending(false); inFlight.current = false
+    catalogGeneration.current++; catalogInFlight.current = false
+    setCatalogTracks(null); setCatalogCursor(undefined); setCatalogTotal(undefined); setCatalogLoading(false); setCatalogError(''); setCatalogMessage(''); setCatalogNeedsRestart(false)
     const load = async (quiet = false) => {
       if (!connected || inFlight.current) return
       if (!window.desktop?.artistMusic) { setError('Каталог артистов доступен в версии приложения на Tauri.'); return }
@@ -39,8 +45,30 @@ export function ArtistView({ request, connected, library, currentId, playing, ad
     if (connected) void load()
     else setLoading(false)
     const timer = window.setInterval(() => { if (document.visibilityState === 'visible' && currentRequest.current.action !== 'resolve') void load(true) }, 300_000)
-    return () => { window.clearInterval(timer); if (generation.current === ticket) { generation.current++; inFlight.current = false } }
+    return () => { window.clearInterval(timer); if (generation.current === ticket) { generation.current++; catalogGeneration.current++; catalogInFlight.current = false; inFlight.current = false } }
   }, [requestKey, connected])
+
+  async function loadCatalog(reset = false) {
+    const artistId = result?.artist?.id, api = window.desktop?.artistMusic
+    if (!artistId || !api || !connected || catalogInFlight.current || (!reset && catalogTracks !== null && !catalogCursor)) return
+    const ticket = generation.current, pageTicket = ++catalogGeneration.current
+    catalogInFlight.current = true; setCatalogLoading(true); setCatalogError(''); setCatalogNeedsRestart(false)
+    if (reset) { setCatalogTracks([]); setCatalogCursor(undefined); setCatalogTotal(undefined); setCatalogMessage(''); setVisible(30) }
+    const cursor = reset ? undefined : catalogCursor
+    try {
+      const next = await api({ action: 'artist-tracks', artistId, ...(cursor ? { cursor } : {}) })
+      if (generation.current !== ticket || catalogGeneration.current !== pageTicket) return
+      if (next.artistId !== artistId || !Array.isArray(next.tracks) || Boolean(next.hasMore) !== Boolean(next.nextCursor) || next.nextCursor === cursor && next.hasMore) throw new Error('VK не подтвердил следующую страницу треков. Повторите запрос.')
+      setCatalogTracks(previous => [...new Map([...(reset ? [] : previous || []), ...next.tracks!].map(track => [track.id, track])).values()])
+      setCatalogCursor(next.nextCursor); setCatalogTotal(next.totalTracks); setCatalogMessage(next.message || '')
+      if (!reset) setVisible(value => value + 100)
+    } catch (reason) { if (generation.current === ticket && catalogGeneration.current === pageTicket) { const message = errorText(reason); setCatalogError(message); setCatalogNeedsRestart(/больше не хранит|не подтвердил следующую страницу/.test(message)) } }
+    finally { if (generation.current === ticket && catalogGeneration.current === pageTicket) { catalogInFlight.current = false; setCatalogLoading(false) } }
+  }
+  function closeCatalog() {
+    catalogGeneration.current++; catalogInFlight.current = false
+    setCatalogTracks(null); setCatalogLoading(false); setCatalogCursor(undefined); setCatalogTotal(undefined); setCatalogError(''); setCatalogMessage(''); setVisible(30)
+  }
 
   async function follow() {
     const artist = result?.artist, api = window.desktop?.artistMusic
@@ -77,11 +105,11 @@ export function ArtistView({ request, connected, library, currentId, playing, ad
     <span className="artist-release-art-wrap"><TrackArtwork track={{ id: release.id, title: release.title, artist: release.artist, artwork: release.artwork }} className="artist-release-art" /><span className="artist-release-play"><ChevronRight size={23} /></span>{release.kind !== 'album' && release.kind !== 'release' && <span className="artist-release-badge">{release.kind === 'compilation' ? 'Сборник' : release.kind === 'single' ? 'Сингл' : 'EP'}</span>}</span>
     <strong>{release.title}</strong><span>{release.artist || `${release.trackCount} треков`}{release.year ? `, ${release.year}` : ''}</span>{release.plays != null && <small>{number.format(release.plays)} прослушиваний</small>}
   </button> }
-  const artist = result?.artist, tracks = artist?.tracks || result?.tracks || [], releases = artist?.releases || result?.releases || []
+  const artist = result?.artist, tracks = catalogTracks ?? artist?.tracks ?? result?.tracks ?? [], releases = artist?.releases || result?.releases || []
   const title = artist?.name || result?.release?.title || (request.action === 'updates' ? 'Новые релизы' : request.action === 'snippets' ? 'Сниппеты' : request.action === 'resolve' ? `Исполнители: ${request.query || ''}` : 'Исполнитель')
   if (!connected) return <section className="artist-view artist-empty"><Mic2 size={42} strokeWidth={1.2} /><h1>Музыка ближе</h1><p>Подключите VK, чтобы открыть артистов, их релизы и обновления.</p><button className="primary-button" onClick={onConnect}>Подключить VK</button></section>
   return <section className="artist-view" aria-busy={loading}>
-    <div className="artist-view-toolbar"><span className="eyebrow">{request.action === 'updates' ? 'ОТ ТЕХ, КОГО ВЫ СЛУШАЕТЕ' : request.action === 'snippets' ? 'ОТКРОЙТЕ НОВЫЙ ЗВУК' : 'МУЗЫКА VK'}</span><button className="icon-button" disabled={loading || refreshing || followPending} onClick={() => void fetchLatest.current(true)} title="Обновить из VK" aria-label="Обновить из VK"><RefreshCw size={17} className={refreshing ? 'spin' : ''} /></button></div>
+    <div className="artist-view-toolbar"><span className="eyebrow">{request.action === 'updates' ? 'ОТ ТЕХ, КОГО ВЫ СЛУШАЕТЕ' : request.action === 'snippets' ? 'ОТКРОЙТЕ НОВЫЙ ЗВУК' : 'МУЗЫКА VK'}</span><button className="icon-button" disabled={loading || refreshing || followPending || catalogLoading} onClick={() => catalogTracks !== null ? void loadCatalog(true) : void fetchLatest.current(true)} title="Обновить из VK" aria-label="Обновить из VK"><RefreshCw size={17} className={refreshing || catalogLoading ? 'spin' : ''} /></button></div>
     {loading && !result ? <div className="artist-skeleton"><div /><section><span /><span /><span /></section></div> : <>
       <header className={`artist-hero ${artist?.photo || result?.release?.artwork ? 'has-art' : ''}`}>
         {artist ? <TrackArtwork track={{ id: artist.id, title: artist.name, artist: artist.name, artwork: artist.photo }} className="artist-portrait" /> : result?.release ? <TrackArtwork track={{ id: result.release.id, title, artist: result.release.artist, artwork: result.release.artwork }} className="artist-release-hero-art" /> : <div className="artist-hero-symbol">{request.action === 'updates' ? <Bell size={40} strokeWidth={1.1} /> : request.action === 'snippets' ? <Radio size={42} strokeWidth={1.1} /> : <Mic2 size={42} strokeWidth={1.1} />}</div>}
@@ -95,7 +123,7 @@ export function ArtistView({ request, connected, library, currentId, playing, ad
       </header>
       {artist?.bio && <details className="artist-bio"><summary>Об исполнителе</summary><p>{artist.bio}</p></details>}
       {result?.artists && result.artists.length > 0 && <section className="artist-follows"><div className="artist-section-heading"><h2>{request.action === 'resolve' ? 'В каталоге VK' : 'Вы подписаны'}</h2><span>{result.artists.length}</span></div><div className="artist-follows-strip">{result.artists.map(a => <button key={a.id} onClick={() => openArtist(a)}><TrackArtwork track={{ id: a.id, title: a.name, artist: a.name, artwork: a.photo }} className="artist-follow-avatar" /><strong>{a.name}</strong>{a.followed && <Check size={13} />}</button>)}</div></section>}
-      {tracks.length > 0 && <section className="artist-track-section"><div className="artist-section-heading"><h2>{artist ? 'Популярное' : request.action === 'snippets' ? 'Подборка VK' : 'Треки'}</h2><span>{tracks.length}</span></div>{request.action === 'snippets' ? <div className="artist-snippet-grid">{tracks.map(track => <article className={`artist-snippet-card ${currentId === track.id ? 'is-active' : ''}`} key={track.id}><button className="artist-snippet-cover-button" disabled={Boolean(snippetPending)} onClick={() => void snippet(track)} aria-label={`Сниппет ${track.title}`}><TrackArtwork track={track} className="artist-snippet-cover" /><span>{snippetPending === track.id ? <LoaderCircle className="spin" size={29} /> : <Play size={29} fill="currentColor" />}</span></button><strong>{track.title}</strong><div className="artist-track-artists">{artistLinks(track)}</div><div className="artist-snippet-footer"><button onClick={() => onPlay(track, tracks, true)}>Полная версия<ChevronRight size={14} /></button>{saved(track) ? <Check size={18} aria-label="В вашей музыке VK" /> : <button className="icon-button" disabled={Boolean(pending)} aria-label={`Добавить ${track.title} в VK`} onClick={() => void add(track)}>{pending === track.id ? <LoaderCircle size={17} className="spin" /> : <Plus size={19} />}</button>}</div></article>)}</div> : <div className="artist-track-list" role="list">{tracks.slice(0, visible).map((t, i) => trackRow(t, i, tracks))}{tracks.length > visible && <button className="artist-show-more" onClick={() => setVisible(v => v + 30)}>Показать ещё {Math.min(30, tracks.length - visible)}</button>}</div>}</section>}
+      {(tracks.length > 0 || artist) && <section className="artist-track-section"><div className="artist-section-heading"><h2>{artist ? catalogTracks !== null ? 'Все треки' : 'Популярное' : request.action === 'snippets' ? 'Подборка VK' : 'Треки'}</h2><span>{catalogTracks !== null && catalogTotal != null ? `${tracks.length} из ${number.format(catalogTotal)}` : tracks.length}</span>{artist && <button className="artist-catalog-toggle" disabled={catalogLoading} onClick={() => catalogTracks !== null ? closeCatalog() : void loadCatalog(true)}>{catalogLoading ? <LoaderCircle size={15} className="spin" /> : null}{catalogTracks !== null ? 'Популярное' : 'Все треки'}<ChevronRight size={15} /></button>}</div>{request.action === 'snippets' ? <div className="artist-snippet-grid">{tracks.map(track => <article className={`artist-snippet-card ${currentId === track.id ? 'is-active' : ''}`} key={track.id}><button className="artist-snippet-cover-button" disabled={Boolean(snippetPending)} onClick={() => void snippet(track)} aria-label={`Сниппет ${track.title}`}><TrackArtwork track={track} className="artist-snippet-cover" /><span>{snippetPending === track.id ? <LoaderCircle className="spin" size={29} /> : <Play size={29} fill="currentColor" />}</span></button><strong>{track.title}</strong><div className="artist-track-artists">{artistLinks(track)}</div><div className="artist-snippet-footer"><button onClick={() => onPlay(track, tracks, true)}>Полная версия<ChevronRight size={14} /></button>{saved(track) ? <Check size={18} aria-label="В вашей музыке VK" /> : <button className="icon-button" disabled={Boolean(pending)} aria-label={`Добавить ${track.title} в VK`} onClick={() => void add(track)}>{pending === track.id ? <LoaderCircle size={17} className="spin" /> : <Plus size={19} />}</button>}</div></article>)}</div> : <div className="artist-track-list" role="list">{tracks.slice(0, visible).map((t, i) => trackRow(t, i, tracks))}{catalogLoading && <div className="artist-catalog-status" role="status"><LoaderCircle size={17} className="spin" />Загружаем треки из VK…</div>}{tracks.length > visible ? <button className="artist-show-more" onClick={() => setVisible(v => v + 100)}>Показать ещё {Math.min(100, tracks.length - visible)}</button> : catalogCursor && <button className="artist-show-more" disabled={catalogLoading} onClick={() => void loadCatalog()}>{catalogLoading ? 'Загружаем…' : 'Загрузить ещё треки'}</button>}{catalogTracks !== null && !tracks.length && !catalogLoading && !catalogError && <p className="artist-catalog-status">VK пока не предоставил треки артиста.</p>}</div>}{catalogError && <div className="artist-inline-error" role="alert"><CircleAlert size={18} /><span>{catalogError}</span><button disabled={catalogLoading} onClick={() => void loadCatalog(catalogNeedsRestart || !catalogTracks?.length)}>{catalogNeedsRestart ? 'Открыть заново' : 'Повторить'}</button></div>}{catalogMessage && <p className="artist-cache-note" role="status">{catalogMessage}</p>}</section>}
       {(['album', 'ep', 'single', 'compilation', 'release'] as const).map(kind => { const rows = releases.filter(r => r.kind === kind); return rows.length > 0 && <section className="artist-releases-section" key={kind}><div className="artist-section-heading"><h2>{labels[kind]}</h2><span>{rows.length}</span><Disc3 size={17} /></div><div className="artist-release-grid">{rows.map(releaseCard)}</div></section> })}
       {!error && !loading && result && !artist && !result.release && !tracks.length && !releases.length && !result.artists?.length && <div className="artist-empty"><Sparkles size={33} strokeWidth={1.2} /><h2>{request.action === 'resolve' ? 'Такого артиста пока нет' : request.action === 'updates' ? 'Пока без новых релизов' : 'Музыка ещё не появилась'}</h2><p>{request.action === 'resolve' ? 'Попробуйте другое имя или откройте исполнителя из трека.' : 'Когда VK предоставит новые подборки, они появятся здесь.'}</p></div>}
     </>}

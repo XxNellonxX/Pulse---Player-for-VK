@@ -17,12 +17,13 @@ struct Release { id: String, owner_id: i64, playlist_id: i64, title: String, art
 struct Clip { track_id: String, from: f64, to: f64 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-struct ResultData { artists: Option<Vec<Artist>>, artist: Option<Artist>, releases: Option<Vec<Release>>, release: Option<Release>, tracks: Option<Vec<Track>>, clip: Option<Clip>, checked_at: i64, cached: bool, has_more: bool, message: Option<String> }
+struct ResultData { artists: Option<Vec<Artist>>, artist: Option<Artist>, releases: Option<Vec<Release>>, release: Option<Release>, tracks: Option<Vec<Track>>, artist_id: Option<String>, next_cursor: Option<String>, total_tracks: Option<u64>, clip: Option<Clip>, checked_at: i64, cached: bool, has_more: bool, message: Option<String> }
 #[derive(Serialize, Deserialize, Default)]
 struct Cache { account: i64, entries: BTreeMap<String, ResultData> }
 
 fn text(value: &str, max: usize) -> String { value.chars().filter(|c| !c.is_control()).take(max).collect() }
 fn artist_id(value: &str) -> bool { !value.is_empty() && value.len() <= 30 && value.bytes().all(|c| c.is_ascii_digit()) }
+fn page_cursor(value: &str) -> bool { value.starts_with("at-") && (13..=103).contains(&value.len()) && value.bytes().all(|c|c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-') }
 fn image(value: Option<String>) -> Option<String> { value.filter(|s| s.len() <= 4096 && url::Url::parse(s).ok().is_some_and(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none() && u.port_or_known_default() == Some(443) && u.host_str().is_some_and(|h| h != "localhost" && !h.ends_with(".localhost") && !h.ends_with(".local") && h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().is_err()))) }
 fn clean_artist(a: &mut Artist) -> Result<(), String> {
     if !artist_id(&a.id) || a.name.is_empty() || a.tracks.len() > 500 || a.releases.len() > 200 { return Err("VK вернул некорректную карточку артиста.".into()); }
@@ -47,6 +48,7 @@ fn validate(mut result: ResultData) -> Result<ResultData, String> {
     if let Some(r) = &mut result.release { clean_release(r)?; }
     if let Some(rows) = &mut result.tracks { if rows.len() > 500 { return Err("Слишком много треков.".into()); } for t in rows { clean_track(t)?; } }
     if result.clip.as_ref().is_some_and(|c| !c.track_id.starts_with("vk-") || !c.from.is_finite() || !c.to.is_finite() || c.from < 0.0 || c.to <= c.from || c.to - c.from > 120.0) { return Err("VK вернул некорректный сниппет.".into()); }
+    if result.artist_id.as_ref().is_some_and(|id|!artist_id(id)) || result.next_cursor.as_ref().is_some_and(|cursor|!page_cursor(cursor)) || result.total_tracks.is_some_and(|total|total > 1_000_000) { return Err("VK вернул некорректную страницу треков артиста.".into()); }
     result.message = result.message.take().map(|s|text(&s, 500)); Ok(result)
 }
 fn decode_web_result(mut value: Value) -> Result<ResultData, String> {
@@ -57,7 +59,7 @@ fn decode_web_result(mut value: Value) -> Result<ResultData, String> {
         match value {
             Value::Array(rows) => for row in rows { normalize(row)?; },
             Value::Object(fields) => for (key, value) in fields {
-                if matches!(key.as_str(),"checkedAt"|"ownerId"|"playlistId"|"trackCount"|"plays"|"releasedAt"|"year"|"listeners"|"followers"|"addedAt"|"audioId") && value.is_number() {
+                if matches!(key.as_str(),"checkedAt"|"ownerId"|"playlistId"|"trackCount"|"totalTracks"|"plays"|"releasedAt"|"year"|"listeners"|"followers"|"addedAt"|"audioId") && value.is_number() {
                     let number = value.as_f64().filter(|n|n.is_finite() && n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0).ok_or("VK вернул некорректный числовой параметр каталога.")?;
                     *value = json!(number as i64);
                 } else { normalize(value)?; }
@@ -73,10 +75,12 @@ fn matches_request(result: &ResultData, input: &Value) -> bool {
     match input.get("action").and_then(Value::as_str).unwrap_or("") {
         "resolve" => result.artists.is_some(),
         "artist" => result.artist.as_ref().is_some_and(|a|Some(a.id.as_str()) == input.get("artistId").and_then(Value::as_str)),
+        "artist-tracks" => result.artist_id.as_deref() == input.get("artistId").and_then(Value::as_str) && result.tracks.as_ref().is_some_and(|tracks|tracks.len() <= 100) && result.has_more == result.next_cursor.is_some(),
         "follow" => result.artist.as_ref().is_some_and(|a|Some(a.id.as_str()) == input.get("artistId").and_then(Value::as_str) && a.followed == input.get("follow").and_then(Value::as_bool)),
         "release" => result.release.as_ref().is_some_and(|r|Some(r.id.as_str()) == input.get("releaseId").and_then(Value::as_str)) && result.tracks.is_some(),
         "updates" => result.artists.is_some() && result.releases.is_some(),
         "snippets" => result.tracks.is_some(),
+        "recommendations" => result.tracks.as_ref().is_some_and(|tracks|tracks.len() <= 100),
         "snippet" => result.clip.as_ref().is_some_and(|c|Some(c.track_id.as_str()) == input.get("trackId").and_then(Value::as_str)),
         _=> false,
     }
@@ -136,10 +140,11 @@ async fn hydrate_cached(app: &AppHandle, expected: &vk_web::UploadGuard, result:
 #[tauri::command]
 pub async fn vk_artist_music(app: AppHandle, input: Value) -> Result<Value, String> {
     let action = input.get("action").and_then(Value::as_str).ok_or("Выберите раздел музыки.")?;
-    if !matches!(action,"resolve"|"artist"|"release"|"updates"|"follow"|"snippets"|"snippet") { return Err("Неизвестный раздел музыки.".into()); }
+    if !matches!(action,"resolve"|"artist"|"artist-tracks"|"release"|"updates"|"follow"|"snippets"|"snippet"|"recommendations") { return Err("Неизвестный раздел музыки.".into()); }
     let mut safe = json!({"action":action});
-    for (field, max) in [("query",200),("artistId",30),("releaseId",100),("trackId",100)] { if let Some(v) = input.get(field) { let s = v.as_str().filter(|s|!s.is_empty() && s.len() <= max).ok_or("Некорректный запрос музыки.")?; safe[field] = json!(s); } }
-    if matches!(action,"artist"|"follow") && !safe.get("artistId").and_then(Value::as_str).is_some_and(artist_id) { return Err("Выберите артиста VK.".into()); }
+    for (field, max) in [("query",200),("artistId",30),("releaseId",100),("trackId",100),("cursor",103)] { if let Some(v) = input.get(field) { let s = v.as_str().filter(|s|!s.is_empty() && s.len() <= max).ok_or("Некорректный запрос музыки.")?; safe[field] = json!(s); } }
+    if matches!(action,"artist"|"artist-tracks"|"follow") && !safe.get("artistId").and_then(Value::as_str).is_some_and(artist_id) { return Err("Выберите артиста VK.".into()); }
+    if safe.get("cursor").is_some_and(|value|action != "artist-tracks" || !value.as_str().is_some_and(page_cursor)) { return Err("Некорректная страница треков артиста.".into()); }
     if action == "resolve" && safe.get("query").and_then(Value::as_str).is_none_or(|s|s.trim().is_empty()) { return Err("Введите имя артиста.".into()); }
     if action == "follow" { safe["follow"] = json!(input.get("follow").and_then(Value::as_bool).ok_or("Выберите состояние подписки.")?); }
     let expected = vk_web::upload_guard(&app).map_err(|_|"Подключите VK для каталога артистов.".to_string())?;
@@ -199,5 +204,18 @@ mod tests {
     #[test] fn resolve_webview_timestamp_float_decodes_and_fractional_or_unsafe_integers_fail() {
         let raw = json!({"checkedAt":1792562400000.0,"artists":[{"id":"6749485843676900230","name":"Daft Punk"}]}); assert_eq!(decode_web_result(raw).unwrap().artists.unwrap()[0].id,"6749485843676900230");
         assert!(decode_web_result(json!({"checkedAt":1.5})).is_err()); assert!(decode_web_result(json!({"checkedAt":9007199254740992.0})).is_err()); assert!(decode_web_result(json!({"checkedAt":0,"artist":{"id":6749485843676900230.0,"name":"Wrong"}})).is_err());
+    }
+    #[test] fn artist_page_receipts_match_exact_artist_and_require_continuation_consistency() {
+        let mut page = ResultData{artist_id:Some("6749485843676900230".into()),tracks:Some(vec![]),checked_at:now(),..Default::default()};
+        let input = json!({"action":"artist-tracks","artistId":"6749485843676900230"});
+        assert!(matches_request(&page,&input)); assert!(!matches_request(&page,&json!({"action":"artist-tracks","artistId":"123"})));
+        page.has_more = true; assert!(!matches_request(&page,&input));
+        page.next_cursor = Some("at-abcde12345-xyz123456".into()); assert!(matches_request(&page,&input)); assert!(validate(page.clone()).is_ok());
+        page.next_cursor = Some("https://vk.ru/private?key=secret".into()); assert!(validate(page).is_err());
+    }
+    #[test] fn recommendations_are_bounded_and_artist_count_webview_float_decodes() {
+        let decoded = decode_web_result(json!({"checkedAt":0.0,"totalTracks":101.0,"artistId":"123","tracks":[]})).unwrap(); assert_eq!(decoded.total_tracks,Some(101));
+        assert!(matches_request(&decoded,&json!({"action":"recommendations"})));
+        let oversized = ResultData{tracks:Some(vec![Track::default();101]),..Default::default()}; assert!(!matches_request(&oversized,&json!({"action":"recommendations"})));
     }
 }

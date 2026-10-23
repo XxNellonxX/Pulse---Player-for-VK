@@ -16,7 +16,7 @@ export type Playlist = {
   contentUnavailable?: boolean; remoteTrackCount?: number;
 };
 export type AppSettings = {
-  theme: 'dark' | 'light' | 'system' | 'high-contrast'; style: 'minimal' | 'compact' | 'album' | 'soft';
+  theme: 'dark' | 'light' | 'system' | 'high-contrast'; style: 'minimal' | 'compact' | 'soft';
   palette?: string;
   accent: string; density: 'comfortable' | 'compact'; textScale: number;
   reducedMotion: boolean; volume: number; repeat: 'off' | 'all' | 'one';
@@ -27,6 +27,7 @@ export type AppSettings = {
 export type PersistedState = {
   version: 1; tracks: Track[]; playlists: Playlist[]; history: string[];
   queue: string[]; currentTrackId: string | null; position: number; settings: AppSettings;
+  serviceImports?: import('./collectionImports').ImportedCollection[];
 };
 export type Capability = { id: string; label: string; status: 'unknown' | 'verified' | 'unsupported'; detail: string; checkedAt?: number };
 export type VkStatus = {
@@ -54,6 +55,12 @@ export type UploadBatchResult = { items: MusicImportItem[]; cancelled: boolean; 
 export type ImportProgress = { phase: string; message: string; current: number; total: number };
 export type AppRelease = { currentVersion: string; latestVersion: string | null; available: boolean; notes: string; releaseUrl: string | null; downloadUrl: string | null };
 export interface DesktopAPI {
+  readServicePlaylist?(url: string): Promise<import('./serviceImports').ServicePlaylistSource>;
+  serviceImportStatus?(): Promise<import('./serviceImports').ServiceImportStatus>;
+  connectServiceImport?(input: { service: import('./serviceImports').ImportService; clientId?: string }): Promise<import('./serviceImports').ServiceImportStatus>;
+  disconnectServiceImport?(service: import('./serviceImports').ImportService): Promise<import('./serviceImports').ServiceImportStatus>;
+  listServicePlaylists?(service: import('./serviceImports').ImportService): Promise<import('./serviceImports').ServicePlaylistDescriptor[]>;
+  cancelServiceImport?(): Promise<void>;
   catalogWatchStatus?(): Promise<import('./catalog').CatalogWatchState>;
   setCatalogFollowed?(id: string, followed: boolean): Promise<import('./catalog').CatalogWatchState>;
   refreshCatalog?(): Promise<import('./catalog').CatalogWatchState>;
