@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 // Independent UI probes: assert the sequence VK supplied, including deliberately
 // conflicting import timestamps. Uses an isolated bridge and browser profile.
-const browser = await chromium.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
+const browser = await chromium.launch({ channel: 'msedge', headless: true });
 const baseURL = process.env.QA_BASE_URL || 'http://127.0.0.1:5173';
 const settings = { theme: 'dark', style: 'minimal', accent: '#bdff62', density: 'comfortable', textScale: 1, reducedMotion: false, volume: .01, repeat: 'off', shuffle: false, closeToTray: false, autoplay: false, autoSkip: false };
 const remote = (id, addedAt, title = `Order ${id}`, inLibrary = true) => ({ id: `vk-101-${id}`, title, artist: `Artist ${20 - id}`, album: '', duration: 60, url: `vk-web://101/${id}`, source: 'vk', addedAt, available: true, remote: { ownerId: 101, audioId: id, inLibrary } });
@@ -80,9 +80,9 @@ await run('playlist-retains-its-own-vk-order-including-exclusive-tracks', async 
 });
 
 await run('explicit-title-sort-and-return-to-vk-default-both-work', async page => {
-  await page.locator('.select-wrap select').selectOption('title');
+  await page.getByRole('combobox',{name:/^Сортировка:/}).click();await page.getByRole('option',{name:'По названию',exact:true}).click();
   assert.deepEqual(await titles(page), ['Alpha', 'Local newer', 'Local older', 'Middle', 'Zulu']);
-  await page.locator('.select-wrap select').selectOption('recent');
+  await page.getByRole('combobox',{name:/^Сортировка:/}).click();await page.getByRole('option',{name:'Как в VK',exact:true}).click();
   assert.deepEqual(await titles(page), ['Zulu', 'Alpha', 'Middle', 'Local newer', 'Local older']);
 });
 

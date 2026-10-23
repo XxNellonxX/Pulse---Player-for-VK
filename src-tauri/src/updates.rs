@@ -19,18 +19,45 @@ pub struct UpdateInfo {
 }
 
 fn version(value: &str) -> Option<[u64; 3]> {
-    let parts: Vec<_> = value.trim_start_matches('v').split('.').collect();
+    let parts: Vec<_> = value.strip_prefix('v').unwrap_or(value).split('.').collect();
     if parts.len() != 3 {
         return None;
     }
     let mut numbers = [0; 3];
     for (index, part) in parts.iter().enumerate() {
-        if part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()) {
+        if part.is_empty() || (part.len() > 1 && part.starts_with('0')) || !part.bytes().all(|c| c.is_ascii_digit()) {
             return None;
         }
         numbers[index] = part.parse().ok()?;
     }
     Some(numbers)
+}
+
+/// A published stable tag stays strict. The installed binary may be a valid
+/// SemVer preview; the stable version of its own base is newer than that preview.
+fn installed_version(value: &str) -> Option<([u64; 3], bool)> {
+    fn identifiers(value: &str, prerelease: bool) -> bool {
+        !value.is_empty() && value.split('.').all(|part| {
+            !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !(prerelease && part.len() > 1 && part.bytes().all(|byte| byte.is_ascii_digit()) && part.starts_with('0'))
+        })
+    }
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let (release, build) = value.split_once('+').map_or((value, None), |(release, build)| (release, Some(build)));
+    if build.is_some_and(|value| !identifiers(value, false)) { return None; }
+    let (core, prerelease) = release.split_once('-').map_or((release, None), |(core, prerelease)| (core, Some(prerelease)));
+    if !core.as_bytes().first().is_some_and(u8::is_ascii_digit) { return None; }
+    if prerelease.is_some_and(|value| !identifiers(value, true)) { return None; }
+    Some((version(core)?, prerelease.is_some()))
+}
+
+fn asset_link(value: &str, tag: &str, name: &str) -> bool {
+    if !release_link(value, true) { return false; }
+    let Ok(mut expected) = Url::parse("https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/") else { return false; };
+    let Ok(mut segments) = expected.path_segments_mut() else { return false; };
+    segments.pop_if_empty().push(tag).push(name);
+    drop(segments);
+    Url::parse(value).is_ok_and(|url| url == expected)
 }
 
 pub(crate) fn release_link(value: &str, download: bool) -> bool {
@@ -74,7 +101,7 @@ fn info(value: &Value, current: &str, os: &str, arch: &str) -> UpdateInfo {
         return result;
     };
     result.latest_version = Some(tag.trim_start_matches('v').into());
-    result.available = version(current).is_some_and(|installed| latest > installed);
+    result.available = installed_version(current).is_some_and(|(installed, prerelease)| latest > installed || latest == installed && prerelease);
     result.notes = value
         .get("body")
         .and_then(Value::as_str)
@@ -88,7 +115,7 @@ fn info(value: &Value, current: &str, os: &str, arch: &str) -> UpdateInfo {
         .and_then(Value::as_str)
         .filter(|url| release_link(url, false))
         .map(str::to_owned);
-    let expected = if os == "windows" {
+    let expected = if os == "windows" && arch == "x86_64" {
         Some("_x64-setup.exe")
     } else if os == "macos" && arch == "aarch64" {
         Some("_aarch64.dmg")
@@ -102,7 +129,10 @@ fn info(value: &Value, current: &str, os: &str, arch: &str) -> UpdateInfo {
         result.download_url = assets.iter().find_map(|asset| {
             let name = asset.get("name")?.as_str()?;
             let url = asset.get("browser_download_url")?.as_str()?;
-            (name.ends_with(suffix) && release_link(url, true)).then(|| url.into())
+            let version = tag.strip_prefix('v').unwrap_or(tag);
+            let expected_name = format!("VK.Player_{version}{suffix}");
+            let native_name = format!("VK Player_{version}{suffix}");
+            ((name == expected_name || name == native_name) && asset_link(url, tag, name)).then(|| url.into())
         });
     }
     result
@@ -178,16 +208,16 @@ mod tests {
     fn only_exact_repository_assets_and_current_architecture_are_used() {
         let base = format!("{REPO}/releases/download/v0.5.0/");
         let value = json!({"tag_name":"v0.5.0", "html_url":format!("{REPO}/releases/tag/v0.5.0"), "assets":[
-            {"name":"Pulse_aarch64.dmg","browser_download_url":format!("{base}Pulse_aarch64.dmg")},
-            {"name":"Pulse_x64-setup.exe","browser_download_url":"https://github.com.evil.test/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.0/a.exe"},
-            {"name":"Pulse_x64-setup.exe","browser_download_url":format!("{base}Pulse_x64-setup.exe")}
+            {"name":"VK.Player_0.5.0_aarch64.dmg","browser_download_url":format!("{base}VK.Player_0.5.0_aarch64.dmg")},
+            {"name":"VK.Player_0.5.0_x64-setup.exe","browser_download_url":"https://github.com.evil.test/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.0/a.exe"},
+            {"name":"VK.Player_0.5.0_x64-setup.exe","browser_download_url":format!("{base}VK.Player_0.5.0_x64-setup.exe")}
         ]});
         let result = info(&value, "0.4.0", "windows", "x86_64");
         assert!(result.available);
         assert!(result
             .download_url
             .unwrap()
-            .ends_with("Pulse_x64-setup.exe"));
+            .ends_with("VK.Player_0.5.0_x64-setup.exe"));
         assert!(info(&value, "0.4.0", "macos", "aarch64")
             .download_url
             .unwrap()
@@ -199,5 +229,63 @@ mod tests {
             &format!("{base}installer.exe?redirect=evil"),
             true
         ));
+    }
+
+    fn release_051() -> Value {
+        let base = format!("{REPO}/releases/download/v0.5.1/");
+        json!({"tag_name":"v0.5.1","draft":false,"prerelease":false,"html_url":format!("{REPO}/releases/tag/v0.5.1"),"assets":[
+            {"name":"VK.Player_0.5.1_aarch64.dmg","browser_download_url":format!("{base}VK.Player_0.5.1_aarch64.dmg")},
+            {"name":"VK.Player_0.5.1_x64.dmg","browser_download_url":format!("{base}VK.Player_0.5.1_x64.dmg")},
+            {"name":"VK.Player_0.5.1_x64-setup.exe","browser_download_url":format!("{base}VK.Player_0.5.1_x64-setup.exe")},
+            {"name":"SHA256SUMS.txt","browser_download_url":format!("{base}SHA256SUMS.txt")}
+        ]})
+    }
+    #[test]
+    fn stable_051_updates_prior_stable_and_preview_builds() {
+        for current in ["0.4.1", "0.5.0-preview.6", "0.5.0-preview.7", "0.5.1-preview.1", "0.5.1-rc.1+build.42"] {
+            let result = info(&release_051(), current, "windows", "x86_64");
+            assert!(result.available, "{current}");
+            assert_eq!(result.latest_version.as_deref(), Some("0.5.1"));
+        }
+        for current in ["0.5.1", "0.5.1+build.42", "0.5.2-preview.1", "0.6.0", "1.0.0"] {
+            assert!(!info(&release_051(), current, "windows", "x86_64").available, "{current}");
+        }
+    }
+    #[test]
+    fn invalid_versions_and_remote_previews_never_offer_an_update() {
+        for current in ["", "0.5", "0.5.1-", "0.5.1-rc..1", "0.5.1-preview.01", "0.05.1", "0.5.1+", "0.5.1+a+b", "0.5.1-preview/1", "vv0.5.1", "999999999999999999999999.1.0"] {
+            assert!(!info(&release_051(), current, "windows", "x86_64").available, "{current}");
+        }
+        for tag in ["v0.5.2-preview.1", "v0.5.2+build.1", "v00.5.2", "vv0.5.2", "v0.5.2-", "v0.5.2.1"] {
+            let mut release = release_051(); release["tag_name"] = json!(tag);
+            assert!(!info(&release, "0.4.1", "windows", "x86_64").available, "{tag}");
+        }
+        for flag in ["prerelease", "draft"] {
+            let mut release = release_051(); release[flag] = json!(true);
+            assert!(!info(&release, "0.4.1", "windows", "x86_64").available);
+        }
+    }
+    #[test]
+    fn stable_051_selects_the_exact_windows_or_mac_architecture_asset() {
+        for (os, arch, suffix) in [("windows", "x86_64", "_x64-setup.exe"), ("macos", "aarch64", "_aarch64.dmg"), ("macos", "x86_64", "_x64.dmg")] {
+            let selected = info(&release_051(), "0.4.1", os, arch).download_url.unwrap();
+            assert_eq!(selected, format!("{REPO}/releases/download/v0.5.1/VK.Player_0.5.1{suffix}"));
+        }
+        for (os, arch) in [("linux", "x86_64"), ("windows", "aarch64"), ("macos", "arm"), ("android", "aarch64")] {
+            assert!(info(&release_051(), "0.4.1", os, arch).download_url.is_none());
+        }
+    }
+    #[test]
+    fn stale_or_mislabeled_assets_are_not_selected_for_a_new_release() {
+        let mut release = release_051();
+        release["assets"] = json!([
+            {"name":"VK.Player_0.4.1_x64-setup.exe","browser_download_url":format!("{REPO}/releases/download/v0.4.1/VK.Player_0.4.1_x64-setup.exe")},
+            {"name":"VK.Player_0.5.1_x64-setup.exe","browser_download_url":format!("{REPO}/releases/download/v0.5.0/VK.Player_0.5.1_x64-setup.exe")},
+            {"name":"VK.Player_0.5.1_x64-setup.exe","browser_download_url":format!("{REPO}/releases/download/v0.5.1/VK.Player_0.4.1_x64-setup.exe")},
+            {"name":"other_0.5.1_x64-setup.exe","browser_download_url":format!("{REPO}/releases/download/v0.5.1/other_0.5.1_x64-setup.exe")}
+        ]);
+        assert!(info(&release, "0.4.1", "windows", "x86_64").download_url.is_none());
+        release["assets"] = json!([{"name":"VK Player_0.5.1_x64-setup.exe","browser_download_url":format!("{REPO}/releases/download/v0.5.1/VK%20Player_0.5.1_x64-setup.exe")}]);
+        assert!(info(&release, "0.4.1", "windows", "x86_64").download_url.is_some());
     }
 }

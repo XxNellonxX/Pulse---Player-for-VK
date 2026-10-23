@@ -1,4 +1,4 @@
-name: Attach verified macOS preview
+name: Attach verified macOS packages
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       tag:
-        description: Existing draft prerelease tag
+        description: Existing draft release tag (stable or preview)
         default: v0.4.0-macos-preview
         required: true
         type: string
@@ -31,17 +31,19 @@ jobs:
       PULSE_PREVIEW_TAG: ${{ inputs.tag }}
       PULSE_PREVIEW_ID: ${{ inputs.release_id }}
     steps:
-      - name: Check completed build and draft preview
+      - name: Check completed build and matching draft release
         shell: bash
         run: |
           set -euo pipefail
           [[ "$PULSE_BUILD_RUN" =~ ^[0-9]+$ ]]
           [[ "$PULSE_PREVIEW_ID" =~ ^[0-9]+$ ]]
-          [[ "$PULSE_PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(macos-preview|preview\.[0-9]+)$ ]]
+          [[ "$PULSE_PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(macos-preview|preview\.[0-9]+))?$ ]]
+          PULSE_IS_PREVIEW=false
+          if [[ "$PULSE_PREVIEW_TAG" == *-* ]]; then PULSE_IS_PREVIEW=true; fi
           gh api "repos/$GH_REPO/actions/runs/$PULSE_BUILD_RUN" > build.json
           jq -e '.conclusion == "success" and .path == ".github/workflows/release-macos.yml"' build.json
           gh api "repos/$GH_REPO/releases/$PULSE_PREVIEW_ID" > preview.json
-          jq -e --arg tag "$PULSE_PREVIEW_TAG" '.draft == true and .prerelease == true and .tag_name == $tag' preview.json
+          jq -e --arg tag "$PULSE_PREVIEW_TAG" --argjson preview "$PULSE_IS_PREVIEW" '.draft == true and .prerelease == $preview and .tag_name == $tag' preview.json
           gh api "repos/$GH_REPO/commits/$PULSE_PREVIEW_TAG" > source.json
           test "$(jq -r '.head_sha' build.json)" = "$(jq -r '.sha' source.json)"
           gh api "repos/$GH_REPO/actions/runs/$PULSE_BUILD_RUN/artifacts" > artifacts.json
