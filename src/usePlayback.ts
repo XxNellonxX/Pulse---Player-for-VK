@@ -10,11 +10,15 @@ import { releaseSoundCloudSource, soundCloudSource } from './sourceResolution'
 
 // Native transport allows 20s resolve + 25s load + 25s play, plus IPC margin.
 const WEB_START_TIMEOUT = 80000
+const MANAGED_AUDIO_PROGRESS_TIMEOUT = 6000
 
 export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAction<PersistedState>>) {
   const audio = useRef<HTMLAudioElement | null>(null)
   const externalHls = useRef<Hls | null>(null)
   const externalUrl = useRef<string | null>(null)
+  const externalManaged = useRef(false)
+  const externalProgressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const managedFallback = useRef<() => boolean>(() => false)
   const forcedExternalId = useRef<string | null>(null)
   const externalAttempted = useRef(new Set<string>())
   const externalRecovery = useRef<{ id: string | null; renewals: number; bypass: boolean }>({ id: null, renewals: 0, bypass: false })
@@ -110,20 +114,37 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     webStallAd.current = false
     webStallRecovery.current = false
   }, [])
-  const recoverExternal = useCallback(() => {
+  const clearExternalProgress = useCallback(() => {
+    if (externalProgressTimer.current) clearTimeout(externalProgressTimer.current)
+    externalProgressTimer.current = null
+  }, [])
+  const watchExternalProgress = useCallback((id: string, version: number) => {
+    clearExternalProgress()
+    if (!externalManaged.current || !playIntent.current || stateRef.current.currentTrackId !== id || sourceVersion.current !== version) return
+    // A canplay/playing event is not evidence that audio is advancing. This
+    // single deadline is renewed only by smooth media-clock progress, or an
+    // explicit user seek/resume. It also bounds a pending gateway grant.
+    externalProgressTimer.current = setTimeout(() => {
+      externalProgressTimer.current = null
+      if (!externalManaged.current || !playIntent.current || stateRef.current.currentTrackId !== id || sourceVersion.current !== version || audio.current?.ended) return
+      managedFallback.current()
+    }, MANAGED_AUDIO_PROGRESS_TIMEOUT)
+  }, [clearExternalProgress])
+  const recoverExternal = useCallback((reason: 'failure' | 'expiry' = 'failure') => {
     const id = stateRef.current.currentTrackId
-    if (!id || !externalUrl.current || !playIntent.current || externalRecovery.current.id !== id || externalRecovery.current.bypass) return false
+    if (!id || (!externalUrl.current && !externalManaged.current) || !playIntent.current || externalRecovery.current.id !== id || externalRecovery.current.bypass) return false
     const element = audio.current
     const position = element && element.readyState >= HTMLMediaElement.HAVE_METADATA && Number.isFinite(element.currentTime) ? element.currentTime : stateRef.current.position
     // Allow one renewal per failure streak for this exact recording. Healthy
     // media-clock progress replenishes the budget for a later grant expiry.
-    if (externalRecovery.current.renewals === 0) externalRecovery.current.renewals = 1
+    if ((!externalManaged.current || reason === 'expiry') && externalRecovery.current.renewals === 0) externalRecovery.current.renewals = 1
     else {
       externalRecovery.current.bypass = true
       forcedExternalId.current = null
       externalAttempted.current.add(id)
     }
     sourceVersion.current++
+    clearExternalProgress()
     transport.current = { id, kind: 'pending' }
     sourceAbort.current?.abort(); externalHls.current?.stopLoad(); element?.pause()
     loadedId.current = null; pendingStart.current = true
@@ -133,7 +154,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     setPosition(position); setError(''); setPlaying(false); setBuffering(true); setNetwork('recovering')
     setReloadNonce(value => value + 1)
     return true
-  }, [setState])
+  }, [setState, clearExternalProgress])
+  managedFallback.current = () => recoverExternal()
   const watchWebStall = useCallback((id: string, advertisement = false, reset = false, recovery = false) => {
     if (reset && webStallTimer.current) { clearTimeout(webStallTimer.current); webStallTimer.current = null }
     if (webStallTimer.current) return
@@ -163,12 +185,12 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     const finished = snippetRef.current
     snippetRef.current = null; snippetReady.current = false; setSnippet(null)
     playIntent.current = false; pendingStart.current = false; webPlaying.current = false; webPaused.current = true
-    clearWebStall(); setPlaying(false); setBuffering(false); setPosition(finished.to)
+    clearWebStall(); clearExternalProgress(); setPlaying(false); setBuffering(false); setPosition(finished.to)
     webLatestPosition.current = finished.to; webPosition.current = finished.to
     if (isWebTrack()) void controlWeb({ operation: 'pause' }).catch(() => {})
     else audio.current?.pause()
     setState(previous => previous.currentTrackId === finished.id ? { ...previous, position: finished.to } : previous)
-  }, [clearWebStall, controlWeb, setState])
+  }, [clearWebStall, clearExternalProgress, controlWeb, setState])
   const restartWeb = useCallback((startPosition = 0) => {
     const id = stateRef.current.currentTrackId
     if (!id) return
@@ -313,10 +335,13 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       if (snippetReady.current && snippetRef.current?.id === stateRef.current.currentTrackId && element.currentTime >= snippetRef.current.to - .05) { finishSnippet(); return }
       const elapsed = Math.max(0, (performance.now() - lastClockAt) / 1000)
       const advanced = element.currentTime - lastProgress
-      if (externalUrl.current && playIntent.current && !element.paused && !element.seeking && advanced > .01 && advanced <= elapsed * 1.5 + .5) {
+      const actualExternalProgress = externalUrl.current && playIntent.current && !element.paused && !element.seeking && advanced > .01 && advanced <= elapsed * 1.5 + .5
+      if (actualExternalProgress) {
         // A seek or a long paused clock must not manufacture successful audio.
         healthyExternalSeconds += Math.min(advanced, elapsed)
         if (healthyExternalSeconds >= 30 && externalRecovery.current.id === stateRef.current.currentTrackId) externalRecovery.current.renewals = 0
+        const id = stateRef.current.currentTrackId
+        if (id) watchExternalProgress(id, sourceVersion.current)
       } else healthyExternalSeconds = 0
       lastClockAt = performance.now()
       if (!element.paused && !element.seeking && element.currentTime > lastProgress + .01) {
@@ -362,8 +387,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     on('timeupdate', update)
     on('progress', updateBuffer)
     on('durationchange', updateBuffer)
-    on('seeking', () => { resetExternalClock(); updateBuffer() })
-    on('seeked', () => { resetExternalClock(); updateBuffer() })
+    on('seeking', () => { clearExternalProgress(); resetExternalClock(); updateBuffer(); const id = stateRef.current.currentTrackId; if (id) watchExternalProgress(id, sourceVersion.current) })
+    on('seeked', () => { resetExternalClock(); updateBuffer(); const id = stateRef.current.currentTrackId; if (id) watchExternalProgress(id, sourceVersion.current) })
     on('loadedmetadata', () => {
       setDuration(Number.isFinite(element.duration) ? element.duration : 0)
       const savedPosition = stateRef.current.position
@@ -382,6 +407,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
     on('playing', () => { if (!playIntent.current) { element.pause(); return }; resetExternalClock(); recovered(); setPlaying(true); setError('') })
     on('pause', () => {
+      if (!playIntent.current) clearExternalProgress()
       resetExternalClock()
       setPlaying(false)
       if (loadedId.current === stateRef.current.currentTrackId && !isWebTrack() && Number.isFinite(element.currentTime)) {
@@ -399,18 +425,21 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
       active = false
       for (const [type, handler] of handlers) element.removeEventListener(type, handler)
       sourceAbort.current?.abort()
+      clearExternalProgress()
       if (stallTimer.current) clearTimeout(stallTimer.current)
       equalizerGraph.current?.destroy(); equalizerGraph.current = null
       externalHls.current?.destroy(); externalHls.current = null
       if (externalUrl.current) { releaseSoundCloudSource(externalUrl.current); externalUrl.current = null }
       element.pause(); element.removeAttribute('src'); element.load(); audio.current = null; loadedId.current = null
     }
-  }, [setState, next, state.currentTrackId, reloadNonce, finishSnippet, recoverExternal])
+  }, [setState, next, state.currentTrackId, reloadNonce, finishSnippet, recoverExternal, clearExternalProgress, watchExternalProgress])
 
   useEffect(() => {
     const element = audio.current
     if (!element) return
     const version = ++sourceVersion.current
+    externalManaged.current = false
+    clearExternalProgress()
     if (externalRecovery.current.id !== current?.id) externalRecovery.current = { id: current?.id || null, renewals: 0, bypass: false }
     if (forcedExternalId.current !== current?.id) forcedExternalId.current = null
     if (current?.id) externalAttempted.current = new Set([...externalAttempted.current].filter(id => id === current.id))
@@ -447,7 +476,11 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         if (resolved.source === 'vk' && playIntent.current && window.desktop?.resolveSoundCloud && !externalRecovery.current.bypass) {
           const forced = forcedExternalId.current === current.id
           try {
-            const source = await soundCloudSource(current, stateRef.current.settings, controller.signal, forced)
+            const source = await soundCloudSource(current, stateRef.current.settings, controller.signal, forced, managed => {
+              if (sourceVersion.current !== version || controller.signal.aborted) return
+              externalManaged.current = managed
+              if (managed) watchExternalProgress(current.id, version)
+            })
             if (sourceVersion.current !== version || controller.signal.aborted) { if (source) releaseSoundCloudSource(source.url); return }
             if (source) {
               externalUrl.current = source.url
@@ -464,6 +497,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           }
         }
         if (sourceVersion.current !== version || controller.signal.aborted) return
+        if (!externalUrl.current) { externalManaged.current = false; clearExternalProgress() }
         if (resolved.url.startsWith('vk-web://')) {
           setSourceLabel('VK')
           transport.current = { id: current.id, kind: 'web' }
@@ -512,7 +546,11 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
           engine.on(HlsEngine.Events.ERROR, (_, detail) => {
             // An expired service capability cannot succeed by retrying its old
             // URL. Obtain a fresh grant immediately and keep the saved offset.
-            if ((detail.fatal || detail.response?.code === 410) && externalHls.current === engine && audio.current === element && sourceVersion.current === version && playIntent.current) element.dispatchEvent(new Event('error'))
+            if (externalHls.current !== engine || audio.current !== element || sourceVersion.current !== version || !playIntent.current) return
+            if (detail.response?.code === 410) { recoverExternal('expiry'); return }
+            const hardGatewayFailure = externalManaged.current && [401, 403, 404, 500, 502, 503, 504].includes(detail.response?.code || 0)
+            if (hardGatewayFailure) { recoverExternal(); return }
+            if (detail.fatal) element.dispatchEvent(new Event('error'))
           })
           engine.attachMedia(element); engine.loadSource(resolved.url)
         } else { element.src = resolved.url; element.load() }
@@ -537,8 +575,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
     void load()
     if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title: current.title, artist: current.artist, album: current.album })
-    return () => { controller.abort(); clearWebStall(); if (current.url.startsWith('vk-web://') && (webLoaded.current === current.id || webPending.current === current.id)) { void controlWeb({ operation: 'stop' }).catch(() => {}); webLoaded.current = null; webPending.current = null; webPlaying.current = false } if (sourceVersion.current === version) sourceVersion.current++; if (stallTimer.current) clearTimeout(stallTimer.current) }
-  }, [current?.id, current?.url, reloadNonce, controlWeb, clearWebStall, watchWebStall, clearSnippet, acceptSnippetStart, playLocal, configureWebEqualizer, recoverExternal])
+    return () => { controller.abort(); clearWebStall(); clearExternalProgress(); if (current.url.startsWith('vk-web://') && (webLoaded.current === current.id || webPending.current === current.id)) { void controlWeb({ operation: 'stop' }).catch(() => {}); webLoaded.current = null; webPending.current = null; webPlaying.current = false } if (sourceVersion.current === version) sourceVersion.current++; if (stallTimer.current) clearTimeout(stallTimer.current) }
+  }, [current?.id, current?.url, reloadNonce, controlWeb, clearWebStall, watchWebStall, clearSnippet, acceptSnippetStart, playLocal, configureWebEqualizer, recoverExternal, clearExternalProgress, watchExternalProgress])
 
   externalFallback.current = id => {
     if (!playIntent.current || !stateRef.current.settings.preferSoundCloud || !window.desktop?.resolveSoundCloud || externalRecovery.current.bypass || externalAttempted.current.has(id)) return false
@@ -623,14 +661,15 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     }
     const element = audio.current
     if (!element) return
-    if (playIntent.current && pendingStart.current) { playIntent.current = false; pendingStart.current = false; sourceAbort.current?.abort(); externalHls.current?.stopLoad(); element.pause(); setPlaying(false); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null; return }
+    if (playIntent.current && pendingStart.current) { playIntent.current = false; pendingStart.current = false; clearExternalProgress(); sourceAbort.current?.abort(); externalHls.current?.stopLoad(); element.pause(); setPlaying(false); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null; return }
     if (element.paused) {
       if (!stateRef.current.currentTrackId) { const first = stateRef.current.queue[0] || stateRef.current.tracks[0]?.id; if (first) playTrack(first); return }
       playIntent.current = true
       if (element.error || !element.getAttribute('src')) { loadedId.current = null; setReloadNonce(value => value + 1); return }
+      watchExternalProgress(stateRef.current.currentTrackId!, sourceVersion.current)
       void playLocal(element).catch(() => { setPlaying(false); setError('Воспроизведение не началось. Проверьте доступность файла и повторите.') })
-    } else { playIntent.current = false; externalHls.current?.stopLoad(); element.pause(); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null }
-  }, [playTrack, controlWeb, clearWebStall, watchWebStall, acceptSnippetStart, playLocal, configureWebEqualizer])
+    } else { playIntent.current = false; clearExternalProgress(); externalHls.current?.stopLoad(); element.pause(); setBuffering(false); if (stallTimer.current) clearTimeout(stallTimer.current); stallTimer.current = null }
+  }, [playTrack, controlWeb, clearWebStall, watchWebStall, acceptSnippetStart, playLocal, configureWebEqualizer, clearExternalProgress, watchExternalProgress])
   const retry = useCallback(() => {
     if (!stateRef.current.currentTrackId) return
     if (isWebTrack()) {
@@ -662,8 +701,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
         setPosition(value); setState(previous => previous.currentTrackId === id ? { ...previous, position: value } : previous)
       }).catch(error => { if (sourceVersion.current === version) setError(error.message) }).finally(() => { if (sourceVersion.current === version) webSeeking.current = false }); return
     }
-    if (audio.current && Number.isFinite(value)) { audio.current.currentTime = value; setPosition(value); setState(prev => ({ ...prev, position: value })) }
-  }, [setState, controlWeb, clearSnippet])
+    if (audio.current && Number.isFinite(value)) { clearExternalProgress(); audio.current.currentTime = value; setPosition(value); setState(prev => ({ ...prev, position: value })); const id = stateRef.current.currentTrackId; if (id) watchExternalProgress(id, sourceVersion.current) }
+  }, [setState, controlWeb, clearSnippet, clearExternalProgress, watchExternalProgress])
   const previous = useCallback(() => { if ((isWebTrack() ? webPosition.current : audio.current?.currentTime || 0) > 3) seek(0); else next(-1) }, [seek, next])
   useEffect(() => {
     if (!('mediaSession' in navigator)) return

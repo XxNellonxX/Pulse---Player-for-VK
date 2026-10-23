@@ -27,3 +27,16 @@ test('service config is optional, strict and can be explicitly disabled by build
     await assert.rejects(loadGatewayOrigin(root, {}), error => !error.message.includes('fixture-should-never-be-embedded'));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test('shared public default is used by clean builds, while local and environment overrides remain explicit', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'pulse-default-service-'));
+  try {
+    await mkdir(path.join(root, 'config'));
+    await writeFile(path.join(root, 'config', 'pulse-service.default.json'), JSON.stringify({ gatewayUrl: 'https://pilot.example.org' }));
+    assert.equal(await loadGatewayOrigin(root, {}), 'https://pilot.example.org');
+    assert.equal(await loadGatewayOrigin(root, { PULSE_GATEWAY_URL: '' }), '');
+    await writeFile(path.join(root, 'config', 'pulse-service.json'), JSON.stringify({ gatewayUrl: 'https://local-override.example.org' }));
+    assert.equal(await loadGatewayOrigin(root, {}), 'https://local-override.example.org');
+    assert.equal(await loadGatewayOrigin(root, { PULSE_GATEWAY_URL: 'https://env-override.example.org' }), 'https://env-override.example.org');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

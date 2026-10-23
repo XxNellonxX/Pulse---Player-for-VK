@@ -21,7 +21,11 @@ export async function loadGatewayOrigin(root, env = process.env) {
   if (Object.hasOwn(env, 'PULSE_GATEWAY_URL')) return gatewayOrigin(env.PULSE_GATEWAY_URL);
   let raw;
   try { raw = await readFile(path.join(root, 'config', 'pulse-service.json')); }
-  catch (error) { if (error.code === 'ENOENT') return ''; throw new Error('Cannot read config/pulse-service.json.'); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw new Error('Cannot read config/pulse-service.json.');
+    try { raw = await readFile(path.join(root, 'config', 'pulse-service.default.json')); }
+    catch (error) { if (error.code === 'ENOENT') return ''; throw new Error('Cannot read the default Pulse service configuration.'); }
+  }
   if (raw.length > 4096) throw new Error('Pulse service config is too large.');
   let config;
   try { config = JSON.parse(raw.toString('utf8').replace(/^\uFEFF/, '')); }

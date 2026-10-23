@@ -10,10 +10,16 @@ import { assertIsolatedNativeBinary } from './assert-isolated-native.mjs';
 
 // Run alone: the QA app identifier owns one Windows WebView2 environment.
 // This never logs in, writes valid provider credentials or accesses a real library.
+// The shipping build now uses the shared service by default. A deliberately
+// direct build (PULSE_GATEWAY_URL empty at compile time) must be tested with
+// PULSE_QA_EXPECT_MANAGED=0; an unexpected route must fail, never auto-adapt.
 // Valid grants / upstream audio / expired allocated sessions need separate QA.
 // Optional PULSE_QA_CREDENTIALS=invalid|cancel exercises the debug-only file picker
 // using only a private temporary file. Invalid files must never write a keychain entry.
 const exe = process.env.TAURI_QA_EXE || path.join(process.env.LOCALAPPDATA, 'vk-player-build/target/debug/vk-player.exe');
+const expectedRoute = process.env.PULSE_QA_EXPECT_MANAGED ?? '1';
+assert.ok(['0', '1'].includes(expectedRoute), 'PULSE_QA_EXPECT_MANAGED must be 0 or 1');
+const expectManaged = expectedRoute === '1';
 await assertIsolatedNativeBinary(exe);
 const root = await mkdtemp(path.join(os.tmpdir(), 'pulse-sc-native-independent-'));
 const profile = path.join(root, 'profile');
@@ -25,6 +31,7 @@ const env = { ...process.env, VK_PLAYER_QA_PROFILE: profile, WEBVIEW2_ADDITIONAL
 for (const name of ['WEBVIEW2_USER_DATA_FOLDER', 'VK_PLAYER_QA_FILES', 'VK_PLAYER_QA_SOUNDCLOUD_FILE', 'PULSE_SOUNDCLOUD_CLIENT_ID', 'PULSE_SOUNDCLOUD_CLIENT_SECRET', 'PULSE_SOUNDCLOUD_PROXY']) delete env[name];
 const credentialMode = process.env.PULSE_QA_CREDENTIALS;
 if (credentialMode && !['invalid', 'cancel'].includes(credentialMode)) throw Error('Unknown credential QA mode');
+if (expectManaged && credentialMode) throw Error('Personal credential picker QA requires an explicitly direct native build and PULSE_QA_EXPECT_MANAGED=0');
 const credentialFixture = path.join(root, 'independent-credentials.json');
 if (credentialMode) {
   env.VK_PLAYER_QA_SOUNDCLOUD_FILE = credentialMode === 'cancel' ? '' : credentialFixture;
@@ -108,13 +115,14 @@ try {
   await dev.send('Network.enable');
   dev.on('Network.responseReceived', event => { if (event.response.url.startsWith('http://pulse-media.localhost/')) responses.push(event.response); });
 
-  await test('actual native bridge reports no provider keys and no signed-in user', async () => {
+  await test('actual native bridge reports the expected service route without keys or a signed-in user', async () => {
     const actual = await page.evaluate(async () => ({ provider: await window.desktop.soundCloudStatus(), vk: await window.desktop.getVkStatus(), library: await window.desktop.getState() }));
-    assert.equal(actual.provider.configured, false); assert.equal(actual.provider.proxy, false);
+    assert.equal(actual.provider.configured, expectManaged); assert.equal(actual.provider.proxy, false);
+    assert.equal(actual.provider.managed === true, expectManaged);
     assert.notEqual(actual.vk.state, 'connected'); assert.equal(actual.library.tracks.length, 0);
     assert.equal(/clientSecret|access_token|Bearer /i.test(JSON.stringify(actual)), false);
   });
-  await test('no keys reject search and URL resolution promptly with native actionable errors', async () => {
+  if (!expectManaged) await test('no keys reject search and URL resolution promptly with native actionable errors', async () => {
     const actual = await page.evaluate(async () => {
       const started = performance.now(), failures = [];
       for (const call of [() => window.desktop.searchSoundCloud('Fixture Artist Fixture Song'), () => window.desktop.resolveSoundCloudCandidate('https://soundcloud.com/qa-artist/qa-song')]) {
@@ -156,18 +164,34 @@ try {
   });
   await test('unknown-session cleanup keeps native bridge healthy', async () => {
     await page.evaluate(async () => { await window.desktop.releaseSoundCloud('http://pulse-media.localhost/' + 'a'.repeat(48) + '/0'); await window.desktop.releaseSoundCloud(); });
-    assert.equal((await page.evaluate(() => window.desktop.soundCloudStatus())).configured, false);
+    assert.equal((await page.evaluate(() => window.desktop.soundCloudStatus())).configured, expectManaged);
   });
-  await test('actual packaged UI explains API setup and has no renderer exception', async () => {
+  await test('actual packaged UI shows the expected connection controls and has no renderer exception', async () => {
     await page.getByRole('button', { name: 'Настройки', exact: true }).click();
     await page.getByRole('button', { name: 'Источники музыки', exact: true }).click();
-    await page.getByText('Если у вас обычный аккаунт SoundCloud', { exact: true }).waitFor();
-    await page.getByText(/платная подписка не гарантирует/).waitFor();
-    assert.equal(await page.getByLabel('Client Secret', { exact: true }).inputValue(), '');
-    assert.equal(await page.getByLabel('Client Secret', { exact: true }).getAttribute('type'), 'password');
+    if (expectManaged) {
+      await page.getByText('SoundCloud через Pulse', { exact: true }).waitFor();
+      assert.equal(await page.getByLabel('Client Secret', { exact: true }).count(), 0);
+      assert.equal(await page.getByLabel('Client ID', { exact: true }).count(), 0);
+      assert.equal(await page.getByLabel('Прокси для SoundCloud', { exact: true }).count(), 0);
+      assert.equal(await page.getByText('Если у вас обычный аккаунт SoundCloud', { exact: true }).count(), 0);
+      assert.equal(await page.getByRole('button', { name: 'Проверить доступ', exact: true }).count(), 1);
+    } else {
+      await page.getByText('Если у вас обычный аккаунт SoundCloud', { exact: true }).waitFor();
+      await page.getByText(/платная подписка не гарантирует/).waitFor();
+      assert.equal(await page.getByLabel('Client Secret', { exact: true }).inputValue(), '');
+      assert.equal(await page.getByLabel('Client Secret', { exact: true }).getAttribute('type'), 'password');
+    }
     assert.deepEqual(errors, []);
   });
-  if (process.env.PULSE_QA_CATALOG_ROUTE === '1') await test('native catalog route is independent, rejects invalid proxy credentials and never returns secrets', async () => {
+  if (expectManaged) await test('managed native catalog hides the personal network setup', async () => {
+    await page.getByRole('button', { name: 'Каталог артистов', exact: true }).click();
+    await page.getByRole('region', { name: 'Каталог артистов', exact: true }).waitFor();
+    assert.equal(await page.locator('.catalog-route-settings').count(), 0);
+    assert.equal(await page.getByLabel('Прокси для MusicBrainz', { exact: true }).count(), 0);
+    assert.deepEqual(errors, []);
+  });
+  if (!expectManaged && process.env.PULSE_QA_CATALOG_ROUTE === '1') await test('native catalog route is independent, rejects invalid proxy credentials and never returns secrets', async () => {
     const before = await page.evaluate(() => window.desktop.statusCatalogRoute());
     assert.equal(before.proxy, false); assert.deepEqual(Object.keys(before).sort(), ['available', 'message', 'proxy']);
     const failures = await page.evaluate(async () => {
@@ -248,7 +272,7 @@ try {
     assert.deepEqual(errors, []);
     console.log('INVALID_CREDENTIAL_FIXTURES ' + (rejected + 1));
   });
-  console.log(JSON.stringify({ results, limits: ['No real SoundCloud API keys or valid native media grant', 'No physical macOS test'], profile }));
+  console.log(JSON.stringify({ results, route: expectManaged ? 'managed' : 'direct', limits: ['No VK login, valid allocated native media session or live audio decode in this isolated fixture', 'No physical macOS test'], profile }));
   if (results.some(result => !result.ok)) process.exitCode = 1;
 } finally {
   if (child?.exitCode === null) { const exited = new Promise(resolve => child.once('exit', resolve)); child.kill(); await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 3000))]); }

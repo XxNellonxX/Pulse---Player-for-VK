@@ -1254,6 +1254,9 @@ async fn connect_vk(app: AppHandle, shared: State<'_, AppState>) -> Result<VkSta
 }
 #[tauri::command]
 async fn disconnect_vk(app: AppHandle) -> VkStatus {
+    // Revoke in-memory media before either logout path can return. An in-flight
+    // source resolution must not refill the previous account's playback cache.
+    soundcloud_player::release_soundcloud(app.state(), None);
     let shared = app.state::<AppState>();
     if vk_web::uses_web(&shared) {
         return vk_web::disconnect(app.clone())

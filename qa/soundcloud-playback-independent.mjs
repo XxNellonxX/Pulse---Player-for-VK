@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 // Actual production React hook; fake provider receipts, MSE and media only.
 // No credentials, VK account, user files, or external network are used.
 const base = process.env.PULSE_QA_URL || 'http://127.0.0.1:5191';
-const browser = await chromium.launch({ executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe', headless: true });
+const browser = await chromium.launch({ channel: 'msedge', headless: true });
 const results = [];
 const mockHls = `export default class Hls {
   static Events = {ERROR:'error'}; static isSupported(){return true;}
@@ -30,9 +30,18 @@ async function run(name, options, action) {
     await page.evaluate(async () => { const runtime = (await import('/@react-refresh')).default; runtime.injectIntoGlobalHook(window); window.$RefreshReg$ = () => {}; window.$RefreshSig$ = () => type => type; window.__vite_plugin_react_preamble_installed__ = true; });
     await page.evaluate(async options => {
       window.__audios=[];window.__engines=[];window.__controls=[];window.__releases=[];window.__resolveCalls=[];window.__listeners=new Set();window.__gates=[];window.__holdMedia=options.holdMedia===true;window.__actions={};
+      // Only long playback deadlines are virtualized. React and short UI tasks
+      // keep their normal timers, so tests exercise the real production hook.
+      if(options.fastTimers){
+        const timers=new Map();let now=0,nextId=100000;
+        const schedule=window.setTimeout.bind(window),cancel=window.clearTimeout.bind(window);
+        window.setTimeout=(callback,delay=0,...args)=>{if(Number(delay)>=1000){const id=nextId++;timers.set(id,{at:now+Number(delay),callback:()=>callback(...args)});return id;}return schedule(callback,delay,...args);};
+        window.clearTimeout=id=>{if(timers.has(id))timers.delete(id);else cancel(id);};
+        window.__advanceTimers=async milliseconds=>{const end=now+milliseconds;for(let count=0;count<64;count++){const due=[...timers].filter(([,timer])=>timer.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!due)break;timers.delete(due[0]);window.__clock+=due[1].at-now;now=due[1].at;due[1].callback();await Promise.resolve();}window.__clock+=end-now;now=end;};
+      }
       // Virtual monotonic time is used only for actual-hook TTL budget tests.
       // Media decode/network/MSE are synthetic, so these do not prove live HLS.
-      if(options.virtualClock){window.__clock=performance.now();Object.defineProperty(performance,'now',{configurable:true,value:()=>window.__clock});}
+      if(options.virtualClock||options.fastTimers){window.__clock=performance.now();Object.defineProperty(performance,'now',{configurable:true,value:()=>window.__clock});}
       Object.defineProperty(navigator,'mediaSession',{configurable:true,value:{metadata:null,setActionHandler:(name,fn)=>window.__actions[name]=fn}});
       window.Audio=class extends EventTarget {
         constructor(){super();Object.assign(this,{paused:true,error:null,currentTime:0,duration:180,readyState:0,networkState:2,src:'',volume:0,plays:0,buffered:{length:1,start:()=>0,end:()=>180}});window.__audios.push(this);}
@@ -42,7 +51,7 @@ async function run(name, options, action) {
       const track=id=>({id,title:'Song '+id,artist:'Artist',album:'',duration:180,source:'vk',url:'vk-web://42/'+id,addedAt:1,available:true,artistCard:'absent',remote:{ownerId:42,audioId:id==='a'?7:8,inLibrary:true}});
       let resolveSequence=0;
       window.desktop={
-        resolveVkTrack:async id=>track(id),soundCloudBinding:async id=>({id:'sc-'+id,title:'Song '+id,artist:'Artist',duration:180,streamable:true}),soundCloudStatus:async()=>({configured:options.configured!==false,proxy:false,message:''}),
+        resolveVkTrack:async id=>track(id),soundCloudBinding:async id=>({id:'sc-'+id,title:'Song '+id,artist:'Artist',duration:180,streamable:true}),soundCloudStatus:async()=>({configured:options.configured!==false,managed:options.managed===true,proxy:false,message:''}),
         resolveSoundCloud(id){const number=++resolveSequence;window.__resolveCalls.push({id,number});if(options.failFirstResolve&&number===1)return Promise.reject(Error('synthetic-provider-unavailable'));const result={url:location.origin+'/__relay/session-'+number+'/0',title:'Song '+id,sourceId:'sc-'+id};return options.holdFirstResolve&&number===1||options.holdSecondResolve&&number===2?new Promise(resolve=>window.__gates.push(()=>resolve(result))):Promise.resolve(result);},
         releaseSoundCloud:async url=>{window.__releases.push(url);if(options.releaseFails)throw Error('synthetic-release-failure');},vkWebControl:async command=>{window.__controls.push(command);return{accepted:true};},onVkPlayback:fn=>{window.__listeners.add(fn);return()=>window.__listeners.delete(fn);},
       };
@@ -64,6 +73,7 @@ const start=async page=>{await page.evaluate(()=>window.__playback.playTrack('a'
 const expire=async page=>page.evaluate(()=>window.__engines.at(-1).expired());
 const renewed=async(page,count=2)=>page.waitForFunction(count=>window.__resolveCalls.length===count&&window.__engines.length===count&&window.__playback.playing,count);
 const healthy=async(page,seconds)=>page.evaluate(seconds=>{for(let n=0;n<seconds;n++){window.__clock+=1000;const audio=window.__audios.at(-1);audio.currentTime+=1;audio.dispatchEvent(new Event('timeupdate'));}},seconds);
+const advance=async(page,milliseconds)=>{await page.evaluate(milliseconds=>window.__advanceTimers(milliseconds),milliseconds);await page.waitForTimeout(40);};
 try {
   await run('saved source plays with original VK library identity and visible source label',{},async page=>{
     await start(page);await page.waitForFunction(()=>window.__playback.playing);
@@ -258,6 +268,80 @@ try {
     await page.evaluate(()=>window.__gates.shift()());await page.waitForTimeout(30);
     assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'b');assert.equal(await page.evaluate(()=>window.__audios.filter(item=>!item.paused).length),1);
     assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-2/0'))),true);assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-3/0'))),false);
+  });
+  await run('managed VPS startup that never receives media switches the exact track to VK within six seconds',{managed:true,holdMedia:true,fastTimers:true},async page=>{
+    await start(page);await advance(page,5900);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false,'The route changed before the allowed startup budget');
+    await advance(page,250);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:0}]);
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1,'Slow startup must not spend another VPS grant before trying the same VK track');
+    assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'VK');
+    await page.evaluate(()=>window.__engines[0].ready());await advance(page,30000);
+    assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false,'Late VPS media started over the direct VK route');
+    assert.equal(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').length),1,'Fallback started repeated VK commands');
+    assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'a');
+  });
+  await run('a managed VPS audio stall switches once to the same VK item at its real media position',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);
+    await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=37;audio.dispatchEvent(new Event('timeupdate'));audio.dispatchEvent(new Event('waiting'));});
+    await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:37}]);
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1);assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);
+    await page.evaluate(()=>window.__emit({network:'error',error:'synthetic VK also failed'}));await advance(page,30000);
+    assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1,'Failed VK fallback looped back into the exhausted VPS source');
+  });
+  await run('a managed route recovered by genuine media-clock progress stays on VPS',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);
+    await page.evaluate(()=>window.__audios.at(-1).dispatchEvent(new Event('waiting')));await advance(page,4000);
+    await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=2;audio.dispatchEvent(new Event('timeupdate'));});await advance(page,3000);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'SoundCloud');
+  });
+  await run('pausing during the managed stall budget cancels late direct playback',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>window.__audios.at(-1).dispatchEvent(new Event('waiting')));await advance(page,4000);
+    await page.evaluate(()=>window.__playback.toggle());await advance(page,30000);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);assert.equal(await page.evaluate(()=>window.__audios.some(item=>!item.paused)),false);assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'a');
+  });
+  await run('late slow VPS resolution cannot replace its VK fallback or start a second sound',{managed:true,fastTimers:true,holdFirstResolve:true},async page=>{
+    await page.evaluate(()=>window.__playback.playTrack('a'));await page.waitForFunction(()=>window.__gates.length===1);await advance(page,6200);
+    await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));await page.evaluate(()=>window.__gates.shift()());await page.waitForTimeout(40);
+    assert.equal(await page.evaluate(()=>window.__engines.length),0);assert.equal(await page.evaluate(()=>window.__releases.some(url=>url.endsWith('/session-1/0'))),true);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'VK');
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>item.id)),['a']);
+  });
+  await run('the next selection retries VPS after a track-specific direct fallback',{managed:true,holdMedia:true,fastTimers:true},async page=>{
+    await start(page);await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    await page.evaluate(()=>{window.__holdMedia=false;window.__playback.playTrack('b');});await page.waitForFunction(()=>window.__state.currentTrackId==='b'&&window.__playback.playing);
+    assert.deepEqual(await page.evaluate(()=>window.__resolveCalls.map(item=>item.id)),['a','b']);assert.equal(await page.evaluate(()=>window.__playback.sourceLabel),'SoundCloud');
+    assert.equal(await page.evaluate(()=>window.__audios.filter(item=>!item.paused).length),1);
+  });
+  await run('switching tracks cancels the old VPS fallback timer without sending a play command for the old item',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>window.__audios.at(-1).dispatchEvent(new Event('waiting')));await advance(page,4000);
+    await page.evaluate(()=>window.__playback.playTrack('b'));await page.waitForFunction(()=>window.__state.currentTrackId==='b'&&window.__playback.playing);await advance(page,3000);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);assert.equal(await page.evaluate(()=>window.__state.currentTrackId),'b');assert.deepEqual(await page.evaluate(()=>window.__resolveCalls.map(item=>item.id)),['a','b']);
+  });
+  await run('a user seek during managed buffering is preserved when direct fallback becomes necessary',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>window.__audios.at(-1).dispatchEvent(new Event('waiting')));await advance(page,3000);
+    await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.seeking=true;audio.dispatchEvent(new Event('seeking'));window.__playback.seek(61);audio.seeking=false;audio.dispatchEvent(new Event('seeked'));audio.dispatchEvent(new Event('waiting'));});
+    await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:61}]);
+  });
+  await run('playing and canplay events cannot hide a frozen managed audio clock',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);
+    for(let index=0;index<6;index++){await advance(page,1000);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.dispatchEvent(new Event('canplay'));audio.dispatchEvent(new Event('playing'));});}
+    await advance(page,250);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:0}]);
+  });
+  await run('a fatal managed source error tries direct VK immediately without another slow VPS grant',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=17;audio.dispatchEvent(new Event('timeupdate'));window.__engines.at(-1).fatal();});
+    await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:17}]);assert.equal(await page.evaluate(()=>window.__resolveCalls.length),1);
+  });
+  await run('managed capability expiry keeps one exact-recording renewal before the bounded no-progress fallback',{managed:true,fastTimers:true},async page=>{
+    await start(page);await page.waitForFunction(()=>window.__playback.playing);await page.evaluate(()=>{const audio=window.__audios.at(-1);audio.currentTime=25;audio.dispatchEvent(new Event('timeupdate'));});await expire(page);await renewed(page);
+    assert.deepEqual(await page.evaluate(()=>window.__resolveCalls.map(item=>item.id)),['a','a']);assert.equal(await page.evaluate(()=>window.__audios.at(-1).currentTime),25);
+    assert.equal(await page.evaluate(()=>window.__controls.some(item=>item.operation==='play')),false);
+    await advance(page,6200);await page.waitForFunction(()=>window.__controls.some(item=>item.operation==='play'));
+    assert.deepEqual(await page.evaluate(()=>window.__controls.filter(item=>item.operation==='play').map(item=>({id:item.id,position:item.position}))),[{id:'a',position:25}]);assert.equal(await page.evaluate(()=>window.__resolveCalls.length),2);
+    assert.equal(await page.evaluate(()=>window.__state.settings.preferSoundCloud),true,'One bad track changed the application-wide source preference');
   });
   console.log(JSON.stringify({summary:results}));if(results.some(r=>!r.ok))process.exitCode=1;
 } finally {await browser.close();}

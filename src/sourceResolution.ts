@@ -13,7 +13,7 @@ export function shouldSearchSoundCloud(track: Track, settings: Pick<AppSettings,
   )
 }
 /** Returns only a saved source or one unique strict metadata match. */
-export async function soundCloudSource(track: Track, settings: AppSettings, signal: AbortSignal, failed = false) {
+export async function soundCloudSource(track: Track, settings: AppSettings, signal: AbortSignal, failed = false, onManaged?: (managed: boolean) => void) {
   const controller = new AbortController()
   const cancel = () => controller.abort()
   signal.addEventListener('abort', cancel, { once: true })
@@ -25,7 +25,7 @@ export async function soundCloudSource(track: Track, settings: AppSettings, sign
     controller.signal.addEventListener('abort', aborted, { once: true })
     timer = setTimeout(() => controller.abort(), failed ? 15000 : 6000)
   })
-  try { return await Promise.race([resolveSource(track, settings, controller.signal, failed), budget]) }
+  try { return await Promise.race([resolveSource(track, settings, controller.signal, failed, onManaged), budget]) }
   catch (cause) {
     if (!signal.aborted && controller.signal.aborted) {
       if (!failed) return null
@@ -38,7 +38,7 @@ export async function soundCloudSource(track: Track, settings: AppSettings, sign
     signal.removeEventListener('abort', cancel)
   }
 }
-async function resolveSource(track: Track, settings: AppSettings, signal: AbortSignal, failed = false) {
+async function resolveSource(track: Track, settings: AppSettings, signal: AbortSignal, failed = false, onManaged?: (managed: boolean) => void) {
   const api = window.desktop
   if (!settings.preferSoundCloud || !api?.soundCloudBinding || !api.resolveSoundCloud) return null
   check(signal)
@@ -51,6 +51,7 @@ async function resolveSource(track: Track, settings: AppSettings, signal: AbortS
   const status = await api.soundCloudStatus?.()
   check(signal)
   if (!status?.configured) return null
+  onManaged?.(status.managed === true)
   if (!binding && api.searchSoundCloud && api.bindSoundCloud) {
     const query = `${track.artist} ${track.title} ${track.version || ''}`.trim().slice(0, 300)
     const page = await api.searchSoundCloud(query)

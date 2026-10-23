@@ -37,7 +37,9 @@ jobs:
       - run: npm run test:gateway
       - run: node --test qa/*.node.mjs
       - run: npm run prepare:imports
-      - run: npm run tauri -- build --target ${{ matrix.target }} --bundles app,dmg --config src-tauri/tauri.macos.conf.json
+      - run: |
+          if [ -z "$PULSE_GATEWAY_URL" ]; then unset PULSE_GATEWAY_URL; fi
+          npm run tauri -- build --target ${{ matrix.target }} --bundles app,dmg --config src-tauri/tauri.macos.conf.json
       - uses: actions/upload-artifact@v4
         with:
           name: pulse-macos-${{ matrix.arch }}

@@ -13,10 +13,12 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::hash_map::DefaultHasher,
     env, fmt,
+    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{sync::Mutex, time::timeout};
 use url::Url;
@@ -31,6 +33,15 @@ const MAX_LIMIT: u32 = 50;
 const MAX_RESPONSE: usize = 2 * 1024 * 1024;
 const MAX_MEDIA_RESPONSE: usize = 8 * 1024 * 1024;
 const MAX_DURATION: f64 = 24. * 60. * 60.;
+// A private playback-session cache, never an offline library. The byte budget
+// includes cached response bodies; at most four active relay responses can add
+// their existing 8 MiB request limit outside this budget.
+const MEDIA_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const MEDIA_CACHE_ENTRIES: usize = 1024;
+const GRANT_CACHE_ENTRIES: usize = 64;
+const DIRECT_GRANT_TTL: Duration = Duration::from_secs(5 * 60);
+// Gateway capabilities expire after 15 minutes. Leave a three-minute margin.
+const MANAGED_GRANT_TTL: Duration = Duration::from_secs(12 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogError {
@@ -124,6 +135,8 @@ pub struct StreamSource {
 pub struct StreamGrant {
     pub track: Candidate,
     pub sources: Vec<StreamSource>,
+    #[serde(skip)]
+    pub(crate) cache_scope: PlaybackCacheScope,
 }
 
 #[derive(Clone, Serialize)]
@@ -144,6 +157,165 @@ pub struct SoundCloudCatalog {
     proxy: Option<String>,
     token: Arc<Mutex<Option<AccessToken>>>,
     clients: Arc<Mutex<Vec<CachedClient>>>,
+    playback: Arc<StdMutex<PlaybackCache>>,
+    stream_locks: Arc<[Mutex<()>; 4]>,
+    media_locks: Arc<[Mutex<()>; 4]>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PlaybackCacheScope {
+    generation: u64,
+    expires_at: Instant,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MediaCacheKey {
+    url: String,
+    range: Option<String>,
+}
+
+struct CacheEntry<K, V> {
+    key: K,
+    value: V,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct PlaybackCache {
+    context: Option<(i64, u64)>,
+    context_revision: u64,
+    generation: u64,
+    grants: Vec<CacheEntry<String, StreamGrant>>,
+    media: Vec<CacheEntry<MediaCacheKey, MediaResource>>,
+    media_bytes: usize,
+}
+
+impl PlaybackCache {
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.grants.clear();
+        self.media.clear();
+        self.media_bytes = 0;
+    }
+
+    fn activate(&mut self, account_id: i64, window_epoch: u64, revision: u64) -> Result<u64, CatalogError> {
+        if revision < self.context_revision || (revision == self.context_revision
+            && self.context.is_some_and(|(_, active_epoch)| active_epoch > window_epoch)) {
+            return Err(CatalogError::Expired);
+        }
+        let context = (account_id, window_epoch);
+        if self.context != Some(context) || revision != self.context_revision {
+            self.clear();
+            self.context = Some(context);
+            self.context_revision = revision;
+        }
+        Ok(self.generation)
+    }
+
+    fn current(&self, generation: u64) -> Result<(), CatalogError> {
+        if self.context.is_some() && self.generation == generation {
+            Ok(())
+        } else {
+            Err(CatalogError::Expired)
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.grants.retain(|entry| entry.expires_at > now);
+        self.media.retain(|entry| entry.expires_at > now);
+        self.media_bytes = self.media.iter().map(|entry| entry.value.bytes.len()).sum();
+    }
+
+    fn grant(&mut self, key: &str, now: Instant) -> Option<StreamGrant> {
+        self.prune(now);
+        let index = self.grants.iter().position(|entry| entry.key == key)?;
+        // Insertion order is LRU order. Hits never extend a grant's validity.
+        let entry = self.grants.remove(index);
+        let value = entry.value.clone();
+        self.grants.push(entry);
+        Some(value)
+    }
+
+    fn insert_grant(&mut self, key: String, value: StreamGrant, now: Instant) {
+        self.prune(now);
+        self.grants.retain(|entry| entry.key != key);
+        if value.cache_scope.expires_at <= now {
+            return;
+        }
+        if self.grants.len() >= GRANT_CACHE_ENTRIES {
+            self.grants.remove(0);
+        }
+        self.grants.push(CacheEntry { key, expires_at: value.cache_scope.expires_at, value });
+    }
+
+    fn media(&mut self, key: &MediaCacheKey, now: Instant) -> Option<MediaResource> {
+        self.prune(now);
+        let index = self.media.iter().position(|entry| &entry.key == key)?;
+        let entry = self.media.remove(index);
+        let value = entry.value.clone();
+        self.media.push(entry);
+        Some(value)
+    }
+
+    fn insert_media(&mut self, key: MediaCacheKey, value: MediaResource, expires_at: Instant, now: Instant) {
+        self.insert_media_with_limits(key, value, expires_at, now, MEDIA_CACHE_BYTES, MEDIA_CACHE_ENTRIES);
+    }
+
+    fn insert_media_with_limits(&mut self, key: MediaCacheKey, value: MediaResource, expires_at: Instant, now: Instant, max_bytes: usize, max_entries: usize) {
+        self.prune(now);
+        if expires_at <= now || !cacheable_audio(&value) || value.bytes.len() > max_bytes || max_entries == 0 {
+            return;
+        }
+        if let Some(index) = self.media.iter().position(|entry| entry.key == key) {
+            self.media_bytes -= self.media.remove(index).value.bytes.len();
+        }
+        while self.media.len() >= max_entries || self.media_bytes + value.bytes.len() > max_bytes {
+            self.media_bytes -= self.media.remove(0).value.bytes.len();
+        }
+        self.media_bytes += value.bytes.len();
+        self.media.push(CacheEntry { key, value, expires_at });
+    }
+}
+
+fn cacheable_audio(resource: &MediaResource) -> bool {
+    if !matches!(resource.status, 200 | 206) || resource.bytes.len() <= 128 {
+        // HLS AES keys are small; unknown binary resources are excluded below.
+        return false;
+    }
+    let mime = resource.content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let first = resource.bytes.iter().position(|byte| !byte.is_ascii_whitespace()).unwrap_or(0);
+    if resource.bytes[first..].starts_with(b"#EXTM3U") {
+        return false;
+    }
+    mime.starts_with("audio/") || matches!(mime.as_str(), "video/mp2t" | "video/mp4")
+}
+
+fn cache_stripe(value: &impl Hash) -> usize {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish() as usize % 4
+}
+
+fn invalidates_playback(error: &CatalogError) -> bool {
+    matches!(error, CatalogError::Unauthorized | CatalogError::Forbidden | CatalogError::NotFound | CatalogError::Expired)
+}
+
+fn grant_cache_deadline(managed: bool, started: Instant, server_expiry_ms: Option<u64>, server_remaining_ms: Option<u64>, now_ms: u64, now: Instant) -> Instant {
+    if !managed { return started + DIRECT_GRANT_TTL; }
+    // A gateway can reuse an existing capability. Its original absolute expiry
+    // must win over the local TTL; a new /streams response never renews it.
+    // A missing/invalid expiry keeps playback online but disables grant/media
+    // caching rather than guessing that another 12 minutes remain.
+    let absolute_ms = server_expiry_ms.and_then(|expiry| expiry.checked_sub(now_ms))
+        .and_then(|remaining| remaining.checked_sub(60_000)).unwrap_or(0)
+        .min(MANAGED_GRANT_TTL.as_millis() as u64);
+    // Relative expiry protects against an incorrect desktop clock. Measuring it
+    // from request start also subtracts response latency conservatively.
+    let relative_ms = server_remaining_ms.and_then(|remaining| remaining.checked_sub(60_000))
+        .unwrap_or(0).min(MANAGED_GRANT_TTL.as_millis() as u64);
+    (now + Duration::from_millis(absolute_ms))
+        .min(started + Duration::from_millis(relative_ms))
+        .min(started + MANAGED_GRANT_TTL)
 }
 
 struct CachedClient {
@@ -163,7 +335,19 @@ impl SoundCloudCatalog {
     pub fn is_managed(&self) -> bool { self.gateway.is_some() }
     pub fn from_gateway(gateway: crate::gateway_client::Gateway) -> Self {
         Self { gateway: Some(gateway), client_id: String::new(), client_secret: String::new(), proxy: None,
-            token: Arc::new(Mutex::new(None)), clients: Arc::new(Mutex::new(Vec::new())) }
+            token: Arc::new(Mutex::new(None)), clients: Arc::new(Mutex::new(Vec::new())),
+            playback: Arc::new(StdMutex::new(PlaybackCache::default())),
+            stream_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+            media_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))) }
+    }
+    pub(crate) fn playback_context(&self, account_id: i64, window_epoch: u64, revision: u64) -> Result<u64, CatalogError> {
+        self.playback.lock().unwrap().activate(account_id, window_epoch, revision)
+    }
+    pub(crate) fn clear_playback_cache(&self, revision: u64) {
+        let mut cache = self.playback.lock().unwrap();
+        cache.clear();
+        cache.context = None;
+        cache.context_revision = cache.context_revision.max(revision);
     }
     pub fn validate_source(&self, value: &str) -> Result<String, CatalogError> {
         match &self.gateway { Some(gateway) => gateway.media_url(value).map_err(|_| CatalogError::InvalidRequest), None => validate_media_url(value) }
@@ -215,6 +399,9 @@ impl SoundCloudCatalog {
             proxy,
             token: Arc::new(Mutex::new(None)),
             clients: Arc::new(Mutex::new(Vec::new())),
+            playback: Arc::new(StdMutex::new(PlaybackCache::default())),
+            stream_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+            media_locks: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
         })
     }
 
@@ -256,8 +443,42 @@ impl SoundCloudCatalog {
         parse_candidate(&value)
     }
 
-    pub async fn streams(&self, track_urn: &str) -> Result<StreamGrant, CatalogError> {
+    pub async fn streams(&self, track_urn: &str, generation: u64) -> Result<StreamGrant, CatalogError> {
         let urn = normalize_track_id(track_urn)?;
+        self.cached_streams(urn.clone(), generation, || self.streams_uncached(&urn, generation)).await
+    }
+
+    async fn cached_streams<F, Fut>(&self, urn: String, generation: u64, fetch: F) -> Result<StreamGrant, CatalogError>
+    where F: FnOnce() -> Fut, Fut: std::future::Future<Output = Result<StreamGrant, CatalogError>> {
+        // Four fixed stripes coalesce identical requests without an unbounded
+        // in-flight-key table. Media downloads have a separate four-stripe pool.
+        let _request = self.stream_locks[cache_stripe(&urn)].lock().await;
+        {
+            let mut cache = self.playback.lock().unwrap();
+            cache.current(generation)?;
+            if let Some(grant) = cache.grant(&urn, Instant::now()) {
+                return Ok(grant);
+            }
+        }
+        let result = fetch().await;
+        let mut cache = self.playback.lock().unwrap();
+        cache.current(generation)?;
+        match result {
+            Ok(grant) => {
+                cache.insert_grant(urn, grant.clone(), Instant::now());
+                Ok(grant)
+            }
+            Err(error) => {
+                if invalidates_playback(&error) { cache.clear(); }
+                Err(error)
+            }
+        }
+    }
+
+    async fn streams_uncached(&self, urn: &str, generation: u64) -> Result<StreamGrant, CatalogError> {
+        // Start the deadline before the network request, never after a slow
+        // response, so cached grants cannot outlive their upstream capability.
+        let started = Instant::now();
         let track = self.track(&urn).await?;
         if !track.streamable {
             return Err(CatalogError::Unavailable);
@@ -265,7 +486,12 @@ impl SoundCloudCatalog {
         let url = api_url_segments(&["tracks", &urn, "streams"])?;
         let value = self.api_json(url).await?;
         let sources = parse_streams_with(&value, |url| self.validate_source(url))?;
-        Ok(StreamGrant { track, sources })
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok()).unwrap_or(u64::MAX);
+        let expires_at = grant_cache_deadline(self.is_managed(), started,
+            value.get("expires_at").and_then(Value::as_u64),
+            value.get("expires_in_ms").and_then(Value::as_u64), now_ms, Instant::now());
+        Ok(StreamGrant { track, sources, cache_scope: PlaybackCacheScope { generation, expires_at } })
     }
 
     /// Fetches one manifest/segment through this provider's optional proxy.
@@ -275,18 +501,57 @@ impl SoundCloudCatalog {
         &self,
         media_url: &str,
         range: Option<&str>,
+        scope: PlaybackCacheScope,
     ) -> Result<MediaResource, CatalogError> {
-        if let Some(gateway) = &self.gateway {
+        let key = MediaCacheKey { url: self.validate_source(media_url)?, range: range.map(str::to_owned) };
+        if let Some(range) = range { validate_range(range)?; }
+        self.cached_media(key, scope, || async {
+            if let Some(gateway) = &self.gateway {
             let resource = gateway.media(media_url, range).await.map_err(gateway_error)?;
             return Ok(MediaResource { status: resource.status, bytes: resource.bytes, content_type: resource.content_type,
                 content_range: resource.content_range, final_url: resource.final_url });
-        }
-        timeout(
+            }
+            timeout(
             Duration::from_secs(45),
             self.fetch_media_inner(media_url, range),
-        )
-        .await
-        .map_err(|_| CatalogError::Network)?
+            ).await.map_err(|_| CatalogError::Network)?
+        }).await
+    }
+
+    async fn cached_media<F, Fut>(&self, key: MediaCacheKey, scope: PlaybackCacheScope, fetch: F) -> Result<MediaResource, CatalogError>
+    where F: FnOnce() -> Fut, Fut: std::future::Future<Output = Result<MediaResource, CatalogError>> {
+        let _request = self.media_locks[cache_stripe(&key)].lock().await;
+        {
+            let mut cache = self.playback.lock().unwrap();
+            cache.current(scope.generation)?;
+            if scope.expires_at > Instant::now() {
+                if let Some(resource) = cache.media(&key, Instant::now()) {
+                    return Ok(resource);
+                }
+            }
+        }
+        let result = fetch().await;
+        let mut cache = self.playback.lock().unwrap();
+        cache.current(scope.generation)?;
+        match result {
+            Ok(resource) => {
+                if cacheable_audio(&resource) {
+                    cache.insert_media(key, resource.clone(), scope.expires_at, Instant::now());
+                }
+                Ok(resource)
+            }
+            Err(error) => {
+                if invalidates_playback(&error) {
+                    cache.clear();
+                } else {
+                    // A player's explicit recovery must ask /streams again,
+                    // rather than repeatedly receiving the same failed grant.
+                    // Healthy, unexpired segment bytes can still be reused.
+                    cache.grants.clear();
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn fetch_media_inner(
@@ -1103,6 +1368,7 @@ fn status_error(response: &Response) -> CatalogError {
     match response.status() {
         StatusCode::UNAUTHORIZED => CatalogError::Unauthorized,
         StatusCode::FORBIDDEN => CatalogError::Forbidden,
+        StatusCode::GONE => CatalogError::Expired,
         StatusCode::NOT_FOUND => CatalogError::NotFound,
         StatusCode::TOO_MANY_REQUESTS => CatalogError::RateLimited {
             retry_after_seconds: response
@@ -1166,6 +1432,291 @@ pub(crate) fn public_ip(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn cache_catalog() -> SoundCloudCatalog {
+        SoundCloudCatalog::from_gateway(crate::gateway_client::Gateway::new("https://pulse.example").unwrap())
+    }
+
+    fn cache_resource(bytes: usize, marker: u8) -> MediaResource {
+        MediaResource { status: 200, bytes: vec![marker; bytes], content_type: "audio/mpeg".into(), content_range: None, final_url: "https://pulse.example/v1/media/test/1".into() }
+    }
+
+    fn cache_key(url: &str, range: Option<&str>) -> MediaCacheKey {
+        MediaCacheKey { url: url.into(), range: range.map(str::to_owned) }
+    }
+
+    fn cache_grant(id: usize, scope: PlaybackCacheScope) -> StreamGrant {
+        let track = parse_candidate(&json!({"kind":"track","id":id,"title":"Song","duration":60000,"access":"playable"})).unwrap();
+        StreamGrant { track, sources: vec![], cache_scope: scope }
+    }
+
+    fn cache_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap()
+    }
+
+    #[test]
+    fn playback_cache_grants_have_fixed_deadlines_and_lru_limits() {
+        let now = Instant::now();
+        let mut cache = PlaybackCache::default();
+        let generation = cache.activate(10, 1, 0).unwrap();
+        let scope = PlaybackCacheScope { generation, expires_at: now + Duration::from_secs(60) };
+        for id in 1..=GRANT_CACHE_ENTRIES { cache.insert_grant(id.to_string(), cache_grant(id, scope), now); }
+        assert!(cache.grant("1", now + Duration::from_secs(59)).is_some());
+        cache.insert_grant("65".into(), cache_grant(65, scope), now);
+        assert!(cache.grant("2", now).is_none());
+        assert!(cache.grant("1", now).is_some());
+        assert_eq!(cache.grants.len(), GRANT_CACHE_ENTRIES);
+        assert!(cache.grant("1", scope.expires_at).is_none());
+        assert!(cache.grants.is_empty());
+        assert!(MANAGED_GRANT_TTL < Duration::from_secs(15 * 60));
+        assert_eq!(DIRECT_GRANT_TTL, Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn playback_cache_gateway_deadline_uses_original_expiry_without_reviving_capability() {
+        let now = Instant::now();
+        let wall = 1_800_000_u64;
+        let deadline = grant_cache_deadline(true, now, Some(wall + 15 * 60_000), Some(15 * 60_000), wall, now);
+        assert_eq!(deadline, now + MANAGED_GRANT_TTL);
+        let reused = grant_cache_deadline(true, now, Some(wall + 3 * 60_000), Some(3 * 60_000), wall, now);
+        assert_eq!(reused, now + Duration::from_secs(120));
+        assert_eq!(grant_cache_deadline(true, now, Some(wall + 60_000), Some(60_000), wall, now), now);
+        assert_eq!(grant_cache_deadline(true, now, Some(wall - 1), Some(60_000), wall, now), now);
+        assert_eq!(grant_cache_deadline(true, now, None, Some(15 * 60_000), wall, now), now);
+        assert_eq!(grant_cache_deadline(true, now, Some(wall + 15 * 60_000), None, wall, now), now);
+        assert_eq!(grant_cache_deadline(false, now, None, None, wall, now), now + DIRECT_GRANT_TTL);
+        // Provider and metadata latency consumes the local TTL too.
+        assert_eq!(grant_cache_deadline(true, now, Some(wall + 15 * 60_000), Some(15 * 60_000), wall, now + Duration::from_secs(30)), now + MANAGED_GRANT_TTL);
+        // A desktop clock ten minutes behind cannot turn a capability with
+        // 60 seconds remaining into another eleven-minute cache lease.
+        assert_eq!(grant_cache_deadline(true, now, Some(wall + 60_000), Some(60_000), wall - 10 * 60_000, now), now);
+        assert_eq!(grant_cache_deadline(true, now, Some(wall + 5 * 60_000), Some(5 * 60_000), wall, now + Duration::from_secs(30)), now + Duration::from_secs(240));
+    }
+
+    #[test]
+    fn playback_cache_media_keys_keep_ranges_and_signed_urls_exact() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        let mut cache = PlaybackCache::default();
+        let full = cache_key("https://pulse.example/media/a?signature=one", None);
+        let part = cache_key("https://pulse.example/media/a?signature=one", Some("bytes=0-255"));
+        cache.insert_media(full.clone(), cache_resource(256, 1), until, now);
+        cache.insert_media(part.clone(), cache_resource(256, 2), until, now);
+        assert_eq!(cache.media(&full, now).unwrap().bytes[0], 1);
+        assert_eq!(cache.media(&part, now).unwrap().bytes[0], 2);
+        assert!(cache.media(&cache_key(&full.url, Some("bytes=256-511")), now).is_none());
+        assert!(cache.media(&cache_key("https://pulse.example/media/a?signature=two", None), now).is_none());
+    }
+
+    #[test]
+    fn playback_cache_byte_entry_limits_eviction_and_expiry_are_exact() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        let mut cache = PlaybackCache::default();
+        let put = |cache: &mut PlaybackCache, key, bytes| cache.insert_media_with_limits(cache_key(key, None), cache_resource(bytes, 1), until, now, 1024, 2);
+        put(&mut cache, "one", 400);
+        put(&mut cache, "two", 400);
+        cache.media(&cache_key("one", None), now).unwrap();
+        put(&mut cache, "three", 624);
+        assert_eq!(cache.media_bytes, 1024);
+        assert!(cache.media(&cache_key("two", None), now).is_none());
+        assert!(cache.media(&cache_key("one", None), now).is_some());
+        put(&mut cache, "oversize", 1025);
+        assert_eq!(cache.media_bytes, 1024);
+        put(&mut cache, "four", 200);
+        assert_eq!(cache.media.len(), 2);
+        assert!(cache.media(&cache_key("three", None), now).is_none());
+        cache.prune(until);
+        assert!(cache.media.is_empty());
+        assert_eq!(cache.media_bytes, 0);
+        assert_eq!(MEDIA_CACHE_BYTES, 128 * 1024 * 1024);
+        assert_eq!(MEDIA_CACHE_ENTRIES, 1024);
+    }
+
+    #[test]
+    fn playback_cache_excludes_manifests_keys_text_and_unsuccessful_responses() {
+        let mut resource = cache_resource(256, 1);
+        assert!(cacheable_audio(&resource));
+        resource.status = 206;
+        assert!(cacheable_audio(&resource));
+        resource.status = 410;
+        assert!(!cacheable_audio(&resource));
+        resource.status = 200;
+        resource.content_type = "application/vnd.apple.mpegurl".into();
+        assert!(!cacheable_audio(&resource));
+        resource.content_type = "application/octet-stream".into();
+        assert!(!cacheable_audio(&resource));
+        resource.bytes[..7].copy_from_slice(b"#EXTM3U");
+        assert!(!cacheable_audio(&resource));
+        resource.bytes = vec![1; 16];
+        assert!(!cacheable_audio(&resource));
+        resource.bytes = vec![1; 32];
+        assert!(!cacheable_audio(&resource));
+        resource.bytes = vec![1; 256];
+        resource.content_type = "text/html".into();
+        assert!(!cacheable_audio(&resource));
+    }
+
+    #[test]
+    fn playback_cache_account_switch_logout_and_stale_activation_do_not_revive_bytes() {
+        let now = Instant::now();
+        let mut cache = PlaybackCache::default();
+        let first = cache.activate(10, 1, 0).unwrap();
+        cache.insert_media(cache_key("one", None), cache_resource(256, 1), now + Duration::from_secs(60), now);
+        assert_eq!(cache.activate(10, 1, 0).unwrap(), first);
+        let second = cache.activate(20, 2, 0).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(cache.current(first), Err(CatalogError::Expired));
+        assert_eq!(cache.activate(10, 1, 0), Err(CatalogError::Expired));
+        assert!(cache.media.is_empty());
+        let catalog = cache_catalog();
+        let old = catalog.playback_context(20, 2, 0).unwrap();
+        catalog.clear_playback_cache(1);
+        assert_eq!(catalog.playback_context(20, 2, 0), Err(CatalogError::Expired));
+        let new = catalog.playback_context(20, 2, 1).unwrap();
+        assert_ne!(old, new);
+    }
+
+    #[test]
+    fn playback_cache_repeat_media_reuses_bytes_and_expired_scopes_fetch_again() {
+        cache_runtime().block_on(async {
+            let catalog = cache_catalog();
+            let generation = catalog.playback_context(1, 1, 0).unwrap();
+            let scope = PlaybackCacheScope { generation, expires_at: Instant::now() + Duration::from_secs(60) };
+            let key = cache_key("one", None);
+            let count = AtomicUsize::new(0);
+            for _ in 0..2 {
+                let resource = catalog.cached_media(key.clone(), scope, || async { count.fetch_add(1, Ordering::SeqCst); Ok(cache_resource(256, 1)) }).await.unwrap();
+                assert_eq!(resource.bytes[0], 1);
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            let expired = PlaybackCacheScope { expires_at: Instant::now() - Duration::from_secs(1), ..scope };
+            let resource = catalog.cached_media(key.clone(), expired, || async { count.fetch_add(1, Ordering::SeqCst); Ok(cache_resource(256, 2)) }).await.unwrap();
+            assert_eq!(resource.bytes[0], 2);
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+            // A late response from an already-expired grant cannot replace the
+            // independently valid cache entry.
+            assert_eq!(catalog.playback.lock().unwrap().media(&key, Instant::now()).unwrap().bytes[0], 1);
+        });
+    }
+
+    #[test]
+    fn playback_cache_media_requests_coalesce_without_serializing_every_segment() {
+        cache_runtime().block_on(async {
+            let catalog = cache_catalog();
+            let generation = catalog.playback_context(1, 1, 0).unwrap();
+            let scope = PlaybackCacheScope { generation, expires_at: Instant::now() + Duration::from_secs(60) };
+            let count = Arc::new(AtomicUsize::new(0));
+            let start = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let key = cache_key("same", Some("bytes=0-255"));
+            let task = |catalog: SoundCloudCatalog, key: MediaCacheKey, gated| {
+                let count = count.clone(); let start = start.clone(); let finish = finish.clone();
+                tokio::spawn(async move { catalog.cached_media(key, scope, || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if gated { start.notify_one(); finish.notified().await; }
+                    Ok(cache_resource(256, 7))
+                }).await })
+            };
+            let first = task(catalog.clone(), key.clone(), true);
+            start.notified().await;
+            let second = task(catalog.clone(), key.clone(), false);
+            let other_key = (0..100).map(|id| cache_key(&id.to_string(), None))
+                .find(|other| cache_stripe(other) != cache_stripe(&key)).unwrap();
+            let independent = task(catalog.clone(), other_key, false);
+            // Another stripe must finish while the first download is blocked.
+            assert_eq!(timeout(Duration::from_secs(1), independent).await.unwrap().unwrap().unwrap().bytes[0], 7);
+            tokio::task::yield_now().await;
+            finish.notify_one();
+            assert_eq!(first.await.unwrap().unwrap().bytes[0], 7);
+            assert_eq!(second.await.unwrap().unwrap().bytes[0], 7);
+            assert_eq!(count.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn playback_cache_inflight_success_after_logout_cannot_restore_audio() {
+        cache_runtime().block_on(async {
+            let catalog = cache_catalog();
+            let generation = catalog.playback_context(1, 1, 0).unwrap();
+            let scope = PlaybackCacheScope { generation, expires_at: Instant::now() + Duration::from_secs(60) };
+            let start = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let pending = {
+                let catalog = catalog.clone(); let start = start.clone(); let finish = finish.clone();
+                tokio::spawn(async move { catalog.cached_media(cache_key("old", None), scope, || async {
+                    start.notify_one(); finish.notified().await; Ok(cache_resource(256, 1))
+                }).await })
+            };
+            start.notified().await;
+            catalog.clear_playback_cache(1);
+            catalog.playback_context(2, 2, 1).unwrap();
+            finish.notify_one();
+            assert!(matches!(pending.await.unwrap(), Err(CatalogError::Expired)));
+            let cache = catalog.playback.lock().unwrap();
+            assert!(cache.media.is_empty() && cache.grants.is_empty());
+        });
+    }
+
+    #[test]
+    fn playback_cache_known_forbidden_or_expired_clears_grants_and_other_segments() {
+        cache_runtime().block_on(async {
+            for error in [CatalogError::Unauthorized, CatalogError::Forbidden, CatalogError::NotFound, CatalogError::Expired] {
+                let catalog = cache_catalog();
+                let generation = catalog.playback_context(1, 1, 0).unwrap();
+                let scope = PlaybackCacheScope { generation, expires_at: Instant::now() + Duration::from_secs(60) };
+                {
+                    let mut cache = catalog.playback.lock().unwrap();
+                    cache.insert_media(cache_key("good", None), cache_resource(256, 1), scope.expires_at, Instant::now());
+                    cache.insert_grant("1".into(), cache_grant(1, scope), Instant::now());
+                }
+                assert!(catalog.cached_media(cache_key("bad", None), scope, || async { Err(error) }).await.is_err());
+                assert!(matches!(catalog.cached_media(cache_key("good", None), scope, || async { panic!("stale scope must not start another fetch") }).await, Err(CatalogError::Expired)));
+                let cache = catalog.playback.lock().unwrap();
+                assert!(cache.media.is_empty() && cache.grants.is_empty());
+                assert_eq!(cache.media_bytes, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn playback_cache_grant_repeats_coalesce_and_network_errors_are_not_cached() {
+        cache_runtime().block_on(async {
+            let catalog = cache_catalog();
+            let generation = catalog.playback_context(1, 1, 0).unwrap();
+            let scope = PlaybackCacheScope { generation, expires_at: Instant::now() + Duration::from_secs(60) };
+            let count = Arc::new(AtomicUsize::new(0));
+            let start = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let task = |catalog: SoundCloudCatalog, gated| {
+                let count = count.clone(); let start = start.clone(); let finish = finish.clone();
+                tokio::spawn(async move { catalog.cached_streams("1".into(), generation, || async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if gated { start.notify_one(); finish.notified().await; }
+                    Ok(cache_grant(1, scope))
+                }).await })
+            };
+            let first = task(catalog.clone(), true);
+            start.notified().await;
+            let second = task(catalog.clone(), false);
+            tokio::task::yield_now().await;
+            finish.notify_one();
+            assert!(first.await.unwrap().is_ok()); assert!(second.await.unwrap().is_ok());
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            catalog.cached_media(cache_key("healthy", None), scope, || async { Ok(cache_resource(256, 1)) }).await.unwrap();
+            for _ in 0..2 {
+                assert!(matches!(catalog.cached_media(cache_key("failed", None), scope, || async { count.fetch_add(1, Ordering::SeqCst); Err(CatalogError::Network) }).await, Err(CatalogError::Network)));
+            }
+            assert_eq!(count.load(Ordering::SeqCst), 3);
+            assert!(catalog.playback.lock().unwrap().grants.is_empty());
+            catalog.cached_streams("1".into(), generation, || async { count.fetch_add(1, Ordering::SeqCst); Ok(cache_grant(1, scope)) }).await.unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 4);
+            let mut cache = catalog.playback.lock().unwrap();
+            assert_eq!(cache.media.len(), 1);
+            assert!(cache.media(&cache_key("healthy", None), Instant::now()).is_some());
+        });
+    }
 
     #[test]
     fn gateway_expiry_is_distinct_from_provider_failures_without_exposing_details() {

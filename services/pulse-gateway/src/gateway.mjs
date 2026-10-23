@@ -4,6 +4,7 @@ import { requireGet } from './config.mjs';
 import { allowedQuery, clientIp, integerQuery, publicPermalink, queryText, trackId, uuid, validateTarget } from './security.mjs';
 import { BoundedCache, AbuseLimits, IntervalGate } from './limits.mjs';
 import { MediaSessions, relayMedia, transientRequest } from './media.mjs';
+import { MediaByteCache } from './media-cache.mjs';
 import { SoundCloudTokens } from './oauth.mjs';
 import { createTransport } from './transport.mjs';
 
@@ -19,7 +20,10 @@ export function createGateway(config, { transport = createTransport(), now = Dat
   const limits = new AbuseLimits(config, now);
   const mbGate = new IntervalGate(1000, now, delay);
   const tokens = new SoundCloudTokens(config, transport, now);
-  const sessions = new MediaSessions(config.origin, now);
+  const mediaCache = new MediaByteCache({ now });
+  const sessions = new MediaSessions(config.origin, now, token => mediaCache.deleteSession(token));
+  const sweep = setInterval(() => { sessions.prune(); mediaCache.prune(); }, 30_000);
+  sweep.unref();
   const pending = new Map();
   const wait = delay || (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
 
@@ -123,8 +127,8 @@ export function createGateway(config, { transport = createTransport(), now = Dat
       const value = await scApi(upstream);
       const keys = STREAM_KEYS.filter(key => typeof value?.[key] === 'string');
       if (!keys.length) throw new GatewayError(404, 'not_available');
-      const session = sessions.create(ip, keys.map(key => value[key]));
-      return Object.fromEntries(keys.map((key, index) => [key, session.urls[index]]));
+      const session = sessions.createOrReuse(ip, keys.map(key => value[key]), id);
+      return { ...Object.fromEntries(keys.map((key, index) => [key, session.urls[index]])), expires_at: session.expiresAt, expires_in_ms: Math.max(0, session.expiresAt - now()) };
     }
     throw new GatewayError(404, 'not_found');
   }
@@ -150,7 +154,7 @@ export function createGateway(config, { transport = createTransport(), now = Dat
       lease = limits.acquire(ip, Boolean(media));
       if (media) {
         allowedQuery(url.searchParams, []);
-        const result = await relayMedia({ transport, tokens, sessions, userAgent: config.userAgent, token: media[1], index: Number(media[2]), ip, range: request.headers.range, head: request.method === 'HEAD', delay: wait });
+        const result = await relayMedia({ transport, tokens, sessions, mediaCache, userAgent: config.userAgent, token: media[1], index: Number(media[2]), ip, range: request.headers.range, head: request.method === 'HEAD', delay: wait });
         lease.bytes(result.chargedBytes);
         response.writeHead(result.status, { ...result.headers, 'x-content-type-options': 'nosniff' });
         response.end(result.bytes);
@@ -178,7 +182,7 @@ export function createGateway(config, { transport = createTransport(), now = Dat
       lease?.release();
     }
   }
-  return { handler, close: () => transport.close?.(), cache, sessions };
+  return { handler, close: () => { clearInterval(sweep); mediaCache.clear(); transport.close?.(); }, cache, mediaCache, sessions };
 }
 
 export function createServer(config, dependencies) {

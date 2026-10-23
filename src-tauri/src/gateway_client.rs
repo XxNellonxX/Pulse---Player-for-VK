@@ -162,7 +162,10 @@ pub(crate) struct Resource {
 impl Gateway {
     pub fn configured() -> Result<Option<Self>, String> {
         // A publisher embeds a public origin at build time, never a shared key.
+        let default: serde_json::Value = serde_json::from_str(include_str!("../../config/pulse-service.default.json"))
+            .map_err(|_| "Неверная конфигурация сервиса Pulse.")?;
         option_env!("PULSE_GATEWAY_URL")
+            .or_else(|| default.get("gatewayUrl").and_then(serde_json::Value::as_str))
             .filter(|url| !url.is_empty())
             .map(Self::new)
             .transpose()

@@ -1299,9 +1299,12 @@ mod tests {
         });
         let config =
             proxy_configuration(&format!("http://u:private-test-password@{address}")).unwrap();
-        let provider =
+        let mut provider =
             MusicBrainzCatalog::with_proxy(config.proxy.as_deref(), Arc::new(Mutex::new(None)))
                 .unwrap();
+        // Exercise the direct proxy adapter regardless of the publisher's
+        // embedded service origin. This fixture must never contact that service.
+        provider.gateway = None;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1347,9 +1350,10 @@ mod tests {
             (String::from_utf8(domain).unwrap(), u16::from_be_bytes(port))
         });
         let config = proxy_configuration(&format!("socks5h://{address}")).unwrap();
-        let provider =
+        let mut provider =
             MusicBrainzCatalog::with_proxy(config.proxy.as_deref(), Arc::new(Mutex::new(None)))
                 .unwrap();
+        provider.gateway = None;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

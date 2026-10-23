@@ -5,6 +5,14 @@ SoundCloud client-credentials flow on an Ubuntu 24.04 VPS in the Netherlands.
 The account owner confirms an active Artist Pro subscription. No credentials,
 OAuth tokens or signed media URLs are included in this report.
 
+Update, 23 October: preview.4 enables the public gateway and bounded session
+caches by default. Real audio has since decoded for 150 seconds, and a separate
+live Edge check played “капля испуга”, sought near the end and reached `ended`
+without HLS/decoder/network errors. This does not invalidate the provider
+failures recorded below or establish universal availability. See the
+[preview.4 verification](release-0.5.0-preview.4-verification.md) for the exact
+test boundaries, remaining FFmpeg warnings and per-track direct-VK fallback.
+
 ## Observed behavior
 
 OAuth token exchange succeeds. Public track search and metadata return HTTP 200

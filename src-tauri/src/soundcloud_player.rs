@@ -2,7 +2,7 @@
 //! No signed provider URLs, secrets or audio files are persisted.
 use crate::{
     soundcloud_catalog::{
-        validate_range, Candidate, CatalogError, CatalogPage, SoundCloudCatalog,
+        validate_range, Candidate, CatalogError, CatalogPage, PlaybackCacheScope, SoundCloudCatalog,
     },
     vk_web, AppState,
 };
@@ -54,6 +54,7 @@ impl Default for SourceState {
 }
 struct Session {
     catalog: Arc<SoundCloudCatalog>,
+    cache_scope: PlaybackCacheScope,
     guard: vk_web::UploadGuard,
     urls: Vec<String>,
     created_at: i64,
@@ -388,10 +389,12 @@ fn apply_configuration(
             &serde_json::to_string(&config).map_err(|_| "Не удалось сохранить настройки.")?,
         )
         .map_err(|_| "Система не разрешила сохранить доступ SoundCloud. Настройки не изменены.")?;
-    shared.generation.fetch_add(1, Ordering::SeqCst);
+    let revision = shared.generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     shared.sessions.lock().unwrap().clear();
     let client = Arc::new(client);
-    *shared.catalog.lock().unwrap() = Some(client.clone());
+    let mut catalog = shared.catalog.lock().unwrap();
+    if let Some(previous) = catalog.as_ref() { previous.clear_playback_cache(revision); }
+    *catalog = Some(client.clone());
     Ok(client)
 }
 
@@ -602,8 +605,10 @@ pub async fn resolve_soundcloud(app: AppHandle, track_id: String) -> Result<Prep
             .ok_or("Для трека ещё не выбран источник SoundCloud.")?
     };
     let client = catalog(&app)?;
+    let cache_generation = client.playback_context(guard.account_id, guard.window_epoch, generation)
+        .map_err(|e| e.to_string())?;
     let grant = client
-        .streams(&binding.candidate.id)
+        .streams(&binding.candidate.id, cache_generation)
         .await
         .map_err(|e| e.to_string())?;
     if generation != shared.generation.load(Ordering::SeqCst)
@@ -631,6 +636,7 @@ pub async fn resolve_soundcloud(app: AppHandle, track_id: String) -> Result<Prep
         token.clone(),
         Session {
             catalog: client,
+            cache_scope: grant.cache_scope,
             guard,
             urls: vec![url],
             created_at: crate::now(),
@@ -649,8 +655,11 @@ pub fn release_soundcloud(shared: State<'_, SourceState>, session_id: Option<Str
     if let Some(id) = session_id {
         shared.sessions.lock().unwrap().remove(&id);
     } else {
-        shared.generation.fetch_add(1, Ordering::SeqCst);
+        let revision = shared.generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         shared.sessions.lock().unwrap().clear();
+        if let Some(client) = shared.catalog.lock().unwrap().as_ref() {
+            client.clear_playback_cache(revision);
+        }
     }
 }
 
@@ -831,10 +840,11 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
                 url.clone(),
                 s.created_at,
                 s.generation,
+                s.cache_scope,
             )
         })
     });
-    let Some((client, guard, url, created_at, generation)) = session else {
+    let Some((client, guard, url, created_at, generation, cache_scope)) = session else {
         return media_response(404, "text/plain", vec![], None);
     };
     if !session_current(
@@ -846,7 +856,7 @@ pub async fn serve(app: AppHandle, request: Request<Vec<u8>>) -> Response<Vec<u8
     {
         return media_response(410, "text/plain", vec![], None);
     }
-    let resource = match client.fetch_media(&url, range).await {
+    let resource = match client.fetch_media(&url, range, cache_scope).await {
         Ok(r) => r,
         Err(error) => return source_error_response(error),
     };
