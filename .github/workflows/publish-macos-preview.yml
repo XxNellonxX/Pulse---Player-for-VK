@@ -37,11 +37,15 @@ jobs:
           set -euo pipefail
           [[ "$PULSE_BUILD_RUN" =~ ^[0-9]+$ ]]
           [[ "$PULSE_PREVIEW_ID" =~ ^[0-9]+$ ]]
-          [[ "$PULSE_PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-macos-preview$ ]]
+          [[ "$PULSE_PREVIEW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(macos-preview|preview\.[0-9]+)$ ]]
           gh api "repos/$GH_REPO/actions/runs/$PULSE_BUILD_RUN" > build.json
           jq -e '.conclusion == "success" and .path == ".github/workflows/release-macos.yml"' build.json
           gh api "repos/$GH_REPO/releases/$PULSE_PREVIEW_ID" > preview.json
           jq -e --arg tag "$PULSE_PREVIEW_TAG" '.draft == true and .prerelease == true and .tag_name == $tag' preview.json
+          gh api "repos/$GH_REPO/commits/$PULSE_PREVIEW_TAG" > source.json
+          test "$(jq -r '.head_sha' build.json)" = "$(jq -r '.sha' source.json)"
+          gh api "repos/$GH_REPO/actions/runs/$PULSE_BUILD_RUN/artifacts" > artifacts.json
+          jq -e '[.artifacts[] | select(.expired == false and (.name == "pulse-macos-arm64" or .name == "pulse-macos-x64"))] | length == 2' artifacts.json
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
         with:
@@ -53,13 +57,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f preview/pulse-macos-arm64/*_aarch64.dmg
-          test -f preview/pulse-macos-x64/*_x64.dmg
-          sha256sum preview/*/*.dmg > SHA256SUMS-macos.txt
-          for PULSE_ASSET in preview/*/*.dmg SHA256SUMS-macos.txt; do
+          shopt -s nullglob
+          PULSE_ARM=(preview/pulse-macos-arm64/*_aarch64.dmg)
+          PULSE_INTEL=(preview/pulse-macos-x64/*_x64.dmg)
+          test "${#PULSE_ARM[@]}" -eq 1
+          test "${#PULSE_INTEL[@]}" -eq 1
+          mkdir release-assets
+          for PULSE_ASSET in "${PULSE_ARM[0]}" "${PULSE_INTEL[0]}"; do
+            PULSE_NAME=$(basename "$PULSE_ASSET")
+            PULSE_NAME=${PULSE_NAME// /.}
+            PULSE_VERSION=${PULSE_PREVIEW_TAG#v}
+            if [[ "$PULSE_PREVIEW_TAG" == *-macos-preview ]]; then PULSE_VERSION=${PULSE_VERSION%-macos-preview}; fi
+            [[ "$PULSE_NAME" == "VK.Player_${PULSE_VERSION}_aarch64.dmg" || "$PULSE_NAME" == "VK.Player_${PULSE_VERSION}_x64.dmg" ]]
+            cp "$PULSE_ASSET" "release-assets/$PULSE_NAME"
+          done
+          (cd release-assets && sha256sum *.dmg) > release-assets/SHA256SUMS-macos.txt
+          for PULSE_ASSET in release-assets/*.dmg release-assets/SHA256SUMS-macos.txt; do
             PULSE_NAME=$(basename "$PULSE_ASSET")
             PULSE_ENCODED=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$PULSE_NAME")
             gh api -X POST "https://uploads.github.com/repos/$GH_REPO/releases/$PULSE_PREVIEW_ID/assets?name=$PULSE_ENCODED" \
               -H 'Content-Type: application/octet-stream' --input "$PULSE_ASSET" --jq '{name, size, digest}'
           done
-          cat SHA256SUMS-macos.txt
+          cat release-assets/SHA256SUMS-macos.txt
