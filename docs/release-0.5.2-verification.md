@@ -1,6 +1,11 @@
 # Pulse 0.5.2 — проверка обновления
 
-24 октября 2026 года. Windows и macOS используют общий frontend и Rust backend,
+24 октября 2026 года. [Выпуск v0.5.2](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.5.2)
+опубликован: ID `422679499`, `draft=false`, `prerelease=false`;
+`/releases/latest` возвращает этот же выпуск. Все три пакета собраны из
+ревизии `ae094d679bcea35313da8b2b77ae5e57d68264ac`, закреплённой тегом `v0.5.2`.
+
+Windows и macOS используют общий frontend и Rust backend,
 версия 0.5.2 и идентификатор `ru.vkplayer.desktop`. Миграция очереди добавляет
 необязательный `queueSource`, совместимый с прежними профилями; расположения
 данных не меняются. Android пока не реализован.
@@ -37,7 +42,9 @@ Windows HKCU Run / StartupApproved и macOS SMAppService. Однократное
 системная регистрация отключена; производственная перезагрузка Windows не выполнялась.
 После полного удаления Windows-приложения запись Run пока может остаться;
 перед удалением её следует отключить в Pulse или настройках Windows.
-Статус платформенных пакетов и публикации будет записан после сборки.
+Обе архитектуры macOS собраны успешно; runtime на физическом устройстве
+не проверен. Производственный Windows-процесс в этом проходе не запускался,
+чтобы не вмешиваться в пользовательский плеер и его профиль.
 Отсутствие физического Mac не позволяет подтвердить вход, Keychain, импорты,
 воспроизведение, обновление или системный запуск на этом устройстве.
 Неподписанные Mac-пакеты остаются preview даже при успешной компиляции.
@@ -59,6 +66,40 @@ Gateway обновлён на действующем VPS с приватной �
 
 ## Пакеты
 
-Windows EXE и Apple Silicon / Intel DMG должны быть собраны из одной ревизии
-и опубликованы в одном выпуске. Ревизия, CI и контрольные суммы будут добавлены
-по фактическому завершению сборки; более ранние результаты 0.5.1 не засчитываются.
+Windows release build завершён. У основного PE проверены ProductName `VK Player`
+и ProductVersion `0.5.2`; профиль и импорт тестовых файлов в production по-прежнему
+не могут переопределяться QA-переменными: эти ветви ограничены debug_assertions.
+Названия QA-переменных встречаются в новом запрете автозапуска тестового окружения;
+само наличие строки в PE не доказывает доступность QA-профиля.
+
+Обе архитектуры macOS успешно собраны в
+[Actions 40088418282](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/40088418282),
+включая TypeScript, Vitest, Node regression, gateway suite и подготовку import-tools.
+Перенос пакетов прошёл в
+[Actions 40088938952](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/40088938952).
+Оба workflow указывают на ту же исходную ревизию. Успешная компиляция не
+подтверждает runtime, подпись и notarization; Mac остаётся unsigned preview.
+
+| Пакет | Размер, байт | SHA-256 |
+|---|---:|---|
+| [Windows EXE](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_x64-setup.exe) | 107 848 613 | `a811f0eec7a5bed5314f7a63331b98dcfd9fca155a5b3c66e374f273efa71b56` |
+| [Mac Apple Silicon DMG](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_aarch64.dmg) | 118 396 039 | `9bdc680aad1f62c4b242d51c56be7e6cd8a01cfb02c4f293430d9df5fa0601b8` |
+| [Mac Intel DMG](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_x64.dmg) | 134 516 182 | `ee8757bbf0a76b18d33305b9eb85ab05de6489d145ddadb4dea7da590a06aeb8` |
+
+GitHub asset digest Windows совпал с локальным установщиком; DMG — с контрольными
+суммами CI. [SHA256SUMS.txt](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/SHA256SUMS.txt)
+и отдельный Mac manifest приложены к выпуску. Полное повторное скачивание
+EXE/DMG не выполнялось. Готовые PE/EXE и staged-изменения проверены на два точных
+известных значения локальных ключей: совпадений нет; это не поиск всех возможных
+неизвестных или закодированных секретов. Финальный staged scanner проверил
+36 файлов перед исходным коммитом, `git diff --cached --check` прошёл.
+
+## Независимая публичная проверка
+
+После публикации отдельный агент выполнил **10/10 проверок без авторизации**:
+stable/latest и ID, source SHA тега и обоих workflow, обе Mac matrix jobs,
+HTTP 200 для HEAD трёх пакетов с совпадающими размерами, скачанные и самостоятельно
+хешированные общий/Mac manifests, абсолютные рабочие ссылки на отчёты и явные
+ограничения в описании. Пакеты EXE/DMG целиком не скачивались; установка,
+автозапуск после перезагрузки и физический runtime этим не проверяются.
+Локальный отчёт исключён из Git: `release-tauri/v0.5.2-public-independent.json`.

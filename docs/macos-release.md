@@ -1,6 +1,28 @@
 # macOS сборка Pulse
 
-## 0.5.1 — опубликованные preview-пакеты macOS
+## 0.5.2 — текущие preview-пакеты macOS
+
+Apple Silicon и Intel успешно собраны из той же ревизии, что Windows:
+`ae094d679bcea35313da8b2b77ae5e57d68264ac`, версия `0.5.2`.
+[Сборка 40088418282](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/40088418282) и
+[прикрепление пакетов 40088938952](https://github.com/XxNellonxX/Pulse---Player-for-VK/actions/runs/40088938952) прошли.
+Общий [выпуск v0.5.2](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.5.2),
+ID `422679499`, опубликован как stable/latest.
+
+- [Apple Silicon DMG](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_aarch64.dmg).
+- [Intel DMG](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_x64.dmg).
+- [Контрольные суммы](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/SHA256SUMS.txt) и
+  [отчёт сборки и проверки](release-0.5.2-verification.md).
+
+Пакеты остаются **unsigned preview**, без подписи и notarization Apple.
+Физические вход, аудио, импорты, Keychain, обновление и автозапуск на Mac не
+проверены. Новый автозапуск использует SMAppService; macOS может отклонить
+регистрацию неподписанного приложения, что отображается в настройках Pulse.
+Независимая публичная проверка подтвердила HEAD 200, размеры и digest пакетов;
+это не установка и не runtime-проверка. При обновлении замените приложение
+в «Программах», сохранив профиль. Следующие разделы — исторические результаты.
+
+## История: 0.5.1 — опубликованные preview-пакеты macOS
 
 Обе архитектуры macOS 14+ успешно собраны из той же ревизии, что и Windows:
 `656e9652aa22a2722532451491b13d04cac3178b`, версия `0.5.1`. Сборка завершена успешно в

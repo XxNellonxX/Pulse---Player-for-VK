@@ -4,19 +4,28 @@
 очередью, плейлистами, эквалайзером, фоновым воспроизведением и 17 темами.
 Windows использует системный WebView2, macOS — WKWebView.
 
-**[Pulse 0.5.1 опубликован](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.5.1).** В одном выпуске доступны
+**[Pulse 0.5.2 опубликован](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/tag/v0.5.2).** В одном выпуске доступны
 установщик Windows и неподписанные preview-пакеты macOS из одной ревизии исходников.
 
-- [Windows x64 — установщик EXE](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_x64-setup.exe).
-- [macOS Apple Silicon — DMG, unsigned preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_aarch64.dmg).
-- [macOS Intel — DMG, unsigned preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.1/VK.Player_0.5.1_x64.dmg).
-- [Последний стабильный выпуск](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/latest) и [описание 0.5.1](docs/releases/0.5.1.md).
+- [Windows x64 — установщик EXE](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_x64-setup.exe).
+- [macOS Apple Silicon — DMG, unsigned preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_aarch64.dmg).
+- [macOS Intel — DMG, unsigned preview](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/download/v0.5.2/VK.Player_0.5.2_x64.dmg).
+- [Последний стабильный выпуск](https://github.com/XxNellonxX/Pulse---Player-for-VK/releases/latest) и [описание 0.5.2](docs/releases/0.5.2.md).
 
 Для обновления завершите Pulse и установите новую версию поверх предыдущей;
 на Mac замените приложение в «Программах». Идентификатор приложения и папки
 данных остаются прежними. Библиотека и настройки сохраняются, сессия VK действует,
 пока её принимает VK. **С preview.6/.7 скачайте обновление вручную:** прежняя
 проверка обновлений может не предложить стабильную версию.
+
+**В 0.5.2:** плавный переход к играющему треку при возвращении в окно,
+перемешивание выбранного альбома/плейлиста с сохранением порядка и автозапуск
+в «Настройки → Система». Укреплены границы нативных команд и публичного gateway,
+обновлены зависимости с исправлениями безопасности. Отключение автозапуска
+через ОС не отменяется. При полном удалении Windows-приложения выключите
+автозапуск заранее: системная запись пока может остаться. На неподписанном Mac
+регистрация входа может быть отклонена.
+[Результаты и пределы проверки безопасности](docs/security-hardening-2026-10-24.md).
 
 **Новое после 0.4.1:** сохранение собственных загруженных MP3 для повторного
 воспроизведения, исправления медленных VK-источников и приватного HLS, независимый
@@ -47,7 +56,7 @@ Mix. MusicBrainz дополняет каталог и локальную лен�
 macOS-пакеты не подписаны и не notarized Apple; остаются preview для Mac.
 Вход, воспроизведение, личные импорты, Keychain и обновление на физическом Mac
 ещё не проверены. [Сборка macOS](docs/macos-release.md).
-[Проверки и границы 0.5.1](docs/release-0.5.1-verification.md).
+[Проверки и границы 0.5.2](docs/release-0.5.2-verification.md).
 [Устройство Pulse Gateway](services/pulse-gateway/README.md),
 [настройка общего сервиса](docs/pulse-service-setup.md),
 [история диагностики SoundCloud](docs/soundcloud-stream-diagnostics.md).
