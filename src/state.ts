@@ -54,8 +54,11 @@ export function hydrateState(value: unknown): PersistedState {
   const candidate = value as Partial<PersistedState>
   const tracks = Array.isArray(candidate.tracks) ? candidate.tracks.map(normalizeTrack).filter((track): track is Track => Boolean(track)) : []
   const ids = new Set(tracks.map(track => track.id))
+  const queue = Array.isArray(candidate.queue) ? [...new Set(candidate.queue.filter(id => typeof id === 'string' && ids.has(id)))] : []
+  const queueIds = new Set(queue)
+  const queueSource = Array.isArray(candidate.queueSource) ? [...new Set(candidate.queueSource.filter(id => typeof id === 'string' && queueIds.has(id)))].slice(0, 100_000) : []
   const playlists = Array.isArray(candidate.playlists) ? candidate.playlists.filter(item => item && typeof item.id === 'string' && typeof item.title === 'string').map(item => ({ ...item, id: item.id, title: item.title.trim() || 'Без названия', trackIds: Array.isArray(item.trackIds) ? item.trackIds.filter(id => typeof id === 'string' && ids.has(id)) : [], createdAt: Number(item.createdAt) || Date.now() })) : []
-  return { ...initialState, ...candidate, tracks, playlists, serviceImports: normalizeCollections(candidate.serviceImports, ids), history: Array.isArray(candidate.history) ? candidate.history.filter(id => typeof id === 'string' && ids.has(id)) : [], queue: Array.isArray(candidate.queue) ? [...new Set(candidate.queue.filter(id => typeof id === 'string' && ids.has(id)))] : [], currentTrackId: typeof candidate.currentTrackId === 'string' && ids.has(candidate.currentTrackId) ? candidate.currentTrackId : null, position: Number.isFinite(Number(candidate.position)) ? Math.max(0, Number(candidate.position)) : 0, settings: normalizeSettings(candidate.settings) }
+  return { ...initialState, ...candidate, tracks, playlists, serviceImports: normalizeCollections(candidate.serviceImports, ids), history: Array.isArray(candidate.history) ? candidate.history.filter(id => typeof id === 'string' && ids.has(id)) : [], queue, queueSource, currentTrackId: typeof candidate.currentTrackId === 'string' && ids.has(candidate.currentTrackId) ? candidate.currentTrackId : null, position: Number.isFinite(Number(candidate.position)) ? Math.max(0, Number(candidate.position)) : 0, settings: normalizeSettings(candidate.settings) }
 }
 export function mergeTracks(existing: Track[], incoming: Track[]): Track[] {
   const known = new Map(existing.map(track => [track.id, track]))
@@ -143,7 +146,7 @@ export function useLibraryState() {
     const previous = observed.current
     observed.current = state
     if (state === saved.current) return
-    const sameCatalog = previous && previous.version === state.version && previous.tracks === state.tracks && previous.playlists === state.playlists && previous.history === state.history && previous.queue === state.queue && previous.currentTrackId === state.currentTrackId
+    const sameCatalog = previous && previous.version === state.version && previous.tracks === state.tracks && previous.playlists === state.playlists && previous.history === state.history && previous.queue === state.queue && previous.queueSource === state.queueSource && previous.currentTrackId === state.currentTrackId
     const equalizerOnly = sameCatalog && previous.settings.equalizer !== state.settings.equalizer && Object.keys(previous.settings).every(key => key === 'equalizer' || previous.settings[key as keyof AppSettings] === state.settings[key as keyof AppSettings])
     if (equalizerOnly) {
       // A slider updates audio immediately. Coalesce disk writes while it is

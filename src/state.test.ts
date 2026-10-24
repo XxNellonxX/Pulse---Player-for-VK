@@ -4,6 +4,15 @@ import type { Track, VkSnapshot } from './shared/contracts'
 const track: Track = { id: 'vk-1-2', source: 'vk', url: 'vk-web://1/2', title: 'Song', artist: 'Artist', album: '', duration: 99, addedAt: 1, available: true, remote: { ownerId: 1, audioId: 2, inLibrary: true } }
 const snapshot = (tracks: Track[]): VkSnapshot => ({ status: { state: 'connected', capabilities: [], message: '' }, complete: true, mode: 'web', tracks, playlists: [] })
 describe('persistent catalog updates', () => {
+  it('retains the album source order across restart without resurrecting removed queue items', () => {
+    const tracks = [track, { ...track, id: 'b' }, { ...track, id: 'c' }]
+    const restored = hydrateState(JSON.parse(JSON.stringify({ tracks, queue: ['c', track.id, 'b'], queueSource: [track.id, 'b', 'c', 'b', 'removed'], settings: { shuffle: true } })))
+    expect(restored.queue).toEqual(['c', track.id, 'b'])
+    expect(restored.queueSource).toEqual([track.id, 'b', 'c'])
+    const next = hydrateState({ ...restored, queue: ['c', 'b'] })
+    expect(next.queueSource).toEqual(['b', 'c'])
+    expect(hydrateState({ tracks, queue: ['b'] }).queueSource).toEqual([])
+  })
   it('reuses unchanged metadata without repainting or persisting the catalog', () => {
     const state = hydrateState({ tracks: [track] })
     expect(applyVkSnapshot(state, snapshot([{ ...track, addedAt: 500 }]))).toBe(state)

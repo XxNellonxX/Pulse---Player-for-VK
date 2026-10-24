@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { GatewayError, upstreamStatus } from './errors.mjs';
 import { requireGet } from './config.mjs';
-import { allowedQuery, clientIp, integerQuery, publicPermalink, queryText, trackId, uuid, validateTarget } from './security.mjs';
+import { allowedQuery, clientIp, integerQuery, publicPermalink, queryText, requireNativeOrSameOrigin, trackId, uuid, validateTarget } from './security.mjs';
 import { BoundedCache, AbuseLimits, IntervalGate } from './limits.mjs';
 import { MediaSessions, relayMedia, transientRequest } from './media.mjs';
 import { MediaByteCache } from './media-cache.mjs';
@@ -9,6 +9,12 @@ import { SoundCloudTokens } from './oauth.mjs';
 import { createTransport } from './transport.mjs';
 
 const STREAM_KEYS = ['hls_aac_160_url', 'hls_mp3_128_url'];
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'x-frame-options': 'DENY',
+  'content-security-policy': "default-src 'none'; frame-ancestors 'none'; sandbox",
+};
 
 function json(response) {
   if (response.status !== 200) throw upstreamStatus(response.status, response.headers);
@@ -140,13 +146,14 @@ export function createGateway(config, { transport = createTransport(), now = Dat
     deadline.unref();
     try {
       requireGet(request.method);
+      requireNativeOrSameOrigin(request, config.origin);
       if (request.url.length > 8192 || !request.url.startsWith('/') || request.url.startsWith('//')) throw new GatewayError(400, 'invalid_request');
       if (request.headers['content-length'] && request.headers['content-length'] !== '0' || request.headers['transfer-encoding']) throw new GatewayError(400, 'body_not_allowed');
       const url = new URL(request.url, config.origin);
       if (url.pathname === '/healthz' || url.pathname === '/readyz') {
         if (url.search) throw new GatewayError(400, 'invalid_request');
         const bytes = Buffer.from(JSON.stringify(url.pathname === '/healthz' ? { status: 'ok' } : { status: 'configured', providersVerified: false }));
-        response.writeHead(200, { 'content-type': 'application/json', 'content-length': String(bytes.length), 'cache-control': 'no-store' });
+        response.writeHead(200, { ...SECURITY_HEADERS, 'content-type': 'application/json', 'content-length': String(bytes.length), 'cache-control': 'no-store' });
         return response.end(request.method === 'HEAD' ? undefined : bytes);
       }
       const ip = clientIp(request, config.trustLoopbackProxy);
@@ -156,19 +163,19 @@ export function createGateway(config, { transport = createTransport(), now = Dat
         allowedQuery(url.searchParams, []);
         const result = await relayMedia({ transport, tokens, sessions, mediaCache, userAgent: config.userAgent, token: media[1], index: Number(media[2]), ip, range: request.headers.range, head: request.method === 'HEAD', delay: wait });
         lease.bytes(result.chargedBytes);
-        response.writeHead(result.status, { ...result.headers, 'x-content-type-options': 'nosniff' });
+        response.writeHead(result.status, { ...result.headers, ...SECURITY_HEADERS });
         response.end(result.bytes);
         return;
       }
       if (request.headers.range) throw new GatewayError(400, 'invalid_request');
       const data = await metadata(url, ip);
       const bytes = Buffer.from(JSON.stringify(data));
-      response.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(bytes.length), 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
+      response.writeHead(200, { ...SECURITY_HEADERS, 'content-type': 'application/json; charset=utf-8', 'content-length': String(bytes.length), 'cache-control': 'private, no-store' });
       response.end(request.method === 'HEAD' ? undefined : bytes);
     } catch (error) {
       const safe = error instanceof GatewayError ? error : new GatewayError(502, 'gateway_unavailable');
       const bytes = Buffer.from(JSON.stringify({ error: safe.code }));
-      const headers = { 'content-type': 'application/json', 'content-length': String(bytes.length), 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' };
+      const headers = { ...SECURITY_HEADERS, 'content-type': 'application/json', 'content-length': String(bytes.length), 'cache-control': 'no-store' };
       if (safe.retryAfter) headers['retry-after'] = String(safe.retryAfter);
       if (safe.status === 405) headers.allow = 'GET, HEAD';
       if (!response.headersSent) response.writeHead(safe.status, headers);

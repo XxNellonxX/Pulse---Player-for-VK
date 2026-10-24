@@ -20,6 +20,14 @@ export function ownMusicIds(tracks: readonly Track[], settings?: Pick<AppSetting
   return [...new Set(tracks.filter(track => canAttemptPlayback(track, settings) && (track.source === 'local' || track.remote?.inLibrary !== false)).map(track => track.id))]
 }
 
+/** Preserve the chosen collection, including explicit queue edits. Removed rows
+ * cannot return when shuffle is toggled or a repeat cycle begins. */
+export function playbackQueueIds(tracks: readonly Track[], queue: readonly string[], source: readonly string[] = [], settings?: Pick<AppSettings, 'preferSoundCloud'>): string[] {
+  const members = new Set(queue)
+  const playable = new Set(tracks.filter(track => canAttemptPlayback(track, settings)).map(track => track.id))
+  return [...new Set([...source.filter(id => members.has(id)), ...queue])].filter(id => playable.has(id))
+}
+
 /** Keep the playing source untouched; the stored order is the remaining deck. */
 export function shuffledQueue(ids: readonly string[], currentId: string | null, random: () => number = Math.random): string[] {
   const rest = shuffleIds(ids.filter(id => id !== currentId), random)

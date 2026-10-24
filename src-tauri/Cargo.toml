@@ -1,6 +1,6 @@
 [package]
 name = "vk-player"
-version = "0.5.1"
+version = "0.5.2"
 description = "VK Player desktop"
 edition = "2021"
 rust-version = "1.77.2"
@@ -31,8 +31,12 @@ keyring = { version = "3", features = ["windows-native", "apple-native"] }
 rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
+winreg = "0.56"
 windows-core = "0.62.2"
 windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 
 [profile.release]
 codegen-units = 1

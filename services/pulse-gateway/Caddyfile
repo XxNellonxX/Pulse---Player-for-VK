@@ -2,6 +2,15 @@
   email {$ACME_EMAIL}
   admin off
   auto_https disable_redirects
+  servers {
+    max_header_size 16KB
+    timeouts {
+      read_header 10s
+      read_body 15s
+      write 60s
+      idle 30s
+    }
+  }
   # Reverse-proxy error records can include the request URI.  Media
   # capability paths are bearer-like temporary values, so keep them out of
   # Caddy's default logger while retaining TLS and startup diagnostics.
@@ -21,6 +30,8 @@
     Strict-Transport-Security "max-age=31536000"
     X-Content-Type-Options "nosniff"
     Referrer-Policy "no-referrer"
+    X-Frame-Options "DENY"
+    Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; sandbox"
     -Server
   }
   request_body {

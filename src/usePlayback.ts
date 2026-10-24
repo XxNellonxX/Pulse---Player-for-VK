@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Dispatch, SetStateAction } from 'react'
 import type { PersistedState, VkWebCommand } from './shared/contracts'
-import { canAttemptPlayback, nextShuffledCycle, ownMusicIds, shuffledQueue } from './shuffle'
+import { canAttemptPlayback, nextShuffledCycle, ownMusicIds, playbackQueueIds, shuffledQueue } from './shuffle'
 import { normalizeBufferedRanges, readMediaBuffered, sameBufferedRanges, secondsBufferedAhead, type BufferedRange, type PlaybackNetwork } from './buffering'
 import './shared/audioEqualizer.js'
 import type { EqualizerGraph } from './shared/audioEqualizer'
@@ -234,8 +234,7 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     if (s.settings.shuffle && direction > 0 && nextIndex >= available.length && s.settings.repeat === 'all') {
       // Each complete permutation is stored, so the queue, Previous and restart
       // follow the same order without random re-picks during a cycle.
-      const completeLibrary = ownMusicIds(s.tracks, s.settings)
-      nextQueue = nextShuffledCycle(completeLibrary.length ? completeLibrary : available, s.currentTrackId)
+      nextQueue = nextShuffledCycle(available, s.currentTrackId)
       nextIndex = 0
     }
     if (nextIndex >= available.length || nextIndex < 0) {
@@ -627,8 +626,8 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
     setError('')
     setState(prev => {
       const requested = queue ? [...new Set([...queue, id])] : [...new Set([...prev.queue, id])]
-      const nextQueue = prev.settings.shuffle && queue ? shuffledQueue(ownMusicIds(prev.tracks, prev.settings), id) : requested
-      return { ...prev, currentTrackId: id, position: start, queue: nextQueue, history: [id, ...prev.history.filter(item => item !== id)].slice(0, 300) }
+      const nextQueue = prev.settings.shuffle && queue ? shuffledQueue(requested, id) : requested
+      return { ...prev, ...(queue ? { queueSource: requested } : {}), currentTrackId: id, position: start, queue: nextQueue, history: [id, ...prev.history.filter(item => item !== id)].slice(0, 300) }
     })
     if (loadedId.current === id && audio.current) {
       if (isWebTrack()) { restartWeb(start); return }
@@ -645,9 +644,11 @@ export function usePlayback(state: PersistedState, setState: Dispatch<SetStateAc
   const toggleShuffle = useCallback(() => {
     setState(previous => {
       const shuffle = !previous.settings.shuffle
-      const pool = ownMusicIds(previous.tracks, previous.settings)
+      const pool = previous.queue.length || previous.currentTrackId
+        ? playbackQueueIds(previous.tracks, previous.queue, previous.queueSource, previous.settings)
+        : ownMusicIds(previous.tracks, previous.settings)
       const queue = shuffle ? shuffledQueue(pool, previous.currentTrackId) : [...new Set([...pool, ...(previous.currentTrackId && !pool.includes(previous.currentTrackId) ? [previous.currentTrackId] : [])])]
-      return { ...previous, queue, settings: { ...previous.settings, shuffle } }
+      return { ...previous, queue, queueSource: pool, settings: { ...previous.settings, shuffle } }
     })
   }, [setState])
   const toggle = useCallback(() => {

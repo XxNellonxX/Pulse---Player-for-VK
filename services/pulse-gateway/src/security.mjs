@@ -4,6 +4,47 @@ import { GatewayError } from './errors.mjs';
 const invalid = () => new GatewayError(400, 'invalid_request');
 const denied = () => new GatewayError(502, 'invalid_provider_target');
 
+function ipv6Parts(address) {
+  // A zone identifier is meaningful only on a local interface and must never
+  // become a provider destination or a distinct public rate-limit identity.
+  if (address.includes('%')) return undefined;
+  let normalized;
+  try { normalized = new URL(`http://[${address}]/`).hostname.slice(1, -1).toLowerCase(); }
+  catch { return undefined; }
+  const halves = normalized.split('::');
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  return (halves.length === 2 ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left).map(part => parseInt(part, 16));
+}
+
+function normalizedAddress(address) {
+  if (net.isIP(address) !== 6) return address;
+  const parts = ipv6Parts(address);
+  if (!parts) return 'unknown';
+  if (parts.slice(0, 5).every(part => part === 0) && parts[5] === 0xffff) {
+    return [parts[6] >> 8, parts[6] & 255, parts[7] >> 8, parts[7] & 255].join('.');
+  }
+  return parts.map(part => part.toString(16)).join(':');
+}
+
+export function rateLimitKey(address) {
+  const normalized = normalizedAddress(address);
+  // IPv6 privacy addresses routinely rotate inside one subscriber /64. Their
+  // quota is shared; media capabilities still bind to the exact client IP.
+  return net.isIP(normalized) === 6 ? `${normalized.split(':').slice(0, 4).join(':')}::/64` : normalized;
+}
+
+export function requireNativeOrSameOrigin(request, origin) {
+  // Native clients do not send these browser-only headers. CORS alone does
+  // not stop another website from making blind GET requests and spending our
+  // provider quota, so reject that browser context before contacting providers.
+  const source = request.headers.origin;
+  const site = request.headers['sec-fetch-site'];
+  if ((source !== undefined && source !== origin) || (site !== undefined && !['same-origin', 'none'].includes(site))) {
+    throw new GatewayError(403, 'browser_origin_not_allowed');
+  }
+}
+
 export function isPublicAddress(address) {
   const family = net.isIP(address);
   if (family === 4) {
@@ -16,12 +57,9 @@ export function isPublicAddress(address) {
   if (family === 6) {
     // Accept ordinary global unicast only. Reject mapped IPv4, local/link-local,
     // multicast, NAT64, documentation, transition and IETF special-use ranges.
-    const normalized = new URL(`http://[${address}]/`).hostname.slice(1, -1).toLowerCase();
-    const halves = normalized.split('::');
-    const left = halves[0] ? halves[0].split(':') : [];
-    const right = halves[1] ? halves[1].split(':') : [];
-    const parts = halves.length === 2 ? [...left, ...Array(8 - left.length - right.length).fill('0'), ...right] : left;
-    const [first, second] = parts.map(part => parseInt(part, 16));
+    const parts = ipv6Parts(address);
+    if (!parts) return false;
+    const [first, second] = parts;
     if (first < 0x2000 || first > 0x3fff) return false;
     if ((first === 0x2001 && (second <= 0x1ff || second === 0xdb8)) || first === 0x2002 || first === 0x3fff) return false;
     return true;
@@ -101,13 +139,12 @@ export function validateRange(value) {
 }
 
 export function clientIp(request, trustLoopbackProxy) {
-  let remote = request.socket.remoteAddress || 'unknown';
-  if (remote.startsWith('::ffff:')) remote = remote.slice(7);
-  if (trustLoopbackProxy && (remote === '127.0.0.1' || remote === '::1')) {
+  const remote = normalizedAddress(request.socket.remoteAddress || 'unknown');
+  if (trustLoopbackProxy && (remote === '127.0.0.1' || remote === '0:0:0:0:0:0:0:1')) {
     const forwarded = request.headers['x-forwarded-for'];
     // Caddy replaces untrusted incoming forwarding headers. Trust exactly one
     // address, and only on the private loopback hop.
-    if (typeof forwarded === 'string' && net.isIP(forwarded.trim())) return forwarded.trim();
+    if (typeof forwarded === 'string' && net.isIP(forwarded.trim())) return normalizedAddress(forwarded.trim());
   }
   return remote;
 }

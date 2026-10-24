@@ -1,4 +1,5 @@
 import { GatewayError } from './errors.mjs';
+import { rateLimitKey } from './security.mjs';
 
 export class BoundedCache {
   constructor({ maxEntries = 256, maxBytes = 32 * 1024 * 1024, now = Date.now } = {}) {
@@ -39,6 +40,7 @@ export class AbuseLimits {
     this.global = { requests: 0, bytes: 0, minute: 0, active: 0 };
   }
   acquire(ip, media = false) {
+    ip = rateLimitKey(ip);
     const now = this.now();
     const minute = Math.floor(now / 60_000);
     if (this.global.minute !== minute) Object.assign(this.global, { requests: 0, bytes: 0, minute });

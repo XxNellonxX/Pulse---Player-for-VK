@@ -7,7 +7,7 @@ async function loadTs(file) {
   const source = await readFile(new URL(file, import.meta.url), 'utf8');
   return import(`data:text/javascript;base64,${Buffer.from(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText).toString('base64')}`);
 }
-const { canAttemptPlayback, shuffleIds, ownMusicIds, shuffledQueue, nextShuffledCycle } = await loadTs('../src/shuffle.ts');
+const { canAttemptPlayback, shuffleIds, ownMusicIds, playbackQueueIds, shuffledQueue, nextShuffledCycle } = await loadTs('../src/shuffle.ts');
 const { musicSearchResults } = await loadTs('../src/musicSearch.ts');
 const track = (id, extra = {}) => ({ id, title: `Title ${id}`, artist: 'Singer', album: '', duration: 90, source: 'vk', available: true, remote: { inLibrary: true }, ...extra });
 
@@ -41,6 +41,16 @@ test('cycle restarts include every track and avoid repeating the previous last t
   assert.deepEqual(shuffleIds(['a', 'a', 'b'], () => 0), ['b', 'a']);
   assert.deepEqual(nextShuffledCycle(['a'], 'a'), ['a']);
   assert.deepEqual(nextShuffledCycle([], null), []);
+});
+
+test('an album deck restores source order while respecting queue additions, removals and availability', () => {
+  const tracks = [track('owned'), track('album-a', { remote: { inLibrary: false } }), track('album-b', { remote: { inLibrary: false } }), track('requested'), track('missing', { source: 'local', available: false })];
+  const source = ['album-a', 'album-b', 'missing'];
+  const pool = playbackQueueIds(tracks, ['album-b', 'album-a', 'requested', 'missing', 'ghost'], source);
+  assert.deepEqual(pool, ['album-a', 'album-b', 'requested']);
+  assert.ok(!pool.includes('owned'));
+  assert.deepEqual(playbackQueueIds(tracks, ['album-b', 'requested'], source), ['album-b', 'requested']);
+  assert.deepEqual(playbackQueueIds(tracks, [], source), []);
 });
 
 test('VK restrictions keep an independent-source opportunity in the entire queue without enabling missing local files', () => {

@@ -19,6 +19,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 mod audio_session;
+mod desktop_security;
+mod autostart;
 mod service_imports;
 mod yandex_account_import;
 mod gateway_client;
@@ -173,6 +175,8 @@ pub struct PersistedState {
     pub playlists: Vec<Playlist>,
     pub history: Vec<String>,
     pub queue: Vec<String>,
+    #[serde(rename = "queueSource", default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_source: Vec<String>,
     #[serde(rename = "currentTrackId")]
     pub current_track_id: Option<String>,
     pub position: f64,
@@ -243,6 +247,7 @@ fn defaults() -> PersistedState {
         playlists: vec![],
         history: vec![],
         queue: vec![],
+        queue_source: vec![],
         current_track_id: None,
         position: 0.,
         service_imports: vec![],
@@ -334,6 +339,9 @@ fn sanitized(mut state: PersistedState, media: &HashMap<String, PathBuf>) -> Per
     state.queue.retain(|id| ids.contains(id));
     let mut seen = HashSet::new();
     state.queue.retain(|id| seen.insert(id.clone()));
+    let queue_ids: HashSet<_> = state.queue.iter().cloned().collect();
+    let mut source_seen = HashSet::new();
+    state.queue_source.retain(|id| queue_ids.contains(id) && source_seen.insert(id.clone()));
     state.history.retain(|id| ids.contains(id));
     state.history.truncate(1000);
     // VK synchronization accepts up to MAX_ITEMS records. Keep the same
@@ -1116,6 +1124,9 @@ fn open_external(app: AppHandle, url: String) -> Result<(), String> {
 }
 fn allowed_vk(url: &url::Url) -> bool {
     url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
         && url.host_str().is_some_and(|host| {
             ["vk.com", "vk.ru", "id.vk.ru"]
                 .iter()
@@ -1784,11 +1795,13 @@ pub fn run() {
                 .build(),
         )
         .manage(AppState::default())
+        .manage(autostart::AutostartState::default())
         .manage(soundcloud_player::SourceState::default())
         .setup(|app| {
             audio_session::start();
             init_auth(&app.state::<AppState>());
             load(app.handle(), &app.state::<AppState>());
+            autostart::initialize(app.handle().clone());
             setup_tray(app.handle())?;
             for key in ["MediaPlayPause", "MediaTrackNext", "MediaTrackPrevious"] {
                 let _ = app.global_shortcut().register(key);
@@ -1820,7 +1833,14 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(|invoke| {
+            if !desktop_security::allow_invoke(&invoke) {
+                invoke.resolver.reject("Native commands are available only to the Pulse player window.");
+                return true;
+            }
+            let handler: fn(tauri::ipc::Invoke) -> bool = tauri::generate_handler![
+            autostart::get_autostart,
+            autostart::set_autostart,
             service_imports::read_service_playlist,
             service_imports::service_import_status,
             service_imports::connect_service_import,
@@ -1871,7 +1891,9 @@ pub fn run() {
             get_version,
             updates::check_app_release,
             export_diagnostics
-        ])
+            ];
+            handler(invoke)
+        })
         .run(context)
         .expect("error while running VK Player");
 }
@@ -1879,6 +1901,15 @@ pub fn run() {
 #[cfg(test)]
 mod storage_tests {
     use super::*;
+    #[test]
+    fn vk_navigation_accepts_only_secure_first_party_endpoints() {
+        for value in ["https://vk.ru/audio", "https://vk.com/", "https://id.vk.ru/authorize", "https://login.vk.com/"] {
+            assert!(allowed_vk(&url::Url::parse(value).unwrap()), "{value}");
+        }
+        for value in ["http://vk.com/", "https://vk.com:444/", "https://user:secret@vk.ru/", "https://vk.ru.example/", "https://example.com/?url=vk.com", "file:///vk.com"] {
+            assert!(!allowed_vk(&url::Url::parse(value).unwrap()), "{value}");
+        }
+    }
     fn imported_fixture(source_id:&str, count:usize)->serde_json::Value {
         serde_json::json!({"id":"untrusted-renderer-id","service":"spotify","sourceId":source_id,"sourceUrl":"https://open.spotify.com/playlist/test?token=PRIVATE#PRIVATE","title":"Imported","total":count,"complete":true,"warnings":[],"importedAt":1700000000000_i64,"entries":(0..count).map(|position|serde_json::json!({"sourceId":"same-recording","title":"Repeated song","artists":["Artist"],"album":"Album","duration":123.4,"position":position,"trackId":"vk-1-7","resolution":"matched","isrc":"US-ABC-26-12345","explicit":false})).collect::<Vec<_>>()})
     }
@@ -2055,11 +2086,13 @@ mod storage_tests {
             ..Track::default()
         });
         state.queue = vec!["a".into(), "a".into(), "ghost".into()];
+        state.queue_source = vec!["ghost".into(), "a".into(), "a".into()];
         state.current_track_id = Some("ghost".into());
         state.history = vec!["a".into(), "ghost".into()];
         let next = sanitized(state, &media);
         assert_eq!(next.tracks[0].url, path.to_string_lossy());
         assert_eq!(next.queue, vec!["a"]);
+        assert_eq!(next.queue_source, vec!["a"]);
         assert_eq!(next.history, vec!["a"]);
         assert_eq!(next.current_track_id, None);
     }

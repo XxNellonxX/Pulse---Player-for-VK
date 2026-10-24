@@ -1,6 +1,6 @@
 {
   "name": "vk-player-desktop",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Windows-first VK music player with a local library and a reliable queue.",
   "private": true,
   "type": "module",
@@ -55,8 +55,7 @@
     "lucide-react": "^0.468.0",
     "music-metadata": "^12.2.3",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "zod": "^3.24.1"
+    "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",
@@ -66,7 +65,7 @@
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^6.1.2",
     "concurrently": "^9.1.0",
-    "electron": "^44.9.0",
+    "electron": "^44.9.3",
     "electron-builder": "^26.15.3",
     "typescript": "^5.7.2",
     "vite": "^8.3.4",

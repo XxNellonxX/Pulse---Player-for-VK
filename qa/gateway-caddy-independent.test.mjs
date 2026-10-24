@@ -49,6 +49,11 @@ test('real Caddy keeps TLS/startup logs while an unavailable upstream never logs
     assert.equal(logger.writer, undefined, 'the default logger must not discard unrelated diagnostics');
     for (const server of Object.values(adapted.apps.http.servers)) {
       assert.equal(server.logs, undefined, 'site access logging must remain disabled');
+      assert.equal(server.read_header_timeout, 10_000_000_000, 'external headers must have a finite deadline');
+      assert.equal(server.read_timeout, 15_000_000_000);
+      assert.equal(server.write_timeout, 60_000_000_000);
+      assert.equal(server.idle_timeout, 30_000_000_000);
+      assert.equal(server.max_header_bytes, 16_000);
     }
 
     async function unusedPort() {

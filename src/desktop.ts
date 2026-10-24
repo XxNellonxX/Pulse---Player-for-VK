@@ -7,6 +7,8 @@ import { soundCloudMediaUrl, soundCloudSessionId } from './shared/mediaSource'
 if (isTauri()) {
   const track = (value: Track): Track => value.source === 'local' && !/^(asset:|https?:)/.test(value.url) ? { ...value, url: convertFileSrc(value.url) } : value
   const api: DesktopAPI = {
+    getAutostart: () => invoke('get_autostart'),
+    setAutostart: enabled => invoke('set_autostart', { enabled }),
     readServicePlaylist: url => invoke('read_service_playlist', { url }),
     serviceImportStatus: () => invoke('service_import_status'),
     connectServiceImport: input => invoke('connect_service_import', { clientId: null, ...input }),

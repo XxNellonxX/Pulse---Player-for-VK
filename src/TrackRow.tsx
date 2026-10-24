@@ -8,7 +8,7 @@ export function TrackRow({ track, active, playing, onPlay, onArtist, onInfo, onQ
   const [open, setOpen] = useState(false)
   const duration = Math.floor(track.duration / 60) + ':' + Math.floor(track.duration % 60).toString().padStart(2, '0')
   const saved = added || track.source === 'vk' && track.remote?.inLibrary !== false
-  return <div className={`track-row ${active ? 'active' : ''}`} role="listitem">
+  return <div className={`track-row ${active ? 'active' : ''}`} role="listitem" data-track-id={track.id} aria-current={active ? 'true' : undefined}>
     <button className="track-index" onClick={onPlay} aria-label={`${playing ? 'Пауза' : 'Воспроизвести'} ${track.title}`}>
       <TrackArtwork track={track}><span className={`track-cover-overlay ${active ? 'is-active' : ''}`}>{playing ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}</span></TrackArtwork>
     </button>

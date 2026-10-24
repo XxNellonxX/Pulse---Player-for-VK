@@ -27,6 +27,8 @@ export type AppSettings = {
 export type PersistedState = {
   version: 1; tracks: Track[]; playlists: Playlist[]; history: string[];
   queue: string[]; currentTrackId: string | null; position: number; settings: AppSettings;
+  /** Original order of the active album, playlist, search or library context. */
+  queueSource?: string[];
   serviceImports?: import('./collectionImports').ImportedCollection[];
 };
 export type Capability = { id: string; label: string; status: 'unknown' | 'verified' | 'unsupported'; detail: string; checkedAt?: number };
@@ -54,7 +56,10 @@ export type MusicImportItem = { name: string; status: 'uploaded' | 'local' | 'fa
 export type UploadBatchResult = { items: MusicImportItem[]; cancelled: boolean; accountId?: number };
 export type ImportProgress = { phase: string; message: string; current: number; total: number };
 export type AppRelease = { currentVersion: string; latestVersion: string | null; available: boolean; notes: string; releaseUrl: string | null; downloadUrl: string | null };
+export type AutostartStatus = { supported: boolean; enabled: boolean; requiresApproval: boolean; message: string };
 export interface DesktopAPI {
+  getAutostart?(): Promise<AutostartStatus>;
+  setAutostart?(enabled: boolean): Promise<AutostartStatus>;
   readServicePlaylist?(url: string): Promise<import('./serviceImports').ServicePlaylistSource>;
   serviceImportStatus?(): Promise<import('./serviceImports').ServiceImportStatus>;
   connectServiceImport?(input: { service: import('./serviceImports').ImportService; clientId?: string }): Promise<import('./serviceImports').ServiceImportStatus>;
