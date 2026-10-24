@@ -1,10 +1,9 @@
 {
   "name": "vk-player-desktop",
   "version": "0.5.2",
-  "description": "Windows-first VK music player with a local library and a reliable queue.",
+  "description": "Pulse music player for Windows and macOS, built with Tauri and a shared React interface.",
   "private": true,
   "type": "module",
-  "main": "electron/main.mjs",
   "scripts": {
     "dev": "node scripts/tauri.mjs dev",
     "build": "node scripts/prepare-web-audio.mjs && tsc --noEmit && vite build",
@@ -15,45 +14,15 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:gateway": "node --test services/pulse-gateway/test/*.test.mjs qa/gateway-*.test.mjs",
-    "dev:electron": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
-    "dist:electron": "npm run build && electron-builder",
     "dev:web": "vite --host 127.0.0.1",
     "tauri": "node scripts/tauri.mjs",
     "test:rust": "node scripts/tauri.mjs --cargo test --offline",
     "qa:tauri": "node qa/tauri-integration.mjs"
   },
-  "build": {
-    "appId": "ru.vkplayer.desktop",
-    "productName": "VK Player",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "dist/**/*",
-      "electron/**/*",
-      "package.json"
-    ],
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "perMachine": false,
-      "allowToChangeInstallationDirectory": true
-    }
-  },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
     "hls.js": "^1.7.3",
     "lucide-react": "^0.468.0",
-    "music-metadata": "^12.2.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -64,12 +33,8 @@
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^6.1.2",
-    "concurrently": "^9.1.0",
-    "electron": "^44.9.3",
-    "electron-builder": "^26.15.3",
     "typescript": "^5.7.2",
     "vite": "^8.3.4",
-    "vitest": "^5.0.5",
-    "wait-on": "^8.0.1"
+    "vitest": "^5.0.5"
   }
 }

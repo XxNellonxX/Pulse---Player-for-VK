@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import type { DesktopAPI, DesktopCommand, Track, PersistedState, VkSnapshot, VkWebPlayback, ImportProgress } from './shared/contracts'
 import { soundCloudMediaUrl, soundCloudSessionId } from './shared/mediaSource'
 
-// Both native shells implement the same narrow contract. Browser preview stays local.
+// Windows and macOS share this Tauri bridge. Browser preview stays local.
 if (isTauri()) {
   const track = (value: Track): Track => value.source === 'local' && !/^(asset:|https?:)/.test(value.url) ? { ...value, url: convertFileSrc(value.url) } : value
   const api: DesktopAPI = {

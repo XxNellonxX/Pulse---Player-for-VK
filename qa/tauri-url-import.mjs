@@ -99,7 +99,7 @@ try {
     assert.equal((await page.evaluate(() => window.desktop.getState())).tracks.length, 0);
     assert.equal((await readdir(path.join(profile, 'imports'))).length, 0);
   });
-  await check('real-youtube-url-ui-imports-original-opus-with-music-metadata', async () => {
+  await check('real-youtube-url-ui-imports-original-opus-with-native-metadata', async () => {
     await page.getByRole('button', { name: 'Загрузить в VK', exact: true }).click();
     await page.getByRole('textbox', { name: 'Ссылка на трек', exact: true }).fill('https://www.youtube.com/watch?v=jNQXAC9IVRw');
     await page.getByRole('combobox', { name: 'Куда добавить трек', exact: true }).selectOption('local');
